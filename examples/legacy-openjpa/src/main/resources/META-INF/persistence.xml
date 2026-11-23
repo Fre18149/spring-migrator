@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<persistence xmlns="http://xmlns.jcp.org/xml/ns/persistence" version="2.2">
+  <persistence-unit name="legacy" transaction-type="RESOURCE_LOCAL">
+    <provider>org.apache.openjpa.persistence.PersistenceProviderImpl</provider>
+    <class>com.acme.legacy.Account</class>
+    <exclude-unlisted-classes>true</exclude-unlisted-classes>
+    <properties>
+      <property name="openjpa.jdbc.SynchronizeMappings" value="buildSchema(ForeignKeys=true)"/>
+      <property name="openjpa.jdbc.DBDictionary" value="h2"/>
+      <property name="openjpa.Log" value="DefaultLevel=WARN, SQL=TRACE"/>
+      <property name="openjpa.DataCache" value="true"/>
+      <property name="openjpa.RemoteCommitProvider" value="sjvm"/>
+      <property name="openjpa.RuntimeUnenhancedClasses" value="supported"/>
+      <property name="openjpa.Compatibility" value="QuotedNumbersInQueries=true"/>
+    </properties>
+  </persistence-unit>
+</persistence>
