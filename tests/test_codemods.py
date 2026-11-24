@@ -531,6 +531,30 @@ class S {
         pr.close()
 
 
+class UpdateSupportTest(unittest.TestCase):
+    def test_state_file_and_changelog(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            sm.write_state(root, target="4.1", java=21, boot_line="3.5", skip_frontend=None)
+            st = sm.read_state(root)
+            self.assertEqual((st["target"], st["java"], st["boot_line"], st["tool_version"]), ("4.1", 21, "3.5", sm.__version__))
+            self.assertNotIn("skip_frontend", st)                       # None values are not recorded
+            self.assertTrue(all(sm.vtuple(v) <= sm.vtuple(sm.__version__) for v, _ in sm.CHANGELOG))
+
+    def test_querydsl_jpa_classifier_and_repair(self):
+        pr = Project({"pom.xml": """<project><dependencies>
+    <dependency><groupId>com.querydsl</groupId><artifactId>querydsl-apt</artifactId><version>4.4.0</version><classifier>jpa</classifier></dependency>
+    <dependency><groupId>com.querydsl</groupId><artifactId>querydsl-jpa</artifactId>
+      <classifier>jakarta</classifier></dependency>
+  </dependencies></project>"""})
+        sm.fix_third_party(pr.root)
+        pom = pr["pom.xml"]
+        self.assertIn("<artifactId>querydsl-apt</artifactId><version>5.1.0</version><classifier>jakarta</classifier>", pom)
+        self.assertIn("<version>5.1.0</version>\n      <classifier>jakarta</classifier>", pom)   # repaired: classified needs a version
+        self.assertEqual(sm.fix_third_party(pr.root), [])
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>

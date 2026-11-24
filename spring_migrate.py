@@ -35,7 +35,24 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
+
+# What each version changes for an already migrated branch (`spring_migrate.py update` prints the entries newer than the
+# version recorded in .spring-migrate/state.json). Every post-fixer is idempotent, so `update` simply runs them again.
+CHANGELOG = [
+    ("2.1.0", "Querydsl querydsl-apt:jpa classifier -> jakarta (javac 'NoClassDefFoundError: javax/persistence/Entity')"),
+    ("2.1.0", "annotation processors in <annotationProcessorPaths>/plugin deps -> Jakarta (Hibernate metamodel generator, persistence-api)"),
+    ("2.1.0", "Java level inherited from a company parent raised to the target Java (pattern switches compiled at -source 17)"),
+    ("2.1.0", "Hibernate 5 internal query classes (NativeQueryImplementor, NativeQueryImpl, ...) -> Hibernate 6 packages"),
+    ("2.1.0", "unreachable pattern-switch arms ('case label is dominated') removed when the build fails on them"),
+    ("2.1.0", "jaxws-maven-plugin <target>2.x -> 3.0; JAXB/JAX-WS binding versions 3.0 incl. inline .wsdl/.xsd customizations"),
+    ("2.1.0", "XJC extension namespace kept (only JAXB/JAX-WS namespaces move to Jakarta); earlier wrong rewrites repaired"),
+    ("2.1.0", "jaxb2-basics / maven-jaxb2-plugin / jaxws-maven-plugin -> Jakarta successors"),
+    ("2.1.0", "explicit versions older than Spring Boot's managed ones removed (e.g. Logback 1.2 / SLF4J 1.7)"),
+    ("2.1.0", "springdoc code and dependencies kept on the same line (1.x/2.x/3.x), also when managed in the root or a parent"),
+    ("2.1.0", "ISO-8859-1 files (umlauts) keep their encoding when edited"),
+]
+STATE_FILE = ".spring-migrate/state.json"
 
 IGNORE_DIRS = {".git", "target", "build", "node_modules", ".gradle", ".idea", ".mvn", "out", ".settings"}
 MAX_FILE_BYTES = 2_000_000
@@ -478,8 +495,13 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
     jc, jt = fix_jaxb_tooling(root)
     changes += jc
     todo_extra = jt
+    changes += fix_jaxws_target(root)
     if boot_version:
-        dc, dt = fix_downgraded_boot_managed(root, boot_version, local_repository(extra or [], os.environ.copy()))
+        lrepo = local_repository(extra or [], os.environ.copy())
+        ac, at = fix_annotation_processors(root, boot_version, lrepo)
+        changes += ac
+        todo_extra += at
+        dc, dt = fix_downgraded_boot_managed(root, boot_version, lrepo)
         changes += dc
         todo_extra += dt
     changes += fix_httptrace(root)
@@ -3444,6 +3466,82 @@ def autofix_compile_errors(root: Path, log: Path) -> list[str]:
     return changes
 
 
+def fix_annotation_processors(root: Path, boot_version: str | None, local_repo: Path) -> tuple[list[str], list[str]]:
+    """Annotation processors run inside javac; one still built for javax crashes the compiler
+    ("Fatal error compiling: NoClassDefFoundError: javax/persistence/Entity"). Boot's management does not reach
+    <annotationProcessorPaths> or plugin dependencies (maven-processor-plugin), so fix them there:
+    Hibernate's metamodel generator (org.hibernate -> org.hibernate.orm; hibernate-processor on Boot 4),
+    javax.persistence-api -> jakarta.persistence-api, Querydsl apt -> 5.x with the jakarta classifier."""
+    changes, todo = [], []
+    managed = boot_managed_versions(boot_version, local_repo) if boot_version else {}
+    if not managed:
+        return [], []
+    proc = ("org.hibernate.orm", "hibernate-processor") if ("org.hibernate.orm", "hibernate-processor") in managed \
+        else ("org.hibernate.orm", "hibernate-jpamodelgen")
+    proc_v = managed.get(proc) or managed.get(("org.hibernate.orm", "hibernate-core"))
+    jpa_v = managed.get(("jakarta.persistence", "jakarta.persistence-api"))
+    mapping = {
+        ("org.hibernate", "hibernate-jpamodelgen"): (proc, proc_v),
+        ("org.hibernate.orm", "hibernate-jpamodelgen"): (proc, proc_v),
+        ("javax.persistence", "javax.persistence-api"): (("jakarta.persistence", "jakarta.persistence-api"), jpa_v),
+        ("javax.persistence", "persistence-api"): (("jakarta.persistence", "jakarta.persistence-api"), jpa_v),
+        ("org.hibernate.javax.persistence", "hibernate-jpa-2.1-api"): (("jakarta.persistence", "jakarta.persistence-api"), jpa_v),
+        ("jakarta.persistence", "jakarta.persistence-api"): (("jakarta.persistence", "jakarta.persistence-api"), jpa_v),
+    }
+    for bf in build_files(root):
+        if bf.name != "pom.xml":
+            continue
+        t = read(bf) or ""
+        plugin_spans = [m.span() for m in re.finditer(r"<plugin>.*?</plugin>", t, re.S)]
+        def fix(m):
+            blk = m.group(0)
+            in_plugin = any(a <= m.start() < z for a, z in plugin_spans)
+            g, a, v = _first_tag(blk, "groupId"), _first_tag(blk, "artifactId"), _first_tag(blk.split("<exclusions>")[0], "version")
+            target = mapping.get((g, a))
+            if target and target[1]:
+                (ng, na), nv = target
+                # outside plugins Boot manages the version; inside <path>/plugin deps it must be explicit
+                needs_version = in_plugin or m.group(1) == "path"
+                if (ng, na) == (g, a) and (not v or v.startswith("${") or vtuple(v)[:2] >= vtuple(nv)[:2]):
+                    return blk
+                out = blk.replace(f"<groupId>{g}</groupId>", f"<groupId>{ng}</groupId>", 1).replace(f"<artifactId>{a}</artifactId>", f"<artifactId>{na}</artifactId>", 1)
+                if v:
+                    out = out.replace(f"<version>{v}</version>", f"<version>{nv}</version>" if needs_version else "", 1)
+                elif needs_version:
+                    out = out.replace(f"<artifactId>{na}</artifactId>", f"<artifactId>{na}</artifactId><version>{nv}</version>", 1)
+                return out
+            if g == "com.querydsl" and a in ("querydsl-apt", "querydsl-jpa") and v and not v.startswith("${") and vtuple(v)[0] < 5:
+                return blk.replace(f"<version>{v}</version>", "<version>5.1.0</version>", 1)
+            return blk
+        new = re.sub(r"<(dependency|path)>(?:(?!<\1>).)*?</\1>", fix, t, flags=re.S)
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: annotation processors -> Jakarta versions ({proc[1]} {proc_v}, jakarta.persistence-api {jpa_v})")
+    return changes, todo
+
+
+def fix_jaxws_target(root: Path) -> list[str]:
+    """wsimport's `target` is the JAX-WS/JAXB spec version of the generated code: 2.x is javax-era, 4.x tooling needs 3.0."""
+    changes = []
+    for bf in build_files(root):
+        if bf.name != "pom.xml":
+            continue
+        t = read(bf) or ""
+        def fix(m):
+            blk = m.group(0)
+            body = re.sub(r"<(dependencies|executions|configuration)>.*?</\1>", "", blk, flags=re.S)
+            v = _first_tag(body, "version")
+            if not v or v.startswith("${") or vtuple(v)[0] < 4:
+                return blk
+            blk = re.sub(r"(<target>)2\.\d(</target>)", r"\g<1>3.0\g<2>", blk)
+            blk = re.sub(r"(<(?:arg|argument)>\s*-target\s+)2\.\d", r"\g<1>3.0", blk)
+            blk = re.sub(r"(<(?:arg|argument)>-target</(?:arg|argument)>\s*<(?:arg|argument)>)2\.\d", r"\g<1>3.0", blk)
+            return blk
+        new = re.sub(r"<plugin>(?:(?!<plugin>).)*?<artifactId>jaxws-maven-plugin</artifactId>.*?</plugin>", fix, t, flags=re.S)
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: jaxws-maven-plugin target 2.x -> 3.0 (Jakarta XML Web Services / Binding)")
+    return changes
+
+
 HTTPTRACE_JAVA = [
     ("org.springframework.boot.actuate.trace.http.InMemoryHttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.InMemoryHttpExchangeRepository"),
     ("org.springframework.boot.actuate.trace.http.HttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository"),
@@ -3729,8 +3827,22 @@ def fix_third_party(root: Path) -> list[str]:
         def qd(mm):
             b = mm.group(0)
             if "<classifier>" in b:
-                return b
-            return re.sub(r"(<artifactId>querydsl-(?:apt|jpa)</artifactId>)", r"\1\n      <classifier>jakarta</classifier>", b, count=1)
+                # querydsl-apt:jpa registers the javax JPA processor inside javac -> "NoClassDefFoundError: javax/persistence/Entity"
+                if not re.search(r"<artifactId>querydsl-(?:apt|jpa)</artifactId>", b):
+                    return b
+                out = re.sub(r"<classifier>\s*(?:jpa|general)\s*</classifier>", "<classifier>jakarta</classifier>", b)
+                v = _first_tag(out, "version")
+                if not v and "<classifier>jakarta</classifier>" in out:
+                    # managed versions do not apply to a classified dependency (also repairs earlier runs that left it out)
+                    return out.replace("<classifier>jakarta</classifier>", "<version>5.1.0</version>\n      <classifier>jakarta</classifier>", 1)
+                if out != b and v and not v.startswith("${") and vtuple(v)[0] < 5:
+                    out = out.replace(f"<version>{v}</version>", "<version>5.1.0</version>", 1)   # jakarta classifier exists from 5.0
+                return out
+            out = re.sub(r"(<artifactId>querydsl-(?:apt|jpa)</artifactId>)", r"\1\n      <classifier>jakarta</classifier>", b, count=1)
+            if not re.search(r"<version>", out):
+                # managed versions do not apply to a classified dependency: it needs its own (Boot 3.5/4.x manage 5.1.0)
+                out = out.replace("<classifier>jakarta</classifier>", "<version>5.1.0</version>\n      <classifier>jakarta</classifier>", 1)
+            return out
         new = re.sub(r"<(dependency|path)>(?:(?!<\1>).)*?<groupId>com\.querydsl</groupId>(?:(?!<\1>).)*?</\1>", qd, new, flags=re.S)
         new = re.sub(r"(['\"]com\.querydsl:querydsl-(?:apt|jpa)(?::[\d.]+)?)(['\"])", r"\1:jakarta\2", new) if "querydsl" in new and ":jakarta" not in new and bf.name != "pom.xml" else new
         if write_if_changed(bf, t, new):
@@ -3903,7 +4015,7 @@ def collect_dependency_refs(root: Path) -> list[DepRef]:
         # dependencies of plugins (exec:java generators, code generators ...) run with the build: a company library pinned
         # there would mix Boot 2 jars (e.g. Logback 1.2) into a Boot 3 build
         for pm in re.finditer(r"<plugin>.*?</plugin>", t, re.S):
-            for d in re.finditer(r"<dependency>(.*?)</dependency>", pm.group(0), re.S):
+            for d in re.finditer(r"<(?:dependency|path)>(.*?)</(?:dependency|path)>", pm.group(0), re.S):
                 b = d.group(1).split("<exclusions>")[0]
                 add("dependency", _first_tag(b, "groupId"), _first_tag(b, "artifactId"), _first_tag(b, "version"), p)
     for p in build_files(root):
@@ -4579,7 +4691,7 @@ QUALITY_SKIP = ["-Dspotless.check.skip=true", "-Dcheckstyle.skip=true", "-Dpmd.s
                 "-Dfmt.skip=true", "-Dformatter.skip=true", "-Dimpsort.skip=true", "-Dlicense.skip=true", "-Denforcer.skip=true",
                 "-Dsortpom.skip=true", "-Djacoco.skip=true"]
 # Lines that explain a failure better than Maven's generic "[ERROR] Failed to execute goal ..."
-CAUSE_RX = re.compile(r"Checkstyle violation|\.java:\[?\d+[,:]\d+\]?:? .*\[\w+\]\s*$|\(\w+\) \w+: |spotless|npm (?:ERR!|error)|yarn error|ERR_PNPM|\[ERROR\] .*\.(?:java|kt):\[|cannot find symbol|Tests run:.*(?:Failures: [1-9]|Errors: [1-9])|"
+CAUSE_RX = re.compile(r"NoClassDefFoundError: javax/|Fatal error compiling|Checkstyle violation|\.java:\[?\d+[,:]\d+\]?:? .*\[\w+\]\s*$|\(\w+\) \w+: |spotless|npm (?:ERR!|error)|yarn error|ERR_PNPM|\[ERROR\] .*\.(?:java|kt):\[|cannot find symbol|Tests run:.*(?:Failures: [1-9]|Errors: [1-9])|"
                       r"<<< (?:FAILURE|ERROR)!|Caused by:|Could not resolve dependencies|Non-resolvable|What went wrong", re.I)
 
 
@@ -4594,6 +4706,9 @@ def show_errors(log: Path, limit: int = 10):
                and "full stack trace" not in l and "please read the following" not in l and "cwiki.apache.org" not in l and l.strip() != "[ERROR]"]
     for l in (causes[:limit - 2] + generic[:max(2, limit - len(causes))])[:limit]:
         say(f"    {l.strip()[:220]}")
+    if any(re.search(r"Fatal error compiling.*NoClassDefFoundError: javax/", l) for l in all_lines):
+        say("    hint: an annotation processor (or compiler plugin) is still built for javax - check <annotationProcessorPaths> and "
+            "maven-processor-plugin dependencies for Boot 2-era versions (company processors: see the dependency plan)")
     if any(re.search(r"npm (?:ERR!|error)|frontend-maven-plugin", l) for l in all_lines):
         say("    hint: a frontend build (frontend-maven-plugin) failed. OpenRewrite does not need it - if npm cannot work in this "
             "environment, re-run with --skip-frontend")
@@ -5048,6 +5163,10 @@ def cmd_migrate(a) -> int:
                 say(f"[stage {st.key}] no Spotless configured in this build - formatting skipped (use --format-goal for another formatter)")
             for n_ in notes or []:
                 say(f"  format: {n_}")
+        if not a.no_git and not (code != 0 or dl):
+            write_state(root, target=a.target, java=a.java, boot_line=st.boot_line or "2.7", stage=st.key,
+                        no_trailing_slash_compat=a.no_trailing_slash_compat or None, skip_frontend=a.skip_frontend or None,
+                        format_goal=a.format_goal, no_legacy=a.no_legacy or None)
         if not a.no_git and git(root, "status", "--porcelain").strip():
             git(root, "add", "-A")
             msg = f"chore(migration): {st.title}\n\nAutomated by spring-migrate {__version__} (OpenRewrite: {', '.join(st.recipes)})"
@@ -5212,6 +5331,105 @@ def cmd_deps(a) -> int:
     return 0
 
 
+def read_state(root: Path) -> dict:
+    f = root / STATE_FILE
+    try:
+        return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    except (ValueError, OSError):
+        return {}
+
+
+def write_state(root: Path, **fields):
+    """Committed with every stage: what the branch was migrated with (no paths or credentials)."""
+    st = read_state(root)
+    st.update({k: v for k, v in fields.items() if v is not None})
+    st["tool_version"] = __version__
+    st["updated"] = dt.datetime.now().isoformat(timespec="seconds")
+    f = root / STATE_FILE
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(st, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def cmd_update(a) -> int:
+    """Apply the fixes of this tool version to a branch an earlier version already migrated."""
+    root = Path(a.path).resolve()
+    env = build_env(a.java_home)
+    if git(root, "rev-parse", "--is-inside-work-tree", check=False).strip() != "true":
+        raise MigrationError("update works on the migration branch (a git repository)")
+    if git(root, "status", "--porcelain").strip() and not a.allow_dirty:
+        raise MigrationError("Working tree has uncommitted changes. Commit/stash them or pass --allow-dirty.")
+    state = read_state(root)
+    info = detect_build(root)
+    if not info["tool"]:
+        raise MigrationError("No pom.xml / build.gradle found.")
+    exe = (str(root / "mvnw") if (root / "mvnw").exists() else "mvn") if info["tool"] == "maven" else \
+        (str(root / "gradlew") if (root / "gradlew").exists() else "gradle")
+    extra = shlex.split(a.build_args or "")
+    bv = info["boot_version"]
+    if (not bv or bv.startswith("${")) and info["tool"] == "maven":
+        bv = effective_boot_version(root, exe, extra, env)
+    if not bv or int(bv.split(".")[0]) < 3:
+        raise MigrationError(f"this branch is on Spring Boot {bv or '?'} - run `migrate` first; `update` refreshes migrated branches")
+    line = ".".join(bv.split(".")[:2])
+    line = line if line in ("3.5", "4.0", "4.1") else ("3.5" if bv.startswith("3") else "4.1")
+    java = a.java or state.get("java") or int(re.sub(r"^1\.", "", info["java_version"] or "17").split(".")[0])
+    old = state.get("tool_version", "before 2.1.0 (no state file)")
+    say(f"[update] {root} - Spring Boot {bv}, Java {java}, migrated with spring-migrate {old}, now {__version__}")
+    news = [t for v, t in CHANGELOG if not state.get("tool_version") or vtuple(v) > vtuple(state["tool_version"])]
+    for t in news:
+        say(f"[update]   new: {t}")
+    report_dir = Path(a.report_dir).resolve() if a.report_dir else root.parent / f"{root.name}-update-{dt.datetime.now():%Y%m%d-%H%M%S}"
+    log_dir = report_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    builder = Builder(root, info["tool"], env, log_dir, extra, None, skip_frontend=a.skip_frontend or state.get("skip_frontend", False),
+                      format_goal=a.format_goal or state.get("format_goal"))
+    if a.no_format:
+        builder.format_goal = None
+    stage_rev = git(root, "rev-parse", "HEAD").strip()
+    changes, todo = run_fixers(root, java, line, migration_base(root), trailing_slash=not state.get("no_trailing_slash_compat", False),
+                               stage_rev=stage_rev, boot_version=bv, extra=extra)
+    if info["tool"] == "maven":
+        changes += fix_java_level(root, java, exe, extra, env)
+    for c in changes:
+        say(f"  fixer: {c}")
+    for t in todo:
+        say(f"  TODO {t}")
+    changed = [f for f in git(root, "diff", "--name-only", stage_rev).split() + git(root, "ls-files", "--others", "--exclude-standard").split()
+               if f.endswith((".java", ".kt", ".groovy")) and (root / f).exists()]
+    for n_ in builder.format("update", changed) or []:
+        say(f"  format: {n_}")
+    write_state(root, java=java, boot_line=line, target=state.get("target"))
+    git(root, "add", "-A")
+    if git(root, "status", "--porcelain").strip():
+        msg = (f"chore(migration): spring-migrate update {state.get('tool_version', 'pre-2.1.0')} -> {__version__}\n\n"
+               + "\n".join(f"- {c}" for c in changes[:40]))
+        r = subprocess.run(["git", "commit", "-q", "-m", msg], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            raise MigrationError(f"git commit failed: {r.stderr.strip()}")
+        say(f"[git] committed {len(changes)} update change(s)" if changes else "[git] no code changes; recorded the tool version in .spring-migrate/state.json")
+    else:
+        say("[update] nothing to change - the branch already has every fix of this version")
+    if a.skip_tests:
+        return 0
+    say("[update] build + tests")
+    ok = builder.verify("update") == 0
+    if not ok:
+        fixed = autofix_compile_errors(root, log_dir / "update-build.log")
+        if fixed:
+            for c in fixed:
+                say(f"  autofix: {c}")
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", "chore(migration): fix compile errors with one safe fix (update)")
+            ok = builder.verify("update-autofix") == 0
+            if not ok:
+                (log_dir / "update-build.log").write_bytes((log_dir / "update-autofix-build.log").read_bytes())
+    say(f"[update] {'build OK' if ok else 'BUILD/TESTS FAILED'}")
+    if not ok:
+        show_errors(log_dir / "update-build.log")
+        return 1
+    return 0
+
+
 def cmd_legacy(a) -> int:
     root = Path(a.path).resolve()
     changes, todo = run_legacy_codemods(root, "all")
@@ -5255,6 +5473,20 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ask the repositories again (default: reuse a check from the last 24 h and Maven's cached version lists)")
     dp.add_argument("--out", help=f"plan file (default: next to the project, <name>-{DEP_PLAN_FILE})")
     dp.set_defaults(fn=cmd_deps)
+
+    up = sub.add_parser("update", help="apply the fixes of this spring-migrate version to an already migrated branch")
+    up.add_argument("path")
+    up.add_argument("--java", type=int, choices=(17, 21), help="target Java (default: from .spring-migrate/state.json or the POM)")
+    up.add_argument("--java-home")
+    up.add_argument("--build-args", help='extra args for mvn/gradle, e.g. "-s /path/settings.xml"')
+    up.add_argument("--skip-tests", action="store_true", help="only apply and commit the fixes, no build")
+    up.add_argument("--skip-frontend", action="store_true")
+    up.add_argument("--format-goal")
+    up.add_argument("--no-format", action="store_true")
+    up.add_argument("--allow-dirty", action="store_true")
+    up.add_argument("--report-dir")
+    up.add_argument("--offline", action="store_true")
+    up.set_defaults(fn=cmd_update)
 
     lg = sub.add_parser("legacy", help="run only the legacy-library codemods (Netflix, legacy OAuth2, id pinning, JPQL ...)")
     lg.add_argument("path")

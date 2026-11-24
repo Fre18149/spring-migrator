@@ -36,7 +36,7 @@ TOOL = HERE / "spring_migrate.py"
 sys.path.insert(0, str(HERE))
 import spring_migrate as sm  # noqa: E402
 
-COMMANDS = ("migrate", "scan", "deps")
+COMMANDS = ("migrate", "scan", "deps", "update")
 TERMINAL = ("succeeded", "failed", "stopped", "cancelled", "error")
 # options the dashboard sets itself or that need a terminal
 HIDDEN_OPTIONS = {"help", "path", "report_dir", "interactive", "out"}
@@ -90,7 +90,7 @@ def build_argv(command: str, path: str, options: dict, schema: dict, report_dir:
                 argv += [o["flag"], str(item).strip()]
         elif v not in (None, "") and str(v) != str(o["default"]):
             argv += [o["flag"], str(v)]
-    if command == "migrate":
+    if command in ("migrate", "update"):
         argv += ["--report-dir", str(report_dir)]
     elif command == "scan":
         argv += ["--out", str(out_file)]
@@ -608,6 +608,13 @@ class Handler(BaseHTTPRequestHandler):
             if parts[3] == "cancel":
                 self.store.cancel(job)
                 return self._json(job.summary())
+            if parts[3] == "update":
+                # apply this tool version's fixes to the branch the job produced (in its copy, if it worked on one)
+                target = job.d["workdir"] if job.d.get("copy") and job.d.get("workdir") else job.d["project"]
+                keep = {k: v for k, v in (job.d.get("options") or {}).items()
+                        if k in ("build_args", "java_home", "skip_frontend", "format_goal", "no_format", "offline", "java")}
+                new = self.store.create("update", target, keep, False)
+                return self._json(new.summary(), 201)
             if parts[3] == "rerun":
                 # same project/options; for migrate this resumes from the current Boot version
                 src = job.d["workdir"] if job.d["copy"] and job.d.get("workdir") and body.get("continue", True) else job.d["project"]
@@ -877,6 +884,7 @@ textarea { font-family: var(--mono); font-size: 12px; min-height: 84px; resize: 
           <label><input type="radio" name="cmd" value="migrate" checked> Migrate</label>
           <label><input type="radio" name="cmd" value="scan"> Scan only (read-only)</label>
           <label><input type="radio" name="cmd" value="deps"> Company dependency plan</label>
+          <label><input type="radio" name="cmd" value="update"> Update a migrated branch</label>
         </div>
         <div class="check" style="margin-top:10px"><input type="checkbox" id="copy" checked><div><label for="copy">Work on a copy</label>
           <div class="note">Copies the project into the dashboard's state folder first, so your checkout is never touched (the tool still creates a migration branch in the copy).</div></div></div>
@@ -975,6 +983,7 @@ function select(id) {
       <div class="actions">
         <button class="btn small danger" id="aCancel" type="button">Cancel</button>
         <button class="btn small" id="aRerun" type="button" title="Run again with the same options. A migration resumes from the Boot version it reached.">Re-run / resume</button>
+        <button class="btn small" id="aUpdate" type="button" title="Apply the fixes of the current spring-migrate version to this branch (no full re-run)">Apply tool updates</button>
         <button class="btn small" id="aDelete" type="button">Delete</button>
       </div></div>
     <div class="body2">
@@ -990,6 +999,7 @@ function select(id) {
   $("#detail").querySelectorAll(".tabs button").forEach(b => b.onclick = () => showTab(b.dataset.t));
   $("#aCancel").onclick = async () => { await api(`/api/jobs/${id}/cancel`, { method: "POST", body: "{}" }); toast("Cancelling…"); refreshJobs(); };
   $("#aRerun").onclick = async () => { const n = await api(`/api/jobs/${id}/rerun`, { method: "POST", body: JSON.stringify({ continue: true }) }); toast("Queued again"); await refreshJobs(); select(n.id); };
+  $("#aUpdate").onclick = async () => { const n = await api(`/api/jobs/${id}/update`, { method: "POST", body: "{}" }); toast("Update queued"); await refreshJobs(); select(n.id); };
   $("#aDelete").onclick = async () => { if (!confirm("Delete this job, its log, report and workspace copy?")) return; try { await api(`/api/jobs/${id}`, { method: "DELETE" }); SEL = null; await refreshJobs(); $("#detail").innerHTML = '<div class="empty"><p>Deleted.</p></div>'; } catch (e) { toast(e.message); } };
   LOGLINES = [];
   updateHeader(j);
@@ -1008,6 +1018,7 @@ function updateHeader(j) {
   $("#dMeta").innerHTML = bits.filter(Boolean).map(b => `<span>${esc(b)}</span>`).join("");
   $("#aCancel").disabled = !ACTIVE.includes(j.status);
   $("#aRerun").disabled = ACTIVE.includes(j.status);
+  $("#aUpdate").disabled = ACTIVE.includes(j.status) || j.command === "scan" || j.command === "deps";
   $("#aDelete").disabled = ACTIVE.includes(j.status);
   renderSteps(j);
 }
@@ -1150,7 +1161,7 @@ function renderOptions(cmd) {
   $("#optForm").innerHTML = GROUP_ORDER.filter(g => groups[g]).map(g => g === "Advanced"
     ? `<details><summary style="cursor:pointer; font-weight:600; margin-bottom:8px">Advanced</summary><fieldset><div class="fields">${groups[g].map(field).join("")}</div></fieldset></details>`
     : `<fieldset><legend>${esc(g)}</legend><div class="fields">${groups[g].map(field).join("")}</div></fieldset>`).join("");
-  $("#submitBtn").textContent = cmd === "migrate" ? "Queue migration" : cmd === "scan" ? "Queue scan" : "Queue dependency plan";
+  $("#submitBtn").textContent = {migrate: "Queue migration", scan: "Queue scan", deps: "Queue dependency plan", update: "Queue update"}[cmd];
 }
 function collectOptions() {
   const o = {};

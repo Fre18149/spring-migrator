@@ -28,6 +28,20 @@ python3 spring_migrate.py migrate /path/to/project \
 The project must be a git repo with a clean tree. Run it on a copy/clone first. The default target is **4.1**
 (`--target 3.5|4.0|4.1`).
 
+## Updating an already migrated branch
+Every migration commits `.spring-migrate/state.json` (tool version, target, Java, Boot line reached, the options that
+matter - no paths or credentials). When a newer spring-migrate fixes something, apply it to the existing branch
+instead of migrating again:
+```bash
+python3 spring_migrate.py update /path/to/migrated-project --build-args "-s settings.xml"
+```
+`update` prints what changed since the version the branch was migrated with (`CHANGELOG` in the script), runs this
+version's post-fixers for the Boot line the branch is on (they are idempotent: what is already right stays as it is),
+formats the changed files, commits them as one `spring-migrate update <old> -> <new>` commit, and runs the build gate
+(with the compile autofix). Branches migrated before 2.1.0 have no state file; Boot and Java are then read from the
+POMs. It also works on a branch whose stage stopped with a failing build. In the dashboard: **Apply tool updates** on
+a finished job (runs in the same copy), or *Update a migrated branch* in the new-job dialog.
+
 ## Web dashboard
 ```bash
 python3 spring_migrate_web.py            # then open http://127.0.0.1:8765
@@ -229,6 +243,10 @@ registry. The recipes only need Java sources and dependencies, so:
 * `--skip-frontend` skips it in every build (baseline and gates as well) for environments where npm cannot work
 * `--rewrite-args "-Dexec.skip -Ddocker.skip ..."` passes extra arguments to the OpenRewrite step only, for other
   plugins that fail outside your CI
+* annotation processors still built for javax crash javac ("Fatal error compiling: NoClassDefFoundError:
+  javax/persistence/Entity"): Querydsl `querydsl-apt:jpa` -> `jakarta` classifier, Hibernate's metamodel generator
+  (`org.hibernate` -> `org.hibernate.orm`, `hibernate-processor` on Boot 4) and `javax.persistence-api` in
+  `<annotationProcessorPaths>` / plugin dependencies are moved to the Jakarta versions Boot manages
 * `--rewrite-no-fork` does not build before rewriting at all (`rewrite:runNoFork`); code that uses generated sources
   then gets less precise type information
 
