@@ -3846,14 +3846,29 @@ def run(cmd: list[str], cwd: Path, log: Path, env: dict) -> int:
             raise MigrationError(f"Command not found: {cmd[0]} ({e})")
 
 
-def show_errors(log: Path, limit: int = 8):
-    """Print the first few ERROR lines of a build log so the user sees the cause immediately."""
+# frontend-maven-plugin's own skip switches (npm/yarn/pnpm/bun, node install, task runners)
+FRONTEND_SKIP = ["-Dskip.installnodenpm", "-Dskip.installnodecorepack", "-Dskip.installnodeyarn", "-Dskip.installnodepnpm", "-Dskip.installyarn", "-Dskip.installbun",
+                 "-Dskip.npm", "-Dskip.npx", "-Dskip.yarn", "-Dskip.pnpm", "-Dskip.bun", "-Dskip.corepack", "-Dskip.bower",
+                 "-Dskip.grunt", "-Dskip.gulp", "-Dskip.jspm", "-Dskip.karma", "-Dskip.webpack", "-Dskip.ember"]
+# Lines that explain a failure better than Maven's generic "[ERROR] Failed to execute goal ..."
+CAUSE_RX = re.compile(r"npm (?:ERR!|error)|yarn error|ERR_PNPM|\[ERROR\] .*\.(?:java|kt):\[|cannot find symbol|Tests run:.*(?:Failures: [1-9]|Errors: [1-9])|"
+                      r"<<< (?:FAILURE|ERROR)!|Caused by:|Could not resolve dependencies|Non-resolvable|What went wrong", re.I)
+
+
+def show_errors(log: Path, limit: int = 10):
+    """Print the lines that explain a failure (npm errors, compiler errors, failed tests) before Maven's generic ones."""
     try:
-        lines = [l for l in log.read_text(errors="replace").splitlines() if "ERROR" in l or "FAILURE" in l or "What went wrong" in l]
+        all_lines = log.read_text(errors="replace").splitlines()
     except OSError:
         return
-    for l in lines[:limit]:
-        say(f"    {l.strip()[:200]}")
+    causes = [l for l in all_lines if CAUSE_RX.search(l)]
+    generic = [l for l in all_lines if ("ERROR" in l or "FAILURE" in l) and l not in causes and "Re-run Maven" not in l
+               and "full stack trace" not in l and "please read the following" not in l and "cwiki.apache.org" not in l and l.strip() != "[ERROR]"]
+    for l in (causes[:limit - 2] + generic[:max(2, limit - len(causes))])[:limit]:
+        say(f"    {l.strip()[:220]}")
+    if any(re.search(r"npm (?:ERR!|error)|frontend-maven-plugin", l) for l in all_lines):
+        say("    hint: a frontend build (frontend-maven-plugin) failed. OpenRewrite does not need it - if npm cannot work in this "
+            "environment, re-run with --skip-frontend")
     say(f"    (full log: {log})")
 
 
@@ -3903,9 +3918,17 @@ def java_major(env: dict) -> int | None:
 # Build-tool adapters
 # --------------------------------------------------------------------------- #
 class Builder:
-    def __init__(self, root: Path, tool: str, env: dict, log_dir: Path, extra: list[str], plugin_version: str | None):
-        self.root, self.tool, self.env, self.log_dir, self.extra = root, tool, env, log_dir, extra
+    def __init__(self, root: Path, tool: str, env: dict, log_dir: Path, extra: list[str], plugin_version: str | None,
+                 rewrite_extra: list[str] | None = None, skip_frontend: bool = False, rewrite_frontend: bool = False, no_fork: bool = False):
+        self.root, self.tool, self.env, self.log_dir, self.extra = root, tool, env, log_dir, list(extra)
         self.plugin_version = plugin_version
+        if skip_frontend and tool == "maven":
+            self.extra += FRONTEND_SKIP
+        # OpenRewrite's `run` goal first builds up to process-test-classes, which also runs frontend builds (npm install ...).
+        # The recipes only need Java sources and dependencies, so skip those there unless asked not to.
+        self.rewrite_extra = (([] if rewrite_frontend or skip_frontend or tool != "maven" else FRONTEND_SKIP)
+                              + list(rewrite_extra or []))
+        self.no_fork = no_fork
         if tool == "maven":
             self.exe = str(root / "mvnw") if (root / "mvnw").exists() else "mvn"
         else:
@@ -3915,11 +3938,12 @@ class Builder:
         log = self.log_dir / f"{stage}-rewrite.log"
         if self.tool == "maven":
             plugin = "org.openrewrite.maven:rewrite-maven-plugin" + (f":{self.plugin_version}" if self.plugin_version else "")
-            goal = f"{plugin}:{'dryRun' if dry else 'run'}"
+            # runNoFork/dryRunNoFork: no build before rewriting (generated sources are then missing for type attribution)
+            goal = f"{plugin}:{'dryRun' if dry else 'run'}{'NoFork' if self.no_fork else ''}"
             cmd = [self.exe, "-B", "-ntp", "-U", goal,
                    f"-Drewrite.recipeArtifactCoordinates={','.join(artifacts)}",
                    f"-Drewrite.activeRecipes={','.join(recipes)}",
-                   "-Drewrite.exportDatatables=false", "-Drewrite.failOnInvalidActiveRecipes=true"] + self.extra
+                   "-Drewrite.exportDatatables=false", "-Drewrite.failOnInvalidActiveRecipes=true"] + self.extra + self.rewrite_extra
             return run(cmd, self.root, log, self.env)
         init = Path(tempfile.mkdtemp(prefix="spring-migrate-")) / "rewrite.init.gradle"
         deps = "\n".join(f'    rewrite("{a}")' for a in artifacts)
@@ -3942,7 +3966,7 @@ rootProject {{
   }}
 }}
 """, encoding="utf-8")
-        cmd = [self.exe, "--no-daemon", "--init-script", str(init), "rewriteDryRun" if dry else "rewriteRun"] + self.extra
+        cmd = [self.exe, "--no-daemon", "--init-script", str(init), "rewriteDryRun" if dry else "rewriteRun"] + self.extra + self.rewrite_extra
         return run(cmd, self.root, log, self.env)
 
     def classpath(self) -> list[str]:
@@ -4058,7 +4082,9 @@ def cmd_migrate(a) -> int:
     if use_openjpa:
         say("[preflight] OpenJPA detected -> adding an OpenJPA -> Hibernate stage")
     stages = plan_stages(a.target, a.java, junit4, a.rewrite_spring_version, a.extra_recipe or [], use_openjpa)
-    builder = Builder(root, info["tool"], env, log_dir, shlex.split(a.build_args or ""), a.rewrite_plugin_version)
+    builder = Builder(root, info["tool"], env, log_dir, shlex.split(a.build_args or ""), a.rewrite_plugin_version,
+                      rewrite_extra=shlex.split(a.rewrite_args or ""), skip_frontend=a.skip_frontend,
+                      rewrite_frontend=a.rewrite_frontend, no_fork=a.rewrite_no_fork)
 
     if resuming:
         done = lambda st: st.key[0] == "1" or (st.key.startswith("2-") and (major, minor) >= (3, 5)) or \
@@ -4437,6 +4463,14 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--report-dir", help="where to write report/logs (default: next to the project)")
     m.add_argument("--rewrite-spring-version", default="RELEASE", help="rewrite-spring version (pin for reproducible runs)")
     m.add_argument("--rewrite-plugin-version", help="rewrite-maven-plugin version (default: latest)")
+    m.add_argument("--skip-frontend", action="store_true",
+                   help="skip frontend-maven-plugin (npm/yarn/pnpm, node install) in every build, e.g. when npm cannot reach its registry here")
+    m.add_argument("--rewrite-frontend", action="store_true",
+                   help="also run frontend builds during the OpenRewrite step (skipped there by default; OpenRewrite does not need them)")
+    m.add_argument("--rewrite-args", help='extra Maven/Gradle args for the OpenRewrite step only, e.g. "-Dexec.skip -Ddocker.skip"')
+    m.add_argument("--rewrite-no-fork", action="store_true",
+                   help="do not build before rewriting (rewrite:runNoFork) - for builds whose plugins fail outside CI; "
+                        "code that uses generated sources then gets less precise recipes")
     m.add_argument("--extra-recipe", action="append", help="additional OpenRewrite recipe name to run in the last stage (repeatable)")
     m.add_argument("--no-legacy", action="store_true", help="skip the legacy-library codemods (Netflix, legacy OAuth2, id pinning, ...)")
     m.add_argument("--no-trailing-slash-compat", action="store_true", help="do not add the trailing-slash compatibility filter")

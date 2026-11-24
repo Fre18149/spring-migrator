@@ -52,7 +52,7 @@ OPTION_GROUPS = {
     "no_trailing_slash_compat": "Migration steps", "no_properties_migrator": "Migration steps",
     "dependency_plan": "Company dependencies", "internal_group": "Company dependencies", "no_dependency_detection": "Company dependencies",
     "offline": "Build", "rewrite_spring_version": "Advanced", "rewrite_plugin_version": "Advanced", "extra_recipe": "Advanced",
-    "json": "Run",
+    "json": "Run", "skip_frontend": "Build", "rewrite_frontend": "Advanced", "rewrite_args": "Advanced", "rewrite_no_fork": "Advanced",
 }
 
 
@@ -306,7 +306,7 @@ class JobStore:
                 work = job.dir / "workspace" / project.name
                 job.append(f"[dashboard] copying {project} -> {work} (the original stays untouched)")
                 shutil.rmtree(work, ignore_errors=True)
-                shutil.copytree(project, work, ignore=shutil.ignore_patterns("target", "build", ".gradle", "node_modules"))
+                shutil.copytree(project, work, ignore=build_output_ignore)
                 self._prepare_copy_git(job, work)
             out_file = job.dir / ("scan.md" if job.d["command"] == "scan" else sm.DEP_PLAN_FILE)
             argv = build_argv(job.d["command"], str(work), job.d["options"], self.schema, job.dir / "report", out_file)
@@ -376,6 +376,18 @@ class JobStore:
         with self.lock:
             self.jobs.pop(job.id, None)
         shutil.rmtree(job.dir, ignore_errors=True)
+
+
+def build_output_ignore(directory: str, names: list[str]) -> set[str]:
+    """Skip build output when copying a project: `target` only next to a pom.xml, `build` only next to a Gradle build
+    (a folder called build elsewhere can be real source, e.g. in a frontend), plus caches."""
+    d = Path(directory)
+    skip = {n for n in names if n in (".gradle", "node_modules")}
+    if "target" in names and (d / "pom.xml").exists():
+        skip.add("target")
+    if "build" in names and ((d / "build.gradle").exists() or (d / "build.gradle.kts").exists()):
+        skip.add("build")
+    return skip
 
 
 # --------------------------------------------------------------------------- #

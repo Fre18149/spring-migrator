@@ -42,6 +42,24 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual(scan[-2:], ["--out", "/o/scan.md"])
 
 
+class CopyTest(unittest.TestCase):
+    def test_only_build_output_is_skipped(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "pom.xml").write_text("<project/>")
+            for d in ("target", "src/main/frontend/build", "src/main/frontend/node_modules"):
+                (root / d).mkdir(parents=True)
+                (root / d / "x").write_text("x")
+            out = root.parent / (root.name + "-copy")
+            web.shutil.copytree(root, out, ignore=web.build_output_ignore)
+            try:
+                self.assertFalse((out / "target").exists())
+                self.assertTrue((out / "src/main/frontend/build/x").exists())     # not a build output
+                self.assertFalse((out / "src/main/frontend/node_modules").exists())
+            finally:
+                web.shutil.rmtree(out)
+
+
 class TrackerTest(unittest.TestCase):
     def test_stages(self):
         t = web.StageTracker()

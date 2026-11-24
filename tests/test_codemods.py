@@ -408,6 +408,40 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class BuilderTest(unittest.TestCase):
+    def capture(self, **kw):
+        seen = []
+        old = sm.run
+        sm.run = lambda cmd, cwd, log, env: seen.append(cmd) or 0
+        try:
+            b = sm.Builder(Path("."), "maven", {}, Path(tempfile.mkdtemp()), ["-s", "corp.xml"], None, **kw)
+            b.rewrite("s", ["R"], ["a:b:1"], dry=False)
+            b.verify("s")
+        finally:
+            sm.run = old
+        return seen
+
+    def test_frontend_skipped_only_for_openrewrite_by_default(self):
+        rewrite, verify = self.capture()
+        self.assertIn("-Dskip.npm", rewrite)
+        self.assertIn("-Dskip.installnodenpm", rewrite)
+        self.assertNotIn("-Dskip.npm", verify)          # your build gates still build the frontend
+        self.assertIn("corp.xml", rewrite)
+        self.assertTrue(rewrite[4].endswith(":run"))
+
+    def test_skip_frontend_everywhere_and_no_fork(self):
+        rewrite, verify = self.capture(skip_frontend=True, no_fork=True, rewrite_extra=["-Ddocker.skip"])
+        self.assertIn("-Dskip.npm", verify)
+        self.assertEqual(rewrite.count("-Dskip.npm"), 1)
+        self.assertTrue(rewrite[4].endswith(":runNoFork"))
+        self.assertIn("-Ddocker.skip", rewrite)
+        self.assertNotIn("-Ddocker.skip", verify)
+
+    def test_rewrite_frontend_keeps_npm(self):
+        rewrite, _ = self.capture(rewrite_frontend=True)
+        self.assertNotIn("-Dskip.npm", rewrite)
+
+
 class MultiModuleTest(unittest.TestCase):
     ROOT = """
         <project>
