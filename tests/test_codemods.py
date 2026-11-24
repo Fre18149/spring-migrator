@@ -408,5 +408,99 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class CompanyDependenciesTest(unittest.TestCase):
+    """Classification works on files in the local Maven repo; MavenRepo.resolve is replaced by a no-op."""
+
+    def repo(self, files: dict) -> "sm.MavenRepo":
+        self.tmp = tempfile.TemporaryDirectory()
+        local = Path(self.tmp.name)
+        import zipfile
+        for name, content in files.items():
+            p = local / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            if name.endswith(".jar"):
+                with zipfile.ZipFile(p, "w") as z:
+                    for entry, data in content.items():
+                        z.writestr(entry, data)
+            else:
+                p.write_text(content, encoding="utf-8")
+        r = sm.MavenRepo(Path("."), "mvn", [], {}, local)
+        r._local = local
+        r.resolve = lambda items, name: None
+        return r
+
+    @staticmethod
+    def pom(g, a, v, parent=None, deps=""):
+        par = f"<parent><groupId>{parent[0]}</groupId><artifactId>{parent[1]}</artifactId><version>{parent[2]}</version></parent>" if parent else ""
+        return f"<project>{par}<groupId>{g}</groupId><artifactId>{a}</artifactId><version>{v}</version><dependencies>{deps}</dependencies></project>"
+
+    def test_classification_and_plan(self):
+        boot = "org.springframework.boot", "spring-boot-starter-parent"
+        files = {
+            "com/acme/acme-parent/maven-metadata-company.xml": "<versions><version>1.0</version><version>2.0</version><version>3.0</version></versions>",
+            "com/acme/acme-parent/1.0/acme-parent-1.0.pom": self.pom("com.acme", "acme-parent", "1.0", (*boot, "2.7.18")),
+            "com/acme/acme-parent/2.0/acme-parent-2.0.pom": self.pom("com.acme", "acme-parent", "2.0", (*boot, "3.5.16")),
+            "com/acme/acme-parent/3.0/acme-parent-3.0.pom": self.pom("com.acme", "acme-parent", "3.0", (*boot, "4.1.3")),
+            # a starter without Boot in its POM: classified from the jar (javax + spring.factories -> Boot 2)
+            "com/acme/web-lib/maven-metadata-company.xml": "<versions><version>1.1</version><version>1.5</version></versions>",
+            "com/acme/web-lib/1.1/web-lib-1.1.pom": self.pom("com.acme", "web-lib", "1.1"),
+            "com/acme/web-lib/1.1/web-lib-1.1.jar": {"META-INF/spring.factories": "org.springframework.boot.autoconfigure.EnableAutoConfiguration=a.B",
+                                                    "a/B.class": b"\xca\xfe javax/servlet/Filter"},
+            "com/acme/web-lib/1.5/web-lib-1.5.pom": self.pom("com.acme", "web-lib", "1.5"),
+            "com/acme/web-lib/1.5/web-lib-1.5.jar": {"META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports": "a.B",
+                                                    "a/B.class": b"\xca\xfe jakarta/servlet/Filter"},
+            # only ever built for Boot 2
+            "com/acme/old-lib/maven-metadata-company.xml": "<versions><version>0.9</version></versions>",
+            "com/acme/old-lib/0.9/old-lib-0.9.pom": self.pom("com.acme", "old-lib", "0.9", ("com.acme", "acme-parent", "1.0")),
+            # plain utility library: no Spring coupling
+            "com/acme/util/maven-metadata-company.xml": "<versions><version>4.0</version></versions>",
+            "com/acme/util/4.0/util-4.0.pom": self.pom("com.acme", "util", "4.0"),
+            "com/acme/util/4.0/util-4.0.jar": {"u/U.class": b"\xca\xfe java/lang/String"},
+        }
+        r = self.repo(files)
+        pr = Project({"pom.xml": """
+            <project>
+              <parent><groupId>com.acme</groupId><artifactId>acme-parent</artifactId><version>1.0</version></parent>
+              <groupId>com.acme</groupId><artifactId>shop</artifactId>
+              <properties><web.version>1.1</web.version></properties>
+              <dependencies>
+                <dependency><groupId>com.acme</groupId><artifactId>web-lib</artifactId><version>${web.version}</version></dependency>
+                <dependency><groupId>com.acme</groupId><artifactId>old-lib</artifactId><version>0.9</version></dependency>
+                <dependency><groupId>com.acme</groupId><artifactId>util</artifactId><version>4.0</version></dependency>
+                <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+              </dependencies>
+            </project>
+            """})
+        plan = sm.detect_dependency_plan(pr.root, r, "4.1", [], say_=lambda m: None)
+        by = {d["coordinate"]: d for d in plan["dependencies"]}
+        self.assertEqual(by["com.acme:acme-parent"]["upgrades"], {"3.5": "2.0", "4.0": "3.0", "4.1": "3.0"})
+        self.assertEqual(by["com.acme:web-lib"]["upgrades"]["3.5"], "1.5")
+        self.assertIn("spring.factories", by["com.acme:web-lib"]["builtAgainst"]["1.1"])
+        self.assertTrue(by["com.acme:old-lib"]["status"].startswith("NO compatible version"))
+        self.assertTrue(by["com.acme:util"]["status"].startswith("no Spring"))
+        self.assertNotIn("org.springframework.boot:spring-boot-starter-web", by)
+
+        sm.apply_dependency_plan(pr.root, plan, "3.5")
+        pom = pr["pom.xml"]
+        self.assertIn("<web.version>1.5</web.version>", pom)
+        self.assertIn("<artifactId>acme-parent</artifactId><version>2.0</version>", pom)
+        sm.apply_dependency_plan(pr.root, plan, "4.1")
+        self.assertIn("<artifactId>acme-parent</artifactId><version>3.0</version>", pr["pom.xml"])
+        pr.close()
+        self.tmp.cleanup()
+
+    def test_interactive_choice_and_gradle(self):
+        plan = {"target": "3.5", "dependencies": [
+            {"coordinate": "com.acme:lib", "kind": "dependency", "current": "1.0", "status": "upgrade",
+             "builtAgainst": {"1.0": "Boot 2.7", "2.0": "Boot 3.5"}, "upgrades": {"3.5": "2.0"}}]}
+        answers = iter(["2.1"])
+        sm.interactive_plan(plan, inp=lambda prompt: next(answers), out=lambda *x: None)
+        self.assertEqual(plan["dependencies"][0]["upgrades"]["3.5"], "2.1")
+        pr = Project({"build.gradle": "dependencies {\n    implementation 'com.acme:lib:1.0'\n}\n"})
+        sm.apply_dependency_plan(pr.root, plan, "3.5")
+        self.assertIn("'com.acme:lib:2.1'", pr["build.gradle"])
+        pr.close()
+
+
 if __name__ == "__main__":
     unittest.main()

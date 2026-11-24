@@ -10,7 +10,7 @@ run() {  # run <example-dir-name>; leaves you in the migrated copy
   git init -q -b main && git add -A && git -c user.name=t -c user.email=t@t commit -qm baseline
   git config user.name t; git config user.email t@t
   python3 "$here/spring_migrate.py" migrate . --target "$TARGET" --report-dir "$work/report" ${BUILD_ARGS:+--build-args "$BUILD_ARGS"}
-  grep -q "<version>${TARGET}\." pom.xml
+  [ -n "${NO_BOOT_IN_POM:-}" ] || grep -q "<version>${TARGET}\." pom.xml
   grep -q "all stages completed" "$work/report/MIGRATION_REPORT.md"
   ! grep -rqE "javax\.(servlet|persistence|validation)" src
   ! git log --format=%s | grep -qv "^chore(migration)\|^baseline$"   # every commit came from the tool
@@ -40,8 +40,16 @@ authserver() {
   ! grep -q "spring-security-oauth2-autoconfigure" pom.xml
   grep -q "RegisteredClientRepository" src/main/java/com/acme/auth/AuthServerConfig.java
 }
+company() {
+  # a company parent (on spring-boot-starter-parent 2.7) and a javax/spring.factories starter from a fake Artifactory
+  local repo; repo="$(mktemp -d)"
+  "$here/tests/build-company-repo.sh" "$repo" >/dev/null
+  NO_BOOT_IN_POM=1 BUILD_ARGS="-s $repo/settings.xml${BUILD_ARGS:+ $BUILD_ARGS}" run legacy-company
+  grep -A2 "<artifactId>acme-parent</artifactId>" pom.xml | grep -q "<version>3.0.0</version>"
+  grep -q "<acme-audit.version>3.0.0</acme-audit.version>" pom.xml
+}
 case "${1:-all}" in
-  demo|openjpa|cloud|authserver) "$1";;
-  all) demo; openjpa; cloud; authserver;;
-  *) echo "usage: $0 [demo|openjpa|cloud|authserver|all]"; exit 2;;
+  demo|openjpa|cloud|authserver|company) "$1";;
+  all) demo; openjpa; cloud; authserver; company;;
+  *) echo "usage: $0 [demo|openjpa|cloud|authserver|company|all]"; exit 2;;
 esac

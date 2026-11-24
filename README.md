@@ -93,6 +93,42 @@ After the 3.5 recipes:
 * Maven wrapper < 3.6.3 and Gradle wrapper below the Boot minimum bumped
 * Third-party: MapStruct < 1.5.5, Lombok pinned in `annotationProcessorPaths`, Querydsl `jakarta` classifier
 
+## Company parents, BOMs and internal libraries (Artifactory / Nexus)
+OpenRewrite only upgrades `spring-boot-starter-parent` and libraries it knows. A **company parent POM** that inherits
+from Boot, an internal **BOM**, or **internal starters** built against Boot 2 are left alone. The last case is the worst:
+a Boot 2 starter registered via `spring.factories` is silently ignored by Boot 3, so nothing fails to compile and its
+beans just vanish.
+
+`migrate` handles this automatically (Maven):
+1. It resolves through **your own Maven and settings**, so pass your Artifactory settings as usual:
+   `--build-args "-s /path/to/settings.xml"`. Mirrors, credentials and encrypted passwords work because Maven does the
+   downloading. The Boot version is read through the parent chain when it is not in your POM.
+2. For every parent, imported BOM and explicitly versioned dependency (Spring itself excluded), it downloads the
+   version list and the newest release of each major, and classifies each by **what it was built against**: the Boot
+   version in its parent chain, the Spring version of its dependencies, `javax` vs `jakarta` references in the bytecode,
+   and whether auto-configuration is registered via `spring.factories` or `AutoConfiguration.imports`.
+3. It picks, per stage, the newest version built for that Boot line (never past `--target`). The versions are applied
+   after that stage's recipes and before its build gate, including versions held in a `<properties>` entry.
+4. The plan is written to `dependency-plan.json` in the report directory and shown in the report. Libraries with no
+   Spring coupling are left alone; libraries with **no compatible release** are listed as a TODO (they need a new
+   release of that library).
+
+To choose yourself:
+```bash
+# detect and review (or answer per dependency with --interactive), then edit the "upgrades" per Boot line
+python3 spring_migrate.py deps /path/to/project --build-args "-s settings.xml" --out plan.json [--interactive]
+python3 spring_migrate.py migrate /path/to/project --build-args "-s settings.xml" --dependency-plan plan.json
+```
+`migrate --interactive` asks the same questions inline. `--internal-group com.acme` marks your groupIds in the report
+(they are also guessed from the project's groupId and from non-public groups); `--no-dependency-detection` turns it off.
+
+Plan entries look like this (Gradle projects: write it by hand; it is applied to `group:artifact:version` strings):
+```json
+{"target": "4.1", "dependencies": [
+  {"coordinate": "com.acme.platform:acme-parent", "kind": "parent", "current": "1.4.0",
+   "upgrades": {"3.5": "2.1.0", "4.0": "3.0.0", "4.1": "3.0.0"}}]}
+```
+
 ## OpenJPA -> Hibernate
 OpenRewrite has no recipe for this, so the tool does it itself, as its own stage on Boot 2.7 (Hibernate 5.6, still
 `javax`) *before* the Spring 6 jump, so a persistence regression is caught on its own commit. Run it alone with
@@ -126,7 +162,7 @@ with file:line, the report repeats them, and a leftover reference fails the stag
   and schema mapping against your real database; lazy loading; the end-of-report checklist
 
 ## Verified
-`tests/e2e.sh` (Maven, JDK 21) migrates four Boot 2.7.13 sample projects to **Boot 4.1.3**. Each has tests that are
+`tests/e2e.sh` (Maven, JDK 21) migrates five Boot 2.7 sample projects to **Boot 4.1.3**. Each has tests that are
 green on the original code and must stay green after every stage, and the script checks that every commit came from
 the tool (no manual fixes):
 * `examples/legacy-demo`: JPA, Security, MVC, validation, JUnit 4, `spring.factories`, Actuator httptrace, Docker/CI
@@ -137,10 +173,13 @@ the tool (no manual fixes):
   `openjdk` images, Maven wrapper 3.6.0
 * `examples/legacy-authserver`: `@EnableAuthorizationServer` with HMAC-signed JWTs; a token is fetched from
   `/oauth/token` before and after migration
+* `examples/legacy-company`: company parent (`acme-parent` 1.4.0 on Boot 2.7) and an internal javax /
+  `spring.factories` starter, served from a fake Artifactory (`tests/build-company-repo.sh` builds a file-based Maven
+  repo plus `settings.xml`); the test checks the starter's filter is still auto-configured after every stage
 
 `tests/test_codemods.py` (`python3 -m unittest discover -s tests`) unit-tests the codemods the samples do not exercise
 (Zuul, Ribbon rules, opaque/HMAC/SSO OAuth2, YAML editing, ID pinning modes, dialects, CI images, wrappers, ...).
 
-Not verified: the Gradle path (implemented, untested), multi-module and Kotlin projects, non-H2 databases, PowerMock
+Not verified: the Gradle path (implemented, untested; dependency detection is Maven-only), multi-module and Kotlin projects, non-H2 databases, PowerMock
 (cannot run on JDK 21 at all, so no green baseline was possible here; the OpenRewrite recipe handles it).
 Review the diff and run your integration tests against your real database before going live.

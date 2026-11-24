@@ -3227,6 +3227,384 @@ def javax_jars(classpath: list[str], direct: set[str] | None = None) -> list[str
 
 
 # --------------------------------------------------------------------------- #
+# Company / internal dependencies (Artifactory, Nexus ...)
+#
+# A company parent POM or BOM that brings Spring Boot, and internal libraries built against one Boot line, are not
+# upgraded by OpenRewrite. We resolve them through the project's own Maven (so settings.xml, mirrors and encrypted
+# credentials work), classify every available version by what it was built against, and pick per stage the newest
+# version that matches. The result is a plan file you can review/edit (or answer interactively).
+# --------------------------------------------------------------------------- #
+DEP_PLAN_FILE = "dependency-plan.json"
+# handled by OpenRewrite / the codemods / Boot's own dependency management
+DEP_SKIP_GROUPS = ("org.springframework", "io.springfox", "com.netflix", "org.powermock", "org.apache.openjpa", "org.apache.httpcomponents",
+                   "javax.", "jakarta.", "org.junit", "junit", "org.openrewrite", "io.micrometer", "org.hibernate", "com.h2database")
+PUBLIC_GROUPS = ("org.apache", "com.fasterxml", "com.google", "org.projectlombok", "org.mockito", "org.postgresql", "com.mysql", "mysql",
+                 "org.mariadb", "io.github.resilience4j", "org.springdoc", "org.slf4j", "ch.qos", "org.yaml", "org.assertj", "org.hamcrest",
+                 "org.flywaydb", "org.liquibase", "io.projectreactor", "io.netty", "org.aspectj", "org.mapstruct", "com.querydsl",
+                 "org.testcontainers", "io.swagger", "org.thymeleaf", "org.webjars", "com.zaxxer", "org.jboss", "org.glassfish", "org.eclipse",
+                 "com.sun", "org.codehaus", "commons-", "io.jsonwebtoken", "org.bouncycastle", "com.nimbusds", "net.", "io.", "com.github.")
+
+
+@dataclass
+class DepRef:
+    kind: str                 # parent | bom | dependency
+    group: str
+    artifact: str
+    version: str
+    prop: str | None          # property that holds the version, if any
+    files: list = field(default_factory=list)
+
+
+def _pom_props(text: str) -> dict:
+    m = re.search(r"<properties>(.*?)</properties>", text, re.S)
+    return dict(re.findall(r"<([\w.\-]+)>\s*([^<]*?)\s*</\1>", m.group(1))) if m else {}
+
+
+def collect_dependency_refs(root: Path) -> list[DepRef]:
+    """Parents, imported BOMs and explicitly versioned dependencies that are not Spring/Boot itself."""
+    refs: dict[tuple, DepRef] = {}
+    props: dict[str, str] = {}
+    poms = [p for p in build_files(root) if p.name == "pom.xml"]
+    for p in poms:
+        props.update(_pom_props(read(p) or ""))
+
+    def add(kind, g, a, v, p):
+        if not (g and a and v) or g.startswith(DEP_SKIP_GROUPS):
+            return
+        prop = None
+        m = re.fullmatch(r"\$\{([\w.\-]+)\}", v.strip())
+        if m:
+            prop = m.group(1)
+            v = props.get(prop, "")
+            if not v or "${" in v:
+                return
+        r = refs.setdefault((kind, g, a), DepRef(kind, g, a, v.strip(), prop))
+        r.files.append(rel(p, root))
+    for p in poms:
+        t = read(p) or ""
+        pm = re.search(r"<parent>(.*?)</parent>", t, re.S)
+        if pm:
+            add("parent", _first_tag(pm.group(1), "groupId"), _first_tag(pm.group(1), "artifactId"), _first_tag(pm.group(1), "version"), p)
+        for dm in re.finditer(r"<dependencyManagement>(.*?)</dependencyManagement>", t, re.S):
+            for d in re.finditer(r"<dependency>(.*?)</dependency>", dm.group(1), re.S):
+                b = d.group(1)
+                kind = "bom" if "<scope>import</scope>" in b else "dependency"
+                add(kind, _first_tag(b, "groupId"), _first_tag(b, "artifactId"), _first_tag(b, "version"), p)
+        for s, e, g, a in pom_dependency_blocks(t):
+            add("dependency", g, a, _first_tag(t[s:e].split("<exclusions>")[0], "version"), p)
+    for p in build_files(root):
+        if p.name == "pom.xml":
+            continue
+        for m in re.finditer(r"['\"]([\w.\-]+):([\w.\-]+):([\w.\-]+)['\"]", read(p) or ""):
+            add("dependency", m.group(1), m.group(2), m.group(3), p)
+    return list(refs.values())
+
+
+def is_internal(group: str, internal_groups: list[str], root_group: str | None) -> bool:
+    if any(group == g or group.startswith(g + ".") for g in internal_groups):
+        return True
+    if root_group:
+        top = ".".join(root_group.split(".")[:2])
+        if group == top or group.startswith(top + "."):
+            return True
+    return not group.startswith(PUBLIC_GROUPS)
+
+
+class MavenRepo:
+    """Resolves artifacts through `mvn` with the project's settings (Artifactory/Nexus auth, mirrors) into the local repo."""
+
+    def __init__(self, root: Path, exe: str, extra: list[str], env: dict, log_dir: Path):
+        self.root, self.exe, self.extra, self.env, self.log_dir = root, exe, extra, env, log_dir
+        self._local = None
+
+    def local(self) -> Path:
+        if self._local is None:
+            r = subprocess.run([self.exe, "-B", "-q", "help:evaluate", "-Dexpression=settings.localRepository", "-DforceStdout"] + self.extra,
+                               cwd=self.root, env=self.env, capture_output=True, text=True)
+            out = [l for l in r.stdout.strip().splitlines() if l.strip() and "Picked up" not in l]
+            self._local = Path(out[-1].strip()) if r.returncode == 0 and out else Path.home() / ".m2/repository"
+        return self._local
+
+    def _repositories_block(self) -> str:
+        t = read(self.root / "pom.xml") or ""
+        m = re.search(r"<repositories>.*?</repositories>", t, re.S)
+        return m.group(0) if m else ""
+
+    def resolve(self, items: list[tuple], name: str):
+        """items: (group, artifact, version-or-range, type). Failures of single items are tolerated."""
+        if not items:
+            return
+        work = self.log_dir / f"resolve-{name}"
+        work.mkdir(parents=True, exist_ok=True)
+        for i, (g, a, v, t) in enumerate(items):   # one pom per item, so a missing artifact does not hide the others
+            d = work / str(i)
+            d.mkdir(exist_ok=True)
+            dep = (f"<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId><version>{v}</version><type>{t}</type>"
+                   f"<exclusions><exclusion><groupId>*</groupId><artifactId>*</artifactId></exclusion></exclusions></dependency>")
+            (d / "pom.xml").write_text(
+                '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>'
+                f'<groupId>spring-migrate</groupId><artifactId>probe-{i}</artifactId><version>1</version><packaging>pom</packaging>'
+                f'{self._repositories_block()}<dependencies>{dep}</dependencies></project>', encoding="utf-8")
+        # a reactor build resolves everything in one Maven start
+        modules = "".join(f"<module>{i}</module>" for i in range(len(items)))
+        (work / "pom.xml").write_text(
+            '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>'
+            '<groupId>spring-migrate</groupId><artifactId>probe</artifactId><version>1</version><packaging>pom</packaging>'
+            f'<modules>{modules}</modules></project>', encoding="utf-8")
+        run([self.exe, "-B", "-ntp", "-U", "-fae", "-f", str(work / "pom.xml"), "dependency:resolve"] + self.extra,
+            work, self.log_dir / f"resolve-{name}.log", self.env)
+
+    def versions(self, g: str, a: str) -> list[str]:
+        d = self.local() / g.replace(".", "/") / a
+        vs = set()
+        for m in d.glob("maven-metadata*.xml"):
+            vs.update(re.findall(r"<version>([^<]+)</version>", read(m) or ""))
+        return sorted((v for v in vs if "SNAPSHOT" not in v), key=vtuple)
+
+    def path(self, g, a, v, ext) -> Path:
+        return self.local() / g.replace(".", "/") / a / v / f"{a}-{v}.{ext}"
+
+
+def _resolve_prop(v: str, props: dict) -> str:
+    for _ in range(5):
+        v2 = re.sub(r"\$\{([\w.\-]+)\}", lambda m: props.get(m.group(1), m.group(0)), v)
+        if v2 == v:
+            break
+        v = v2
+    return v
+
+
+def built_against(repo: MavenRepo, g: str, a: str, v: str, depth: int = 0) -> dict:
+    """What a published artifact was built against: {'boot': '3.5.16'|None, 'spring': '6'|None, 'ee': 'javax'|'jakarta'|None,
+    'autoconfig': 'spring.factories'|'imports'|None, 'found': bool}."""
+    info = {"boot": None, "spring": None, "ee": None, "autoconfig": None, "found": False, "chain": []}
+    pom = repo.path(g, a, v, "pom")
+    text = read(pom) if pom.exists() else None
+    if text is None:
+        return info
+    info["found"] = True
+    props = _pom_props(text)
+    props.setdefault("project.version", v)
+    pm = re.search(r"<parent>(.*?)</parent>", text, re.S)
+    if pm:
+        pg, pa, pv = (_first_tag(pm.group(1), x) for x in ("groupId", "artifactId", "version"))
+        info["chain"].append(f"{pg}:{pa}:{pv}")
+        props.setdefault("project.parent.version", pv)
+        if pg == "org.springframework.boot" and pa in ("spring-boot-starter-parent", "spring-boot-dependencies", "spring-boot-parent"):
+            info["boot"] = pv
+        elif depth < 8:
+            up = built_against(repo, pg, pa, pv, depth + 1)
+            info["boot"] = info["boot"] or up["boot"]
+            info["spring"] = up["spring"]
+            info["ee"] = up["ee"]
+            info["chain"] += up["chain"]
+    for d in re.finditer(r"<dependency>(.*?)</dependency>", text, re.S):
+        b = d.group(1)
+        dg, da, dv = _first_tag(b, "groupId"), _first_tag(b, "artifactId"), _resolve_prop(_first_tag(b, "version"), props)
+        if dg == "org.springframework.boot" and dv and "${" not in dv and not info["boot"]:
+            info["boot"] = dv
+        if dg == "org.springframework" and dv and "${" not in dv and da.startswith("spring-"):
+            info["spring"] = dv.split(".")[0]
+        if dg.startswith("jakarta.") or dg == "org.glassfish.jakarta":
+            info["ee"] = "jakarta"
+        elif re.match(r"javax\.(servlet|persistence|validation|transaction|ws\.rs|xml\.bind|mail|jms|inject)", dg) and info["ee"] != "jakarta":
+            info["ee"] = "javax"
+    jar = repo.path(g, a, v, "jar")
+    if jar.exists():
+        import zipfile
+        try:
+            with zipfile.ZipFile(jar) as z:
+                names = set(z.namelist())
+                if "META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports" in names:
+                    info["autoconfig"] = "imports"
+                elif "META-INF/spring.factories" in names and b"EnableAutoConfiguration" in z.read("META-INF/spring.factories"):
+                    info["autoconfig"] = "spring.factories"
+                javax = jakarta = False
+                for n in names:
+                    if n.endswith(".class") and not n.startswith("META-INF/versions/"):
+                        bts = z.read(n)
+                        javax = javax or JAVAX_EE_BYTES.search(bts) is not None
+                        jakarta = jakarta or re.search(rb"jakarta/(?:servlet|persistence|validation|transaction|ws/rs|xml/bind|annotation|inject)/", bts) is not None
+                info["ee"] = "jakarta" if jakarta else ("javax" if javax else info["ee"])
+        except Exception:
+            pass
+    return info
+
+
+def boot_line_of(info: dict) -> str:
+    """'2', '3', '4', '3+' (Jakarta, Boot line unknown), 'neutral' (no Spring/EE coupling) or 'unknown'."""
+    if not info["found"]:
+        return "unknown"
+    if info["boot"]:
+        return info["boot"].split(".")[0]
+    if info["spring"]:
+        return {"5": "2", "6": "3", "7": "4"}.get(info["spring"], "unknown")
+    if info["ee"] == "jakarta" or info["autoconfig"] == "imports":
+        return "3+"
+    if info["ee"] == "javax" or info["autoconfig"] == "spring.factories":
+        return "2"
+    return "neutral"
+
+
+def _accepts(line: str, cls: str, info: dict, target: str) -> int:
+    """Score how well a version fits a stage's Boot line (0 = not acceptable)."""
+    major = line.split(".")[0]
+    if cls == major:
+        bv = info.get("boot")
+        if bv and vtuple(bv)[:2] > vtuple(target)[:2]:
+            return 0  # never go past the requested target
+        if major == "3" and bv and vtuple(bv)[:2] > vtuple(line)[:2]:
+            return 0
+        return 3
+    if cls == "3+":
+        return 2
+    if cls == "neutral":
+        return 1
+    if major == "4" and cls == "3":
+        return 0
+    return 0
+
+
+def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_groups: list[str], say_=None) -> dict:
+    say_ = say_ or say
+    refs = collect_dependency_refs(root)
+    root_pom = re.sub(r"<parent>.*?</parent>", "", read(root / "pom.xml") or "", flags=re.S)
+    root_group = _first_tag(root_pom, "groupId") or None
+    lines = [l for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(target)]
+    say_(f"[deps] checking {len(refs)} parent/BOM/dependency reference(s) through your Maven settings")
+    repo.resolve([(r.group, r.artifact, "[0,)", "pom") for r in refs], "metadata")
+    candidates = {}
+    to_fetch = []
+    for r in refs:
+        newer = [v for v in repo.versions(r.group, r.artifact) if vtuple(v) > vtuple(r.version) and re.match(r"^[\d.]+(?:[.-](?:RELEASE|Final|GA))?$", v)]
+        by_major: dict[str, str] = {}
+        for v in newer:
+            by_major[v.split(".")[0]] = v       # sorted ascending -> keeps the latest of each major
+        cands = [r.version] + list(by_major.values())
+        candidates[(r.kind, r.group, r.artifact)] = cands
+        to_fetch += [(r.group, r.artifact, v, "pom" if r.kind != "dependency" else "jar") for v in cands]
+    repo.resolve(sorted(set(to_fetch)), "candidates")
+    plan = {"target": target, "internalGroups": internal_groups, "dependencies": []}
+    for r in refs:
+        cands = candidates[(r.kind, r.group, r.artifact)]
+        infos = {v: built_against(repo, r.group, r.artifact, v) for v in cands}
+        cur = infos[r.version]
+        cur_cls = boot_line_of(cur)
+        entry = {"coordinate": f"{r.group}:{r.artifact}", "kind": r.kind, "current": r.version, "versionProperty": r.prop,
+                 "files": r.files, "internal": is_internal(r.group, internal_groups, root_group),
+                 "builtAgainst": {v: _describe(i) for v, i in infos.items()}, "upgrades": {}, "status": ""}
+        if cur_cls in ("neutral",):
+            entry["status"] = "no Spring/Java EE coupling - no change needed"
+        elif cur_cls == "unknown":
+            entry["status"] = "could not be resolved - check --build-args / settings.xml"
+        else:
+            missing = []
+            for line in lines:
+                best = None
+                for v in sorted(cands, key=vtuple):
+                    sc = _accepts(line, boot_line_of(infos[v]), infos[v], target)
+                    if sc and (best is None or (sc, vtuple(v)) >= (best[0], vtuple(best[1]))):
+                        best = (sc, v)
+                if best and best[1] != r.version:
+                    entry["upgrades"][line] = best[1]
+                elif not best:
+                    missing.append(line)
+            if missing and not entry["upgrades"]:
+                entry["status"] = f"NO compatible version found for Boot {', '.join(missing)} - needs a new release of this library"
+            elif missing:
+                entry["status"] = f"upgrade available, but nothing built for Boot {', '.join(missing)} (previous choice is kept there)"
+            elif entry["upgrades"]:
+                entry["status"] = "upgrade"
+            else:
+                entry["status"] = "current version already fits"
+        plan["dependencies"].append(entry)
+    return plan
+
+
+def _describe(i: dict) -> str:
+    if not i["found"]:
+        return "not resolvable"
+    parts = []
+    if i["boot"]:
+        parts.append(f"Boot {i['boot']}")
+    elif i["spring"]:
+        parts.append(f"Spring {i['spring']}")
+    if i["ee"]:
+        parts.append(i["ee"])
+    if i["autoconfig"]:
+        parts.append(f"autoconfig via {i['autoconfig']}")
+    return ", ".join(parts) or "no Spring/EE coupling"
+
+
+def render_dependency_plan(plan: dict) -> str:
+    L = ["## Company / internal dependencies", "",
+         "| Dependency | Kind | Current | Built against | " + " | ".join(f"Boot {l}" for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])) + " | Status |",
+         "|---|---|---|---|" + "---|" * len([l for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])]) + "---|"]
+    for d in plan["dependencies"]:
+        cols = [d["upgrades"].get(l, "-") for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])]
+        L.append(f"| `{d['coordinate']}`{' (internal)' if d.get('internal') else ''} | {d['kind']} | {d['current']} | "
+                 f"{d['builtAgainst'].get(d['current'], '')} | " + " | ".join(cols) + f" | {d['status']} |")
+    L += ["", f"Edit `{DEP_PLAN_FILE}` (the `upgrades` per Boot line) and pass it with `--dependency-plan` to override.", ""]
+    return "\n".join(L)
+
+
+def interactive_plan(plan: dict, inp=input, out=print) -> dict:
+    """Ask for every dependency that has Spring coupling which version to use per Boot line."""
+    for d in plan["dependencies"]:
+        if d["status"].startswith("no Spring") and not d["upgrades"]:
+            continue
+        out(f"\n{d['coordinate']} ({d['kind']}, current {d['current']}): {d['status']}")
+        for v, desc in d["builtAgainst"].items():
+            out(f"    {v:<14} {desc}")
+        for line in [l for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])]:
+            sugg = d["upgrades"].get(line, d["current"])
+            ans = inp(f"  version for Boot {line} [{sugg}] (enter = accept, 'skip' = keep {d['current']}): ").strip()
+            if ans.lower() == "skip":
+                d["upgrades"].pop(line, None)
+            elif ans:
+                d["upgrades"][line] = ans
+        d["status"] = "chosen interactively"
+    return plan
+
+
+def apply_dependency_plan(root: Path, plan: dict, line: str) -> list[str]:
+    """Set the versions the plan chose for this Boot line (parent, BOM import, dependency, or the version property)."""
+    changes = []
+    for d in plan.get("dependencies", []):
+        v = d.get("upgrades", {}).get(line)
+        if not v:
+            continue
+        g, a = d["coordinate"].split(":")[:2]
+        for bf in build_files(root):
+            t = read(bf) or ""
+            if a not in t:
+                continue
+            new = t
+            if bf.name == "pom.xml":
+                if d.get("versionProperty"):
+                    new = re.sub(r"(<" + re.escape(d["versionProperty"]) + r">)[^<]*(</" + re.escape(d["versionProperty"]) + r">)",
+                                 rf"\g<1>{v}\g<2>", new)
+                blk = r"(<groupId>" + re.escape(g) + r"</groupId>\s*<artifactId>" + re.escape(a) + r"</artifactId>\s*<version>)(?!\$\{)[^<]+(</version>)"
+                new = re.sub(blk, rf"\g<1>{v}\g<2>", new)
+            else:
+                new = re.sub(r"(['\"]" + re.escape(g) + ":" + re.escape(a) + r":)[\w.\-]+(['\"])", rf"\g<1>{v}\g<2>", new)
+            if write_if_changed(bf, t, new):
+                changes.append(f"{rel(bf, root)}: {d['coordinate']} -> {v} (built for Boot {line})")
+    return changes
+
+
+def effective_boot_version(root: Path, exe: str, extra: list[str], env: dict) -> str | None:
+    """Boot version when it comes through a company parent/BOM: the resolved org.springframework.boot:spring-boot."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "deps.txt"
+        r = subprocess.run([exe, "-B", "-ntp", "-q", "dependency:list", "-DincludeGroupIds=org.springframework.boot",
+                            "-DincludeArtifactIds=spring-boot", f"-DoutputFile={out}", "-DexcludeTransitive=false"] + extra,
+                           cwd=root, env=env, capture_output=True, text=True)
+        m = re.search(r"org\.springframework\.boot:spring-boot:jar:([\w.\-]+)", read(out) or "") if out.exists() else None
+        return m.group(1) if m else None
+
+
+# --------------------------------------------------------------------------- #
 # Process / git helpers
 # --------------------------------------------------------------------------- #
 class MigrationError(Exception):
@@ -3436,7 +3814,12 @@ def cmd_migrate(a) -> int:
     info = pre["info"]
     if not info["tool"]:
         raise MigrationError("No pom.xml / build.gradle found in the project root.")
-    say(f"[preflight] {info['tool']} project, Spring Boot {info['boot_version']}, Java {info['java_version']}")
+    if not info["boot_version"] and info["tool"] == "maven":
+        exe = str(root / "mvnw") if (root / "mvnw").exists() else "mvn"
+        info["boot_version"] = effective_boot_version(root, exe, shlex.split(a.build_args or ""), env)
+        if info["boot_version"]:
+            say(f"[preflight] Spring Boot {info['boot_version']} comes through a company parent/BOM")
+    say(f"[preflight] {info['tool']} project, Spring Boot {info['boot_version'] or 'not detected'}, Java {info['java_version'] or 'from parent'}")
     bv = info["boot_version"] or "2.7"
     try:
         major, minor = int(bv.split(".")[0]), int(bv.split(".")[1])
@@ -3500,6 +3883,7 @@ def cmd_migrate(a) -> int:
 
     # ---- baseline --------------------------------------------------------
     results = []
+    todo_pre: list[str] = []
     if not a.skip_tests and not a.skip_baseline and not resuming and (a.no_git or created_branch):
         say("[baseline] build + tests on the ORIGINAL code (so you can tell old failures from new ones)")
         t0 = time.time()
@@ -3518,8 +3902,27 @@ def cmd_migrate(a) -> int:
         else:
             say("[baseline] OK")
 
+    # ---- company / internal dependencies --------------------------------
+    dep_plan = None
+    if a.dependency_plan:
+        dep_plan = json.loads(Path(a.dependency_plan).read_text(encoding="utf-8"))
+        say(f"[deps] using {a.dependency_plan}")
+    elif info["tool"] == "maven" and not a.no_dependency_detection:
+        dep_plan = detect_dependency_plan(root, MavenRepo(root, builder.exe, builder.extra, env, log_dir), a.target, a.internal_group or [])
+        if a.interactive:
+            dep_plan = interactive_plan(dep_plan)
+    if dep_plan:
+        (report_dir / DEP_PLAN_FILE).write_text(json.dumps(dep_plan, indent=2) + "\n", encoding="utf-8")
+        for d in dep_plan["dependencies"]:
+            if d.get("upgrades") or not d.get("status", "").startswith(("no Spring", "current")):
+                say(f"[deps] {d['coordinate']} {d['current']}: {d.get('status', '')} "
+                    + " ".join(f"{l}->{v}" for l, v in d.get("upgrades", {}).items()))
+                if d.get("status", "").startswith("NO compatible"):
+                    todo_pre.append(f"`{d['coordinate']}` {d['current']}: {d['status']}")
+        say(f"[deps] plan: {report_dir / DEP_PLAN_FILE} (edit and pass with --dependency-plan to change choices)")
+
     # ---- stages ----------------------------------------------------------
-    todo_all: list[str] = []
+    todo_all: list[str] = list(todo_pre)
     failed_stage = None
     for st in stages:
         say(f"\n[stage {st.key}] {st.title}")
@@ -3579,8 +3982,14 @@ def cmd_migrate(a) -> int:
                     say(f"[stage {st.key}] OpenRewrite failed (exit {code}):")
                     show_errors(log_dir / f"{st.key}-rewrite.log")
                 break
+        if st.boot_line and dep_plan and not (code != 0 or dl) and not (st.legacy and not a.no_legacy):
+            for c in apply_dependency_plan(root, dep_plan, st.boot_line):
+                pre_changes.append(c)
+                say(f"  deps: {c}")
         if st.legacy and not a.no_legacy and not (code != 0 or dl):
             post_c, post_t = run_legacy_codemods(root, "post")
+            if dep_plan and st.boot_line:
+                post_c += apply_dependency_plan(root, dep_plan, st.boot_line)
             todo_all += post_t
             pre_changes += post_c
             for c in post_c:
@@ -3644,7 +4053,7 @@ def cmd_migrate(a) -> int:
     # ---- report ----------------------------------------------------------
     post = scan(root)
     (report_dir / "scan-after.md").write_text(render_scan(post, "Post-migration scan"), encoding="utf-8")
-    write_report(report_dir, root, a, pre, post, results, todo_all, failed_stage, branch if not a.no_git else None)
+    write_report(report_dir, root, a, pre, post, results, todo_all, failed_stage, branch if not a.no_git else None, dep_plan)
     say(f"\n[done] report: {report_dir/'MIGRATION_REPORT.md'}")
     if failed_stage:
         say(f"[done] stopped at stage {failed_stage}. Automated changes are committed; fix the build on top of them, "
@@ -3653,7 +4062,7 @@ def cmd_migrate(a) -> int:
     return 0
 
 
-def write_report(report_dir, root, a, pre, post, results, todo, failed_stage, branch):
+def write_report(report_dir, root, a, pre, post, results, todo, failed_stage, branch, dep_plan=None):
     before, after = scan_counts(pre), scan_counts(post)
     rules = {r.id: r for r in RULES}
     L = ["# Migration report", "",
@@ -3672,6 +4081,8 @@ def write_report(report_dir, root, a, pre, post, results, todo, failed_stage, br
     L += [f"- {t}" for t in todo]
     if openjpa_present(pre):
         L += [""] + openjpa_section(root)
+    if dep_plan:
+        L += [""] + render_dependency_plan(dep_plan).splitlines()
     L += ["", "## Always review", ""] + [f"- {c}" for c in CHECKLIST]
     L += ["", "See `scan-after.md` for file/line locations and `logs/` for full build output.", ""]
     (report_dir / "MIGRATION_REPORT.md").write_text("\n".join(L), encoding="utf-8")
@@ -3719,6 +4130,25 @@ def cmd_openjpa(a) -> int:
     return 0
 
 
+def cmd_deps(a) -> int:
+    root = Path(a.path).resolve()
+    if not (root / "pom.xml").exists():
+        raise MigrationError("dependency detection resolves through Maven: no pom.xml found "
+                             "(for Gradle, write the plan by hand - see README - and pass it with --dependency-plan)")
+    env = build_env(getattr(a, "java_home", None))
+    exe = str(root / "mvnw") if (root / "mvnw").exists() else "mvn"
+    log_dir = Path(tempfile.mkdtemp(prefix="spring-migrate-deps-"))
+    repo = MavenRepo(root, exe, shlex.split(a.build_args or ""), env, log_dir)
+    plan = detect_dependency_plan(root, repo, a.target, a.internal_group or [])
+    if a.interactive:
+        plan = interactive_plan(plan)
+    out = Path(a.out or root.parent / f"{root.name}-{DEP_PLAN_FILE}")
+    out.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    print(render_dependency_plan(plan))
+    say(f"written {out} (logs: {log_dir}). Use it with: migrate {a.path} --dependency-plan {out}")
+    return 0
+
+
 def cmd_legacy(a) -> int:
     root = Path(a.path).resolve()
     changes, todo = run_legacy_codemods(root, "all")
@@ -3750,6 +4180,16 @@ def main(argv=None) -> int:
     o.add_argument("path")
     o.set_defaults(fn=cmd_openjpa)
 
+    dp = sub.add_parser("deps", help="detect company/internal dependencies (parent, BOMs, libraries) and plan their upgrades")
+    dp.add_argument("path")
+    dp.add_argument("--target", choices=("3.5", "4.0", "4.1"), default="4.1")
+    dp.add_argument("--internal-group", action="append", help="groupId prefix of your company artifacts (repeatable; also guessed)")
+    dp.add_argument("--build-args", help='extra args for mvn, e.g. "-s /path/settings.xml" for your Artifactory')
+    dp.add_argument("--java-home")
+    dp.add_argument("--interactive", action="store_true", help="choose the version per Boot line for each dependency")
+    dp.add_argument("--out", help=f"plan file (default: next to the project, <name>-{DEP_PLAN_FILE})")
+    dp.set_defaults(fn=cmd_deps)
+
     lg = sub.add_parser("legacy", help="run only the legacy-library codemods (Netflix, legacy OAuth2, id pinning, JPQL ...)")
     lg.add_argument("path")
     lg.add_argument("--offline", action="store_true")
@@ -3778,6 +4218,10 @@ def main(argv=None) -> int:
     m.add_argument("--no-legacy", action="store_true", help="skip the legacy-library codemods (Netflix, legacy OAuth2, id pinning, ...)")
     m.add_argument("--no-trailing-slash-compat", action="store_true", help="do not add the trailing-slash compatibility filter")
     m.add_argument("--no-properties-migrator", action="store_true", help="do not run tests with spring-boot-properties-migrator")
+    m.add_argument("--dependency-plan", help=f"use this {DEP_PLAN_FILE} (from `deps` or a previous run) instead of detecting")
+    m.add_argument("--internal-group", action="append", help="groupId prefix of your company artifacts (repeatable; also guessed)")
+    m.add_argument("--interactive", action="store_true", help="choose company dependency versions per Boot line interactively")
+    m.add_argument("--no-dependency-detection", action="store_true", help="do not look for company parent/BOM/library upgrades")
     m.add_argument("--offline", action="store_true", help="do not query Maven Central / SDKMAN for latest versions (use built-in ones)")
     m.set_defaults(fn=cmd_migrate)
 

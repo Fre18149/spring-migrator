@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <!-- company parent from Artifactory; it inherits from spring-boot-starter-parent 2.7.18 -->
+  <parent>
+    <groupId>com.acme.platform</groupId>
+    <artifactId>acme-parent</artifactId>
+    <version>1.4.0</version>
+    <relativePath/>
+  </parent>
+  <groupId>com.acme</groupId>
+  <artifactId>shop</artifactId>
+  <version>1.0.0</version>
+  <properties>
+    <acme-audit.version>1.2.0</acme-audit.version>
+  </properties>
+  <dependencies>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+    <dependency>
+      <groupId>com.acme.platform</groupId>
+      <artifactId>acme-audit-starter</artifactId>
+      <version>${acme-audit.version}</version>
+    </dependency>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
+  </dependencies>
+</project>
