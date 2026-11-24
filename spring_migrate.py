@@ -922,8 +922,22 @@ def add_import(text: str, fqcn: str) -> str:
         return text
     if any(i.rsplit(".", 1)[-1] == simple for i in imps):
         return text  # a different class with that simple name is imported; caller should use the FQCN
-    m = list(re.finditer(r"^\s*import\s+[^;]+;[ \t]*\n", text, re.M))
+    m = list(re.finditer(r"^[ \t]*import\s+(static\s+)?([\w.*]+)\s*;[ \t]*\n", text, re.M))
     line = f"import {fqcn};\n"
+    plain = [x for x in m if not x.group(1)]
+    if plain:
+        # keep the existing order (checkstyle ImportOrder/CustomImportOrder, spotless importOrder): insert before the first
+        # larger import of the same top-level package group, else after the last smaller one of that group
+        top = fqcn.split(".")[0]
+        same = [x for x in plain if x.group(2).split(".")[0] == top]
+        names = [x.group(2) for x in plain]
+        if names == sorted(names) or same:
+            group = same or plain
+            nxt = next((x for x in group if x.group(2) > fqcn), None)
+            if nxt is not None:
+                return text[:nxt.start()] + line + text[nxt.start():]
+            return text[:group[-1].end()] + line + text[group[-1].end():]
+        return text[:plain[-1].end()] + line + text[plain[-1].end():]
     if m:
         return text[:m[-1].end()] + line + text[m[-1].end():]
     pm = re.search(r"^\s*package\s+[\w.]+\s*;[ \t]*\n", text, re.M)
@@ -4015,7 +4029,7 @@ FRONTEND_SKIP = ["-Dskip.installnodenpm", "-Dskip.installnodecorepack", "-Dskip.
                  "-Dskip.npm", "-Dskip.npx", "-Dskip.yarn", "-Dskip.pnpm", "-Dskip.bun", "-Dskip.corepack", "-Dskip.bower",
                  "-Dskip.grunt", "-Dskip.gulp", "-Dskip.jspm", "-Dskip.karma", "-Dskip.webpack", "-Dskip.ember"]
 # Lines that explain a failure better than Maven's generic "[ERROR] Failed to execute goal ..."
-CAUSE_RX = re.compile(r"npm (?:ERR!|error)|yarn error|ERR_PNPM|\[ERROR\] .*\.(?:java|kt):\[|cannot find symbol|Tests run:.*(?:Failures: [1-9]|Errors: [1-9])|"
+CAUSE_RX = re.compile(r"Checkstyle violation|\.java:\[?\d+[,:]\d+\]?:? .*\[\w+\]\s*$|\(\w+\) \w+: |spotless|npm (?:ERR!|error)|yarn error|ERR_PNPM|\[ERROR\] .*\.(?:java|kt):\[|cannot find symbol|Tests run:.*(?:Failures: [1-9]|Errors: [1-9])|"
                       r"<<< (?:FAILURE|ERROR)!|Caused by:|Could not resolve dependencies|Non-resolvable|What went wrong", re.I)
 
 
@@ -4094,7 +4108,8 @@ def java_major(env: dict) -> int | None:
 # --------------------------------------------------------------------------- #
 class Builder:
     def __init__(self, root: Path, tool: str, env: dict, log_dir: Path, extra: list[str], plugin_version: str | None,
-                 rewrite_extra: list[str] | None = None, skip_frontend: bool = False, rewrite_frontend: bool = False, no_fork: bool = False):
+                 rewrite_extra: list[str] | None = None, skip_frontend: bool = False, rewrite_frontend: bool = False, no_fork: bool = False,
+                 format_goal: str | None = None):
         self.root, self.tool, self.env, self.log_dir, self.extra = root, tool, env, log_dir, list(extra)
         self.plugin_version = plugin_version
         if skip_frontend and tool == "maven":
@@ -4104,6 +4119,7 @@ class Builder:
         self.rewrite_extra = (([] if rewrite_frontend or skip_frontend or tool != "maven" else FRONTEND_SKIP)
                               + list(rewrite_extra or []))
         self.no_fork = no_fork
+        self.format_goal = format_goal if format_goal is not None else ("spotless:apply" if tool == "maven" else "spotlessApply")
         if tool == "maven":
             self.exe = str(root / "mvnw") if (root / "mvnw").exists() else "mvn"
         else:
@@ -4156,6 +4172,27 @@ rootProject {{
             cp += [x for x in (read(f) or "").strip().split(os.pathsep) if x and x not in cp]
             f.unlink()
         return cp
+
+    def format(self, stage: str, files: list[str]) -> list[str] | None:
+        """Run the project's formatter (default: Spotless, as configured in the build) on the files a stage changed.
+        Returns a note, or None when the project has no such formatter (then it is not tried again)."""
+        if self.format_goal is None or not files:
+            return []
+        log = self.log_dir / f"{stage}-format.log"
+        if self.tool == "maven":
+            # Spotless matches spotlessFiles against absolute paths; limit it to the changed files
+            patterns = ",".join(".*" + re.escape("/" + f) for f in files)
+            cmd = [self.exe, "-B", "-ntp", self.format_goal] + (["-DspotlessFiles=" + patterns] if "spotless" in self.format_goal else [])
+        else:
+            cmd = [self.exe, "--no-daemon", self.format_goal]
+        code = run(cmd + self.extra, self.root, log, self.env)
+        text = read(log) or ""
+        if code != 0 and re.search(r"No plugin found for prefix|Task '\w+' not found|could not find task|NoPluginFoundForPrefix", text, re.I):
+            self.format_goal = None
+            return None
+        if code != 0:
+            return [f"formatter `{self.format_goal}` failed (exit {code}) - see {log}"]
+        return [f"formatted {len(files)} changed file(s) with `{self.format_goal}`"]
 
     def verify(self, stage: str) -> int:
         log = self.log_dir / f"{stage}-build.log"
@@ -4259,7 +4296,10 @@ def cmd_migrate(a) -> int:
     stages = plan_stages(a.target, a.java, junit4, a.rewrite_spring_version, a.extra_recipe or [], use_openjpa)
     builder = Builder(root, info["tool"], env, log_dir, shlex.split(a.build_args or ""), a.rewrite_plugin_version,
                       rewrite_extra=shlex.split(a.rewrite_args or ""), skip_frontend=a.skip_frontend,
-                      rewrite_frontend=a.rewrite_frontend, no_fork=a.rewrite_no_fork)
+                      rewrite_frontend=a.rewrite_frontend, no_fork=a.rewrite_no_fork,
+                      format_goal=a.format_goal)
+    if a.no_format:
+        builder.format_goal = None
 
     if resuming:
         done = lambda st: st.key[0] == "1" or (st.key.startswith("2-") and (major, minor) >= (3, 5)) or \
@@ -4350,6 +4390,7 @@ def cmd_migrate(a) -> int:
         t0 = time.time()
         changes = []
         if st.key == OPENJPA_STAGE:
+            stage_rev = git(root, "rev-parse", "HEAD").strip() if not a.no_git else None
             changes, todo = migrate_openjpa(root)
             if dep_plan:
                 changes += apply_dependency_plan(root, dep_plan, HIBERNATE_LINE)
@@ -4432,6 +4473,15 @@ def cmd_migrate(a) -> int:
         if not st.java_fix:
             changes = changes + pre_changes if st.key != OPENJPA_STAGE else changes
         note = f"{len(changes)} tool change(s)"
+        if not a.no_git and builder.format_goal and not (code != 0 or dl):
+            base = stage_rev if st.key != OPENJPA_STAGE else git(root, "rev-parse", "HEAD").strip()
+            changed = [f for f in git(root, "diff", "--name-only", base).split() + git(root, "ls-files", "--others", "--exclude-standard").split()
+                       if f.endswith((".java", ".kt", ".groovy")) and (root / f).exists()]
+            notes = builder.format(st.key, changed)
+            if notes is None:
+                say(f"[stage {st.key}] no Spotless configured in this build - formatting skipped (use --format-goal for another formatter)")
+            for n_ in notes or []:
+                say(f"  format: {n_}")
         if not a.no_git and git(root, "status", "--porcelain").strip():
             git(root, "add", "-A")
             msg = f"chore(migration): {st.title}\n\nAutomated by spring-migrate {__version__} (OpenRewrite: {', '.join(st.recipes)})"
@@ -4644,6 +4694,9 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--report-dir", help="where to write report/logs (default: next to the project)")
     m.add_argument("--rewrite-spring-version", default="RELEASE", help="rewrite-spring version (pin for reproducible runs)")
     m.add_argument("--rewrite-plugin-version", help="rewrite-maven-plugin version (default: latest)")
+    m.add_argument("--format-goal", help="formatter run on the changed files before each stage commit "
+                                        "(default: spotless:apply / spotlessApply, if the build configures Spotless)")
+    m.add_argument("--no-format", action="store_true", help="do not run the formatter after each stage")
     m.add_argument("--skip-frontend", action="store_true",
                    help="skip frontend-maven-plugin (npm/yarn/pnpm, node install) in every build, e.g. when npm cannot reach its registry here")
     m.add_argument("--rewrite-frontend", action="store_true",

@@ -224,6 +224,16 @@ registry. The recipes only need Java sources and dependencies, so:
 When a build fails, the tool prints the lines that explain it (npm errors, compiler errors, failing tests) before
 Maven's generic ones.
 
+## Formatting and Checkstyle
+Before each stage is committed, the tool runs **`spotless:apply`** (Gradle: `spotlessApply`) on the files that stage
+changed (`-DspotlessFiles=...`), with the Spotless configuration your build already has, also when it comes from a
+company parent. Code the migration did not touch is never reformatted. If the build has no Spotless, this is noticed
+once and skipped. `--format-goal` runs another formatter instead (e.g. `com.spotify.fmt:fmt-maven-plugin:format`,
+`net.revelc.code:impsort-maven-plugin:sort`), `--no-format` turns it off.
+
+The tool's own code changes insert imports in sorted position within their package group. When a build gate fails
+on Checkstyle, the summary shows the violations with file:line and rule.
+
 ## What still needs a human
 The tool does every mechanical step; these are design decisions or need runtime knowledge. The scanner lists each
 with file:line, the report repeats them, and a leftover reference fails the stage's build gate:

@@ -408,6 +408,18 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class ImportOrderTest(unittest.TestCase):
+    def test_inserted_in_sorted_position_and_group(self):
+        src = ("package a;\n\nimport java.util.List;\nimport java.util.Map;\n\n"
+               "import org.springframework.context.annotation.Bean;\nimport org.springframework.stereotype.Service;\n\nclass A {}\n")
+        out = sm.add_import(src, "org.springframework.context.annotation.Configuration")
+        self.assertIn("annotation.Bean;\nimport org.springframework.context.annotation.Configuration;\nimport org.springframework.stereotype", out)
+        out = sm.add_import(out, "java.util.ArrayList")
+        self.assertIn("import java.util.ArrayList;\nimport java.util.List;", out)
+        out = sm.add_import(out, "org.springframework.web.filter.UrlHandlerFilter")
+        self.assertIn("stereotype.Service;\nimport org.springframework.web.filter.UrlHandlerFilter;\n\nclass", out)
+
+
 class SpringdocTest(unittest.TestCase):
     ROOT = """<project>
   <parent><groupId>{pg}</groupId><artifactId>{pa}</artifactId><version>1</version></parent>
@@ -487,6 +499,25 @@ class BuilderTest(unittest.TestCase):
         self.assertTrue(rewrite[4].endswith(":runNoFork"))
         self.assertIn("-Ddocker.skip", rewrite)
         self.assertNotIn("-Ddocker.skip", verify)
+
+    def test_spotless_only_on_changed_files(self):
+        seen = []
+        old = sm.run
+        log_dir = Path(tempfile.mkdtemp())
+        def fake(cmd, cwd, log, env):
+            seen.append(cmd)
+            log.write_text("[ERROR] No plugin found for prefix 'spotless' in the current project" if len(seen) > 1 else "ok")
+            return 0 if len(seen) == 1 else 1
+        sm.run = fake
+        try:
+            b = sm.Builder(Path("."), "maven", {}, log_dir, [], None)
+            self.assertEqual(b.format("s", ["web/src/main/java/a/B.java"]), ["formatted 1 changed file(s) with `spotless:apply`"])
+            self.assertIn("-DspotlessFiles=.*/web/src/main/java/a/B\\.java", seen[0])
+            self.assertIsNone(b.format("s2", ["x/Y.java"]))          # no Spotless in this build
+            self.assertEqual(b.format("s3", ["x/Y.java"]), [])       # ... and not tried again
+            self.assertEqual(len(seen), 2)
+        finally:
+            sm.run = old
 
     def test_rewrite_frontend_keeps_npm(self):
         rewrite, _ = self.capture(rewrite_frontend=True)
