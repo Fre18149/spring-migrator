@@ -489,6 +489,9 @@ class BuilderTest(unittest.TestCase):
         self.assertIn("-Dskip.npm", rewrite)
         self.assertIn("-Dskip.installnodenpm", rewrite)
         self.assertNotIn("-Dskip.npm", verify)          # your build gates still build the frontend
+        self.assertIn("-Dspotless.check.skip=true", rewrite)   # no format/style gate while rewriting
+        self.assertIn("-Dcheckstyle.skip=true", rewrite)
+        self.assertNotIn("-Dspotless.check.skip=true", verify)  # ... but the build gate keeps them
         self.assertIn("corp.xml", rewrite)
         self.assertTrue(rewrite[4].endswith(":run"))
 

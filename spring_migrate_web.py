@@ -172,7 +172,7 @@ class StageTracker:
                 if rest.startswith("report:"):
                     self.summary["report"] = rest.split(":", 1)[1].strip()
                 if "stopped at stage" in rest:
-                    self.summary["stopped_at"] = re.search(r"stopped at stage (\S+)", rest).group(1).rstrip(".")
+                    self.summary["stopped_at"] = re.search(r"stopped at stage (\S+)", rest).group(1).rstrip(".:")
             elif tag == "check":
                 self.summary.setdefault("checks", []).append(rest)
             return

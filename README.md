@@ -231,6 +231,11 @@ company parent. Code the migration did not touch is never reformatted. If the bu
 once and skipped. `--format-goal` runs another formatter instead (e.g. `com.spotify.fmt:fmt-maven-plugin:format`,
 `net.revelc.code:impsort-maven-plugin:sort`), `--no-format` turns it off.
 
+The OpenRewrite step runs without your quality gates (`spotless.check.skip`, `checkstyle.skip`, PMD, SpotBugs, fmt,
+formatter, license, enforcer, JaCoCo): it only needs compiled code, and the tool's own edits are formatted just before
+the stage commit. The build gate after each stage runs all of them. OpenRewrite is retried only after
+repository/download problems, and a failed OpenRewrite step leaves a clean working tree to re-run from.
+
 The tool's own code changes insert imports in sorted position within their package group. When a build gate fails
 on Checkstyle, the summary shows the violations with file:line and rule.
 

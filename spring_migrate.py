@@ -4028,6 +4028,12 @@ def run(cmd: list[str], cwd: Path, log: Path, env: dict) -> int:
 FRONTEND_SKIP = ["-Dskip.installnodenpm", "-Dskip.installnodecorepack", "-Dskip.installnodeyarn", "-Dskip.installnodepnpm", "-Dskip.installyarn", "-Dskip.installbun",
                  "-Dskip.npm", "-Dskip.npx", "-Dskip.yarn", "-Dskip.pnpm", "-Dskip.bun", "-Dskip.corepack", "-Dskip.bower",
                  "-Dskip.grunt", "-Dskip.gulp", "-Dskip.jspm", "-Dskip.karma", "-Dskip.webpack", "-Dskip.ember"]
+# Quality gates that are bound early in many builds. The OpenRewrite step only needs compiled code, and the tool's own
+# pre-step edits are formatted just before the stage commit, so a format/style check there would fail for nothing.
+# The build gates after each stage keep all of them.
+QUALITY_SKIP = ["-Dspotless.check.skip=true", "-Dcheckstyle.skip=true", "-Dpmd.skip=true", "-Dcpd.skip=true", "-Dspotbugs.skip=true",
+                "-Dfmt.skip=true", "-Dformatter.skip=true", "-Dimpsort.skip=true", "-Dlicense.skip=true", "-Denforcer.skip=true",
+                "-Dsortpom.skip=true", "-Djacoco.skip=true"]
 # Lines that explain a failure better than Maven's generic "[ERROR] Failed to execute goal ..."
 CAUSE_RX = re.compile(r"Checkstyle violation|\.java:\[?\d+[,:]\d+\]?:? .*\[\w+\]\s*$|\(\w+\) \w+: |spotless|npm (?:ERR!|error)|yarn error|ERR_PNPM|\[ERROR\] .*\.(?:java|kt):\[|cannot find symbol|Tests run:.*(?:Failures: [1-9]|Errors: [1-9])|"
                       r"<<< (?:FAILURE|ERROR)!|Caused by:|Could not resolve dependencies|Non-resolvable|What went wrong", re.I)
@@ -4117,7 +4123,7 @@ class Builder:
         # OpenRewrite's `run` goal first builds up to process-test-classes, which also runs frontend builds (npm install ...).
         # The recipes only need Java sources and dependencies, so skip those there unless asked not to.
         self.rewrite_extra = (([] if rewrite_frontend or skip_frontend or tool != "maven" else FRONTEND_SKIP)
-                              + list(rewrite_extra or []))
+                              + (QUALITY_SKIP if tool == "maven" else []) + list(rewrite_extra or []))
         self.no_fork = no_fork
         self.format_goal = format_goal if format_goal is not None else ("spotless:apply" if tool == "maven" else "spotlessApply")
         if tool == "maven":
@@ -4385,6 +4391,7 @@ def cmd_migrate(a) -> int:
     # ---- stages ----------------------------------------------------------
     todo_all: list[str] = list(todo_pre)
     failed_stage = None
+    rewrite_failed = False
     for st in stages:
         say(f"\n[stage {st.key}] {st.title}")
         t0 = time.time()
@@ -4417,24 +4424,29 @@ def cmd_migrate(a) -> int:
             code, dl = 1, []
             for attempt in range(1, a.retries + 2):
                 code = builder.rewrite(st.key, st.recipes, st.artifacts, dry=False) if st.recipes else 0
-                dl = rewrite_had_download_failures(log_dir / f"{st.key}-rewrite.log") if code == 0 else []
+                dl = rewrite_had_download_failures(log_dir / f"{st.key}-rewrite.log") if st.recipes else []
                 if code == 0 and not dl:
                     break
+                # only repository/download problems are worth retrying; a build or recipe failure would fail again
+                last = attempt > a.retries or not dl
                 if not a.no_git and not a.allow_dirty:
-                    # tree was clean when we started -> discard partial OpenRewrite edits, then redo our deterministic pre-steps
+                    # the tree was clean when we started -> discard the partial edits; redo our pre-steps only for a retry,
+                    # so a final failure leaves a clean tree that a re-run can start from
                     git(root, "reset", "-q", "--hard", "HEAD")
                     git(root, "clean", "-fdq")
-                    if attempt <= a.retries:
+                    if not last:
                         if st.legacy and not a.no_legacy:
                             run_legacy_codemods(root)
                         if st.bump_to:
                             bump_boot(root, boot_version_for(st.bump_to))
-                if attempt <= a.retries and (dl or code != 0):
-                    say(f"[stage {st.key}] attempt {attempt} failed ({'repository/download problem' if dl else 'exit ' + str(code)}); retrying in 30s")
-                    time.sleep(30)
+                if last:
+                    break
+                say(f"[stage {st.key}] attempt {attempt} failed (repository/download problem); retrying in 30s")
+                time.sleep(30)
             if code != 0 or dl:
                 results.append((st.key, st.title, False, time.time() - t0, "OpenRewrite failed - see rewrite log"))
                 failed_stage = st.key
+                rewrite_failed = True
                 if dl:
                     say(f"[stage {st.key}] OpenRewrite could not download artifacts, so it would have skipped edits silently. "
                         f"Nothing was committed for this stage. Check network/proxy, rate limits, or pass your mirror via "
@@ -4534,7 +4546,10 @@ def cmd_migrate(a) -> int:
     (report_dir / "scan-after.md").write_text(render_scan(post, "Post-migration scan"), encoding="utf-8")
     write_report(report_dir, root, a, pre, post, results, todo_all, failed_stage, branch if not a.no_git else None, dep_plan)
     say(f"\n[done] report: {report_dir/'MIGRATION_REPORT.md'}")
-    if failed_stage:
+    if failed_stage and rewrite_failed:
+        say(f"[done] stopped at stage {failed_stage}: OpenRewrite failed, nothing of this stage was committed and the working tree "
+            f"is clean. Fix the cause (see above), then re-run `spring-migrate migrate` - it continues with this stage.")
+    elif failed_stage:
         say(f"[done] stopped at stage {failed_stage}. Automated changes are committed; fix the build on top of them, "
             f"then re-run `spring-migrate migrate` for the remaining stages (it detects the current version).")
         return 1
