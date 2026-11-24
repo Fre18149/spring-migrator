@@ -3404,12 +3404,18 @@ def _remove_switch_arm(text: str, line_no: int) -> str | None:
     if i >= len(lines) or not re.match(r"\s*case\b", lines[i]):
         return None
     ind = len(lines[i]) - len(lines[i].lstrip())
+
+    def braces(l: str) -> int:
+        l = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//.*$', "", l)   # ignore braces in literals/comments
+        return l.count("{") - l.count("}")
+    depth = braces(lines[i])
     j = i + 1
     while j < len(lines):
         l = lines[j]
         cur = len(l) - len(l.lstrip())
-        if l.strip() and cur <= ind and (re.match(r"\s*(case\b|default\b)", l) or l.strip().startswith("}")):
+        if depth <= 0 and l.strip() and cur <= ind and (re.match(r"\s*(case\b|default\b)", l) or l.strip().startswith("}")):
             break
+        depth += braces(l)
         j += 1
     return "\n".join(lines[:i] + lines[j:])
 
