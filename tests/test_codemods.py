@@ -491,6 +491,46 @@ class DowngradedBootManagedTest(unittest.TestCase):
             pr.close()
 
 
+class CompileAutofixTest(unittest.TestCase):
+    SRC = """package a;
+class S {
+    String f(Object o) {
+        switch (o) {
+            case CharSequence cs -> {
+                return "cs";
+            }
+            case String s -> {
+                return "s";
+            }
+            default -> {
+                return "x";
+            }
+        }
+    }
+}
+"""
+
+    def test_dominated_arm_removed_german_javac(self):
+        pr = Project({"src/main/java/a/S.java": self.SRC})
+        f = pr.root / "src/main/java/a/S.java"
+        log = pr.root / "build.log"
+        log.write_text(f"[ERROR] {f}:[8,18] Dieses case-Label wird von einem vorherigen case-Label dominiert\n", encoding="utf-8")
+        self.assertEqual(len(sm.autofix_compile_errors(pr.root, log)), 1)
+        out = pr["src/main/java/a/S.java"]
+        self.assertNotIn("case String s", out)
+        self.assertIn("case CharSequence cs -> {\n                return \"cs\";\n            }\n            default -> {", out)
+        pr.close()
+
+    def test_hibernate6_types(self):
+        pr = Project({"src/main/java/a/W.java": "import org.hibernate.query.internal.NativeQueryImpl;\n"
+                                                "import org.hibernate.query.spi.NativeQueryImplementor;\nclass W {}\n"})
+        sm.fix_hibernate6_types(pr.root)
+        out = pr["src/main/java/a/W.java"]
+        self.assertIn("import org.hibernate.query.sql.internal.NativeQueryImpl;", out)
+        self.assertIn("import org.hibernate.query.sql.spi.NativeQueryImplementor;", out)
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>

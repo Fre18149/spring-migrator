@@ -474,6 +474,7 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
     changes += fix_quoted_properties(root, base_rev)
     changes += fix_springdoc_leftovers(root)
     changes += fix_springdoc(root, boot_line)
+    changes += fix_hibernate6_types(root)
     jc, jt = fix_jaxb_tooling(root)
     changes += jc
     todo_extra = jt
@@ -3306,6 +3307,137 @@ def fix_downgraded_boot_managed(root: Path, boot_version: str | None, local_repo
     return changes, todo
 
 
+# Hibernate 5 internals that moved in Hibernate 6 (verified against hibernate-core 6.6 and 7.4; OpenRewrite does not map them)
+HIBERNATE6_TYPES = {
+    "org.hibernate.query.spi.NativeQueryImplementor": "org.hibernate.query.sql.spi.NativeQueryImplementor",
+    "org.hibernate.query.internal.NativeQueryImpl": "org.hibernate.query.sql.internal.NativeQueryImpl",
+    "org.hibernate.query.internal.QueryImpl": "org.hibernate.query.sqm.internal.QuerySqmImpl",
+    "org.hibernate.query.internal.AbstractProducedQuery": "org.hibernate.query.spi.AbstractQuery",
+}
+
+
+def fix_hibernate6_types(root: Path) -> list[str]:
+    changes = []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "org.hibernate.query" not in t:
+            continue
+        new = t
+        for a, b in HIBERNATE6_TYPES.items():
+            new = re.sub(re.escape(a) + r"\b", b, new)
+        new = re.sub(r"\bAbstractProducedQuery\b", "AbstractQuery", new) if "org.hibernate.query.spi.AbstractQuery" in new else new
+        new = re.sub(r"\bQueryImpl\b", "QuerySqmImpl", new) if "org.hibernate.query.sqm.internal.QuerySqmImpl" in new else new
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: Hibernate 5 internal query classes -> their Hibernate 6 packages")
+    return changes
+
+
+def _effective_java_levels(root: Path, exe: str, extra: list[str], env: dict) -> list[int]:
+    """Java levels the compiler gets per module (maven-compiler-plugin release/source, from the effective POM)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "e.xml"
+        code, _ = _effective_pom(root, exe, extra, env, out)
+        text = read(out) if out.exists() else ""
+    levels = []
+    for pm in re.finditer(r"<plugin>(?:(?!<plugin>).)*?<artifactId>maven-compiler-plugin</artifactId>(.*?)</plugin>", text or "", re.S):
+        conf = re.search(r"<configuration>(.*?)</configuration>", pm.group(1), re.S)
+        c = conf.group(1) if conf else ""
+        v = _first_tag(c, "release") or _first_tag(c, "source")
+        m = re.match(r"(?:1\.)?(\d+)", v or "")
+        if m:
+            levels.append(int(m.group(1)))
+    for m in re.finditer(r"<maven\.compiler\.(?:release|source)>(?:1\.)?(\d+)</maven\.compiler\.(?:release|source)>", text or ""):
+        levels.append(int(m.group(1)))
+    return levels
+
+
+def fix_java_level(root: Path, java: int, exe: str, extra: list[str], env: dict) -> list[str]:
+    """OpenRewrite's Java upgrade only edits the project's own POMs. When the Java level comes from a (company) parent,
+    the code is rewritten for the new Java (e.g. pattern switches) but still compiled at the old one. Set it in the
+    top POM, and override a fixed <release>/<source> of the compiler plugin if the parent hard-codes one."""
+    top = root / "pom.xml"
+    if not top.exists():
+        return []
+    levels = _effective_java_levels(root, exe, extra, env)
+    if not levels or min(levels) >= java:
+        return []
+    changes = []
+    t = read(top) or ""
+    new = pom_set_property(t, "java.version", str(java))
+    for prop in ("maven.compiler.release", "maven.compiler.source", "maven.compiler.target"):
+        if f"<{prop}>" in new or prop == "maven.compiler.release":
+            new = pom_set_property(new, prop, str(java))
+    if write_if_changed(top, t, new):
+        changes.append(f"pom.xml: Java level {min(levels)} (inherited) -> {java} (java.version / maven.compiler.release)")
+    if min(_effective_java_levels(root, exe, extra, env) or [java]) < java:
+        t = read(top) or ""
+        plugin = ("      <plugin>\n        <groupId>org.apache.maven.plugins</groupId>\n        <artifactId>maven-compiler-plugin</artifactId>\n"
+                  "        <configuration>\n          <release>${maven.compiler.release}</release>\n        </configuration>\n      </plugin>\n")
+        if "<artifactId>maven-compiler-plugin</artifactId>" not in re.sub(r"<pluginManagement>.*?</pluginManagement>", "", t, flags=re.S):
+            pl = _top_level(t, "build")
+            if pl:
+                m = re.search(r"<build>(?:(?!</build>).)*?<plugins>[ \t]*\n?", t[pl.start():], re.S)
+                if m and "<pluginManagement>" not in t[pl.start():pl.start() + m.end()]:
+                    pos = pl.start() + m.end()
+                    new = t[:pos] + ("" if t[pos - 1] == "\n" else "\n") + plugin + t[pos:]
+                else:
+                    end = t.index("</build>", pl.start())
+                    new = t[:end] + "    <plugins>\n" + plugin + "    </plugins>\n  " + t[end:]
+            else:
+                pos = t.rindex("</project>")
+                new = t[:pos] + "  <build>\n    <plugins>\n" + plugin + "    </plugins>\n  </build>\n" + t[pos:]
+            if write_if_changed(top, t, new):
+                changes.append(f"pom.xml: maven-compiler-plugin <release> overridden to {java} (the parent hard-codes a lower level)")
+    return changes
+
+
+# ---- compile errors with a safe mechanical fix -----------------------------------------------------------------------
+_DOMINATED_RX = re.compile(r"\[ERROR\] (/\S+?\.java):\[(\d+),\d+\] (?:this case label is dominated by a preceding case label|"
+                           r"diese case-Marke wird von einer vorherigen case-Marke dominiert|"
+                           r"[^\n]*(?:dominated|dominiert)[^\n]*)")
+
+
+def _remove_switch_arm(text: str, line_no: int) -> str | None:
+    """Remove the `case ...` arm that starts on line_no (1-based): up to the next case/default label or the switch's end."""
+    lines = text.split("\n")
+    i = line_no - 1
+    if i >= len(lines) or not re.match(r"\s*case\b", lines[i]):
+        return None
+    ind = len(lines[i]) - len(lines[i].lstrip())
+    j = i + 1
+    while j < len(lines):
+        l = lines[j]
+        cur = len(l) - len(l.lstrip())
+        if l.strip() and cur <= ind and (re.match(r"\s*(case\b|default\b)", l) or l.strip().startswith("}")):
+            break
+        j += 1
+    return "\n".join(lines[:i] + lines[j:])
+
+
+def autofix_compile_errors(root: Path, log: Path) -> list[str]:
+    """Fix compile errors that have exactly one safe fix. A pattern-switch arm 'dominated by a preceding case label' can
+    never match (OpenRewrite's if/else-instanceof -> switch conversion produces these when a later type is a subtype of an
+    earlier one; in the if/else chain the branch was merely dead code): remove it."""
+    changes = []
+    hits: dict[str, set] = {}
+    for m in _DOMINATED_RX.finditer(read(log) or ""):
+        hits.setdefault(m.group(1), set()).add(int(m.group(2)))
+    for f, line_nos in hits.items():
+        p = Path(f)
+        if not p.exists():
+            continue
+        t = read(p) or ""
+        new = t
+        for ln in sorted(line_nos, reverse=True):      # bottom-up keeps the other line numbers valid
+            r = _remove_switch_arm(new, ln)
+            if r is not None:
+                new = r
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root) if str(p).startswith(str(root)) else p}: removed {len(line_nos)} unreachable switch arm(s) "
+                           f"(dominated by a preceding case)")
+    return changes
+
+
 HTTPTRACE_JAVA = [
     ("org.springframework.boot.actuate.trace.http.InMemoryHttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.InMemoryHttpExchangeRepository"),
     ("org.springframework.boot.actuate.trace.http.HttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository"),
@@ -4893,6 +5025,8 @@ def cmd_migrate(a) -> int:
                                        stage_rev=stage_rev, boot_version=stage_boot_version(root, builder, env),
                                        extra=builder.extra)
             todo_all += todo
+            if builder.tool == "maven":
+                changes += fix_java_level(root, a.java, builder.exe, builder.extra, env)
             for c in changes:
                 say(f"  fixer: {c}")
             changes = pre_changes + changes
@@ -4921,6 +5055,20 @@ def cmd_migrate(a) -> int:
             saved = add_properties_migrator(root) if st.boot_line and not a.no_properties_migrator else {}
             try:
                 ok = builder.verify(st.key) == 0
+                if not ok:
+                    fixed = autofix_compile_errors(root, log_dir / f"{st.key}-build.log")
+                    if fixed:
+                        for c in fixed:
+                            say(f"  autofix: {c}")
+                        if not a.no_git:
+                            restore_files(saved)
+                            git(root, "add", "-A")
+                            git(root, "commit", "-q", "-m", f"chore(migration): fix compile errors with one safe fix ({st.key})")
+                            saved = add_properties_migrator(root) if saved else {}
+                        say(f"[stage {st.key}] build + tests again after the compile fixes")
+                        ok = builder.verify(st.key + "-autofix") == 0
+                        if not ok:
+                            (log_dir / f"{st.key}-build.log").write_bytes((log_dir / f"{st.key}-autofix-build.log").read_bytes())
             finally:
                 restore_files(saved)
             if saved:
