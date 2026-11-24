@@ -113,6 +113,16 @@ beans just vanish.
    Spring coupling are left alone; libraries with **no compatible release** are listed as a TODO (they need a new
    release of that library).
 
+**OpenJPA and Hibernate in your libraries.** OpenJPA and Hibernate themselves are not planned here (the OpenJPA stage
+removes OpenJPA, Boot manages Hibernate), but libraries that use them are:
+* a version that still needs OpenJPA (an `org.apache.openjpa` dependency, OpenJPA API calls, or entities enhanced by the
+  OpenJPA enhancer) is never chosen, because the migration removes OpenJPA;
+* if OpenJPA only comes in through such a library, the OpenJPA -> Hibernate stage is added automatically, and the plan
+  gets a **"Boot 2.7 + Hibernate"** column: the library's javax/Hibernate 5 build, applied in that stage so the switch
+  is tested on its own commit before the Jakarta jump;
+* the Hibernate version a library was built for is shown; a library built for Hibernate 5/6 that calls Hibernate APIs
+  is flagged on the Boot 4 lines (Boot 4 ships Hibernate 7).
+
 To choose yourself:
 ```bash
 # detect and review (or answer per dependency with --interactive), then edit the "upgrades" per Boot line
@@ -128,6 +138,7 @@ Plan entries look like this (Gradle projects: write it by hand; it is applied to
   {"coordinate": "com.acme.platform:acme-parent", "kind": "parent", "current": "1.4.0",
    "upgrades": {"3.5": "2.1.0", "4.0": "3.0.0", "4.1": "3.0.0"}}]}
 ```
+(`"2.7-hibernate"` is the key for the OpenJPA stage.)
 
 ## OpenJPA -> Hibernate
 OpenRewrite has no recipe for this, so the tool does it itself, as its own stage on Boot 2.7 (Hibernate 5.6, still
@@ -175,7 +186,9 @@ the tool (no manual fixes):
   `/oauth/token` before and after migration
 * `examples/legacy-company`: company parent (`acme-parent` 1.4.0 on Boot 2.7) and an internal javax /
   `spring.factories` starter, served from a fake Artifactory (`tests/build-company-repo.sh` builds a file-based Maven
-  repo plus `settings.xml`); the test checks the starter's filter is still auto-configured after every stage
+  repo plus `settings.xml`); the test checks the starter's filter is still auto-configured after every stage. Its
+  `acme-persistence` 1.0.0 is built on OpenJPA: the run adds the OpenJPA stage, switches it to the Hibernate 5 build
+  there, then to the Hibernate 6/7 builds
 
 `tests/test_codemods.py` (`python3 -m unittest discover -s tests`) unit-tests the codemods the samples do not exercise
 (Zuul, Ribbon rules, opaque/HMAC/SSO OAuth2, YAML editing, ID pinning modes, dialects, CI images, wrappers, ...).

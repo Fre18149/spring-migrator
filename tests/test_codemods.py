@@ -489,6 +489,74 @@ class CompanyDependenciesTest(unittest.TestCase):
         pr.close()
         self.tmp.cleanup()
 
+    def test_openjpa_and_hibernate_libraries(self):
+        boot = "org.springframework.boot", "spring-boot-starter-parent"
+        dep = lambda g, a, v="": f"<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>{f'<version>{v}</version>' if v else ''}</dependency>"
+        files = {
+            "com/acme/persistence/maven-metadata-company.xml":
+                "<versions><version>1.0</version><version>1.1</version><version>2.0</version></versions>",
+            # 1.0: built on OpenJPA (enhanced entity -> PersistenceCapable in the bytecode)
+            "com/acme/persistence/1.0/persistence-1.0.pom": self.pom("com.acme", "persistence", "1.0", (*boot, "2.7.18"),
+                                                                     dep("org.apache.openjpa", "openjpa", "3.2.2")),
+            "com/acme/persistence/1.0/persistence-1.0.jar": {"p/E.class": b"\xca\xfe org/apache/openjpa/enhance/PersistenceCapable javax/persistence/Entity"},
+            # 1.1: same Boot 2.7 / javax line, but on Hibernate 5
+            "com/acme/persistence/1.1/persistence-1.1.pom": self.pom("com.acme", "persistence", "1.1", (*boot, "2.7.18"),
+                                                                     dep("org.hibernate", "hibernate-core")),
+            "com/acme/persistence/1.1/persistence-1.1.jar": {"p/E.class": b"\xca\xfe org/hibernate/Session javax/persistence/Entity"},
+            # 2.0: Boot 3.5, Hibernate 6, calls Hibernate APIs
+            "com/acme/persistence/2.0/persistence-2.0.pom": self.pom("com.acme", "persistence", "2.0", (*boot, "3.5.16"),
+                                                                     dep("org.hibernate.orm", "hibernate-core")),
+            "com/acme/persistence/2.0/persistence-2.0.jar": {"p/E.class": b"\xca\xfe org/hibernate/Session jakarta/persistence/Entity"},
+        }
+        r = self.repo(files)
+        pr = Project({"pom.xml": """
+            <project>
+              <parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>2.7.18</version></parent>
+              <groupId>com.acme</groupId><artifactId>app</artifactId>
+              <dependencies>
+                <dependency><groupId>com.acme</groupId><artifactId>persistence</artifactId><version>1.0</version></dependency>
+              </dependencies>
+            </project>
+            """})
+        plan = sm.detect_dependency_plan(pr.root, r, "4.1", [], say_=lambda m: None)
+        d = plan["dependencies"][0]
+        self.assertTrue(plan["openjpaViaDependencies"])
+        self.assertEqual(plan["lines"][0], sm.HIBERNATE_LINE)
+        self.assertTrue(d["usesOpenJPA"])
+        self.assertIn("OpenJPA", d["builtAgainst"]["1.0"])
+        self.assertIn("Hibernate 5", d["builtAgainst"]["1.1"])
+        # OpenJPA stage gets the Hibernate-based 2.7 build, Boot 3.5 gets 2.0; nothing was built for Boot 4
+        self.assertEqual(d["upgrades"].get(sm.HIBERNATE_LINE), "1.1")
+        self.assertEqual(d["upgrades"].get("3.5"), "2.0")
+        self.assertNotIn("4.0", d["upgrades"])
+        self.assertIn("nothing built for Boot 4.0, 4.1", d["status"])
+        sm.apply_dependency_plan(pr.root, plan, sm.HIBERNATE_LINE)
+        self.assertIn("<version>1.1</version>", pr["pom.xml"])
+        pr.close()
+        self.tmp.cleanup()
+
+    def test_hibernate6_library_on_boot4_is_flagged(self):
+        boot = "org.springframework.boot", "spring-boot-starter-parent"
+        files = {
+            "com/acme/repo/maven-metadata-company.xml": "<versions><version>1.0</version><version>2.0</version></versions>",
+            "com/acme/repo/1.0/repo-1.0.pom": self.pom("com.acme", "repo", "1.0", (*boot, "3.5.16")),
+            "com/acme/repo/1.0/repo-1.0.jar": {"p/R.class": b"\xca\xfe org/hibernate/Session jakarta/persistence/Entity"},
+            # 2.0: jakarta, no Boot in the POM (line unknown), built against Hibernate 6
+            "com/acme/repo/2.0/repo-2.0.pom": self.pom("com.acme", "repo", "2.0", None,
+                                                       "<dependency><groupId>org.hibernate.orm</groupId><artifactId>hibernate-core</artifactId><version>6.6.1.Final</version></dependency>"),
+            "com/acme/repo/2.0/repo-2.0.jar": {"p/R.class": b"\xca\xfe org/hibernate/Session jakarta/persistence/Entity"},
+        }
+        r = self.repo(files)
+        pr = Project({"pom.xml": "<project><parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId>"
+                                 "<version>3.5.16</version></parent><groupId>com.acme</groupId><artifactId>app</artifactId><dependencies>"
+                                 "<dependency><groupId>com.acme</groupId><artifactId>repo</artifactId><version>1.0</version></dependency>"
+                                 "</dependencies></project>"})
+        d = sm.detect_dependency_plan(pr.root, r, "4.1", [], say_=lambda m: None)["dependencies"][0]
+        self.assertEqual(d["upgrades"].get("4.1"), "2.0")
+        self.assertIn("built for Hibernate 6", d["status"])
+        pr.close()
+        self.tmp.cleanup()
+
     def test_interactive_choice_and_gradle(self):
         plan = {"target": "3.5", "dependencies": [
             {"coordinate": "com.acme:lib", "kind": "dependency", "current": "1.0", "status": "upgrade",

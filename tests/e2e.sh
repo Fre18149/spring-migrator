@@ -47,6 +47,10 @@ company() {
   NO_BOOT_IN_POM=1 BUILD_ARGS="-s $repo/settings.xml${BUILD_ARGS:+ $BUILD_ARGS}" run legacy-company
   grep -A2 "<artifactId>acme-parent</artifactId>" pom.xml | grep -q "<version>3.0.0</version>"
   grep -q "<acme-audit.version>3.0.0</acme-audit.version>" pom.xml
+  # acme-persistence 1.0.0 needs OpenJPA: the OpenJPA stage must run and pick the Hibernate build, then the Boot 4 build
+  git log --format=%s | grep -q "OpenJPA -> Hibernate"
+  git show "$(git log -1 --format=%H --grep='OpenJPA -> Hibernate'):pom.xml" | grep -A1 "<artifactId>acme-persistence</artifactId>" | grep -q "<version>1.1.0</version>"
+  grep -A1 "<artifactId>acme-persistence</artifactId>" pom.xml | grep -q "<version>3.0.0</version>"
 }
 case "${1:-all}" in
   demo|openjpa|cloud|authserver|company) "$1";;

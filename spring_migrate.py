@@ -3235,6 +3235,8 @@ def javax_jars(classpath: list[str], direct: set[str] | None = None) -> list[str
 # version that matches. The result is a plan file you can review/edit (or answer interactively).
 # --------------------------------------------------------------------------- #
 DEP_PLAN_FILE = "dependency-plan.json"
+HIBERNATE_LINE = "2.7-hibernate"   # plan key applied in the OpenJPA -> Hibernate stage (Boot 2.7, javax)
+PLAN_LINES = (HIBERNATE_LINE, "3.5", "4.0", "4.1")
 # handled by OpenRewrite / the codemods / Boot's own dependency management
 DEP_SKIP_GROUPS = ("org.springframework", "io.springfox", "com.netflix", "org.powermock", "org.apache.openjpa", "org.apache.httpcomponents",
                    "javax.", "jakarta.", "org.junit", "junit", "org.openrewrite", "io.micrometer", "org.hibernate", "com.h2database")
@@ -3377,7 +3379,7 @@ def _resolve_prop(v: str, props: dict) -> str:
 def built_against(repo: MavenRepo, g: str, a: str, v: str, depth: int = 0) -> dict:
     """What a published artifact was built against: {'boot': '3.5.16'|None, 'spring': '6'|None, 'ee': 'javax'|'jakarta'|None,
     'autoconfig': 'spring.factories'|'imports'|None, 'found': bool}."""
-    info = {"boot": None, "spring": None, "ee": None, "autoconfig": None, "found": False, "chain": []}
+    info = {"boot": None, "spring": None, "ee": None, "autoconfig": None, "found": False, "chain": [], "openjpa": False, "hibernate": None}
     pom = repo.path(g, a, v, "pom")
     text = read(pom) if pom.exists() else None
     if text is None:
@@ -3398,6 +3400,8 @@ def built_against(repo: MavenRepo, g: str, a: str, v: str, depth: int = 0) -> di
             info["spring"] = up["spring"]
             info["ee"] = up["ee"]
             info["chain"] += up["chain"]
+            info["openjpa"] = up["openjpa"]          # dependencies declared in a parent are inherited
+            info["hibernate"] = up["hibernate"]
     for d in re.finditer(r"<dependency>(.*?)</dependency>", text, re.S):
         b = d.group(1)
         dg, da, dv = _first_tag(b, "groupId"), _first_tag(b, "artifactId"), _resolve_prop(_first_tag(b, "version"), props)
@@ -3405,6 +3409,10 @@ def built_against(repo: MavenRepo, g: str, a: str, v: str, depth: int = 0) -> di
             info["boot"] = dv
         if dg == "org.springframework" and dv and "${" not in dv and da.startswith("spring-"):
             info["spring"] = dv.split(".")[0]
+        if dg == "org.apache.openjpa":
+            info["openjpa"] = True
+        if da == "hibernate-core" and dg in ("org.hibernate", "org.hibernate.orm"):
+            info["hibernate"] = dv.split(".")[0] if dv and "${" not in dv else ("6+" if dg == "org.hibernate.orm" else "5")
         if dg.startswith("jakarta.") or dg == "org.glassfish.jakarta":
             info["ee"] = "jakarta"
         elif re.match(r"javax\.(servlet|persistence|validation|transaction|ws\.rs|xml\.bind|mail|jms|inject)", dg) and info["ee"] != "jakarta":
@@ -3419,16 +3427,29 @@ def built_against(repo: MavenRepo, g: str, a: str, v: str, depth: int = 0) -> di
                     info["autoconfig"] = "imports"
                 elif "META-INF/spring.factories" in names and b"EnableAutoConfiguration" in z.read("META-INF/spring.factories"):
                     info["autoconfig"] = "spring.factories"
-                javax = jakarta = False
+                javax = jakarta = uses_hibernate = False
                 for n in names:
                     if n.endswith(".class") and not n.startswith("META-INF/versions/"):
                         bts = z.read(n)
+                        # OpenJPA API use or enhanced entities (PersistenceCapable is added by the enhancer)
+                        info["openjpa"] = info["openjpa"] or b"org/apache/openjpa/" in bts
+                        uses_hibernate = uses_hibernate or b"org/hibernate/" in bts
                         javax = javax or JAVAX_EE_BYTES.search(bts) is not None
                         jakarta = jakarta or re.search(rb"jakarta/(?:servlet|persistence|validation|transaction|ws/rs|xml/bind|annotation|inject)/", bts) is not None
                 info["ee"] = "jakarta" if jakarta else ("javax" if javax else info["ee"])
+                info["uses_hibernate"] = uses_hibernate
         except Exception:
             pass
     return info
+
+
+def hibernate_of(info: dict) -> str | None:
+    """Hibernate major a library was built for (explicit dependency, else implied by its Boot line)."""
+    if info.get("hibernate") and info["hibernate"] not in ("6+",):
+        return info["hibernate"]
+    if info.get("boot"):
+        return {"2": "5", "3": "6", "4": "7"}.get(info["boot"].split(".")[0])
+    return info.get("hibernate")
 
 
 def boot_line_of(info: dict) -> str:
@@ -3448,6 +3469,10 @@ def boot_line_of(info: dict) -> str:
 
 def _accepts(line: str, cls: str, info: dict, target: str) -> int:
     """Score how well a version fits a stage's Boot line (0 = not acceptable)."""
+    if info.get("openjpa"):
+        return 0  # the migration removes OpenJPA; a version that still needs it cannot work
+    if line == HIBERNATE_LINE:  # OpenJPA stage: still Boot 2.7 / javax, but on Hibernate
+        return {"2": 3, "neutral": 1}.get(cls, 0)
     major = line.split(".")[0]
     if cls == major:
         bv = info.get("boot")
@@ -3465,7 +3490,8 @@ def _accepts(line: str, cls: str, info: dict, target: str) -> int:
     return 0
 
 
-def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_groups: list[str], say_=None) -> dict:
+def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_groups: list[str], say_=None,
+                           openjpa_stage: bool = False) -> dict:
     say_ = say_ or say
     refs = collect_dependency_refs(root)
     root_pom = re.sub(r"<parent>.*?</parent>", "", read(root / "pom.xml") or "", flags=re.S)
@@ -3484,16 +3510,22 @@ def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_gr
         candidates[(r.kind, r.group, r.artifact)] = cands
         to_fetch += [(r.group, r.artifact, v, "pom" if r.kind != "dependency" else "jar") for v in cands]
     repo.resolve(sorted(set(to_fetch)), "candidates")
-    plan = {"target": target, "internalGroups": internal_groups, "dependencies": []}
+    all_infos = {(r.kind, r.group, r.artifact): {v: built_against(repo, r.group, r.artifact, v) for v in candidates[(r.kind, r.group, r.artifact)]}
+                 for r in refs}
+    via_libs = any(i[r.version]["openjpa"] for r, i in ((r, all_infos[(r.kind, r.group, r.artifact)]) for r in refs))
+    if openjpa_stage or via_libs:
+        lines = [HIBERNATE_LINE] + lines
+    plan = {"target": target, "internalGroups": internal_groups, "lines": lines, "openjpaViaDependencies": via_libs, "dependencies": []}
     for r in refs:
         cands = candidates[(r.kind, r.group, r.artifact)]
-        infos = {v: built_against(repo, r.group, r.artifact, v) for v in cands}
+        infos = all_infos[(r.kind, r.group, r.artifact)]
         cur = infos[r.version]
         cur_cls = boot_line_of(cur)
         entry = {"coordinate": f"{r.group}:{r.artifact}", "kind": r.kind, "current": r.version, "versionProperty": r.prop,
                  "files": r.files, "internal": is_internal(r.group, internal_groups, root_group),
-                 "builtAgainst": {v: _describe(i) for v, i in infos.items()}, "upgrades": {}, "status": ""}
-        if cur_cls in ("neutral",):
+                 "builtAgainst": {v: _describe(i) for v, i in infos.items()}, "upgrades": {}, "status": "",
+                 "usesOpenJPA": cur["openjpa"]}
+        if cur_cls in ("neutral",) and not cur["openjpa"]:
             entry["status"] = "no Spring/Java EE coupling - no change needed"
         elif cur_cls == "unknown":
             entry["status"] = "could not be resolved - check --build-args / settings.xml"
@@ -3517,6 +3549,12 @@ def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_gr
                 entry["status"] = "upgrade"
             else:
                 entry["status"] = "current version already fits"
+            if cur["openjpa"]:
+                entry["status"] = "uses OpenJPA (removed by the migration); " + entry["status"]
+            for line, v in entry["upgrades"].items():
+                i = infos.get(v)
+                if line.startswith("4") and i and i.get("uses_hibernate") and hibernate_of(i) in ("5", "6"):
+                    entry["status"] += f"; {v} was built for Hibernate {hibernate_of(i)} and calls Hibernate APIs - Boot {line} ships Hibernate 7, test it"
         plan["dependencies"].append(entry)
     return plan
 
@@ -3533,15 +3571,28 @@ def _describe(i: dict) -> str:
         parts.append(i["ee"])
     if i["autoconfig"]:
         parts.append(f"autoconfig via {i['autoconfig']}")
+    if i.get("openjpa"):
+        parts.append("OpenJPA")
+    elif i.get("uses_hibernate") or i.get("hibernate"):
+        parts.append(f"Hibernate {hibernate_of(i) or '?'}")
     return ", ".join(parts) or "no Spring/EE coupling"
 
 
+def plan_lines(plan: dict) -> list[str]:
+    if plan.get("lines"):
+        return plan["lines"]
+    keys = {k for d in plan.get("dependencies", []) for k in d.get("upgrades", {})}
+    return [l for l in PLAN_LINES if l in keys or (l != HIBERNATE_LINE and vtuple(l) <= vtuple(plan.get("target", "4.1")))]
+
+
 def render_dependency_plan(plan: dict) -> str:
+    lines = plan_lines(plan)
+    label = lambda l: "Boot 2.7 + Hibernate" if l == HIBERNATE_LINE else f"Boot {l}"
     L = ["## Company / internal dependencies", "",
-         "| Dependency | Kind | Current | Built against | " + " | ".join(f"Boot {l}" for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])) + " | Status |",
-         "|---|---|---|---|" + "---|" * len([l for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])]) + "---|"]
+         "| Dependency | Kind | Current | Built against | " + " | ".join(label(l) for l in lines) + " | Status |",
+         "|---|---|---|---|" + "---|" * len(lines) + "---|"]
     for d in plan["dependencies"]:
-        cols = [d["upgrades"].get(l, "-") for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])]
+        cols = [d["upgrades"].get(l, "-") for l in lines]
         L.append(f"| `{d['coordinate']}`{' (internal)' if d.get('internal') else ''} | {d['kind']} | {d['current']} | "
                  f"{d['builtAgainst'].get(d['current'], '')} | " + " | ".join(cols) + f" | {d['status']} |")
     L += ["", f"Edit `{DEP_PLAN_FILE}` (the `upgrades` per Boot line) and pass it with `--dependency-plan` to override.", ""]
@@ -3556,9 +3607,9 @@ def interactive_plan(plan: dict, inp=input, out=print) -> dict:
         out(f"\n{d['coordinate']} ({d['kind']}, current {d['current']}): {d['status']}")
         for v, desc in d["builtAgainst"].items():
             out(f"    {v:<14} {desc}")
-        for line in [l for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(plan["target"])]:
+        for line in plan_lines(plan):
             sugg = d["upgrades"].get(line, d["current"])
-            ans = inp(f"  version for Boot {line} [{sugg}] (enter = accept, 'skip' = keep {d['current']}): ").strip()
+            ans = inp(f"  version for {'Boot 2.7 + Hibernate (OpenJPA stage)' if line == HIBERNATE_LINE else 'Boot ' + line} [{sugg}] (enter = accept, 'skip' = keep {d['current']}): ").strip()
             if ans.lower() == "skip":
                 d["upgrades"].pop(line, None)
             elif ans:
@@ -3589,7 +3640,8 @@ def apply_dependency_plan(root: Path, plan: dict, line: str) -> list[str]:
             else:
                 new = re.sub(r"(['\"]" + re.escape(g) + ":" + re.escape(a) + r":)[\w.\-]+(['\"])", rf"\g<1>{v}\g<2>", new)
             if write_if_changed(bf, t, new):
-                changes.append(f"{rel(bf, root)}: {d['coordinate']} -> {v} (built for Boot {line})")
+                changes.append(f"{rel(bf, root)}: {d['coordinate']} -> {v} (built for "
+                               f"{'Boot 2.7 + Hibernate' if line == HIBERNATE_LINE else 'Boot ' + line})")
     return changes
 
 
@@ -3908,7 +3960,8 @@ def cmd_migrate(a) -> int:
         dep_plan = json.loads(Path(a.dependency_plan).read_text(encoding="utf-8"))
         say(f"[deps] using {a.dependency_plan}")
     elif info["tool"] == "maven" and not a.no_dependency_detection:
-        dep_plan = detect_dependency_plan(root, MavenRepo(root, builder.exe, builder.extra, env, log_dir), a.target, a.internal_group or [])
+        dep_plan = detect_dependency_plan(root, MavenRepo(root, builder.exe, builder.extra, env, log_dir), a.target, a.internal_group or [],
+                                          openjpa_stage=use_openjpa)
         if a.interactive:
             dep_plan = interactive_plan(dep_plan)
     if dep_plan:
@@ -3920,6 +3973,11 @@ def cmd_migrate(a) -> int:
                 if d.get("status", "").startswith("NO compatible"):
                     todo_pre.append(f"`{d['coordinate']}` {d['current']}: {d['status']}")
         say(f"[deps] plan: {report_dir / DEP_PLAN_FILE} (edit and pass with --dependency-plan to change choices)")
+        if dep_plan.get("openjpaViaDependencies") and not a.no_openjpa and not any(st.key == OPENJPA_STAGE for st in stages) \
+                and any(st.key.startswith("2-") for st in stages):
+            say("[deps] OpenJPA comes in through a dependency -> adding the OpenJPA -> Hibernate stage")
+            at = next(i for i, st in enumerate(stages) if st.key.startswith("2-"))
+            stages.insert(at, Stage(OPENJPA_STAGE, "OpenJPA -> Hibernate (on Boot 2.7 / Hibernate 5.6, before the Spring 6 jump)", [], []))
 
     # ---- stages ----------------------------------------------------------
     todo_all: list[str] = list(todo_pre)
@@ -3930,6 +3988,8 @@ def cmd_migrate(a) -> int:
         changes = []
         if st.key == OPENJPA_STAGE:
             changes, todo = migrate_openjpa(root)
+            if dep_plan:
+                changes += apply_dependency_plan(root, dep_plan, HIBERNATE_LINE)
             todo_all += todo
             for c in changes:
                 say(f"  openjpa: {c}")
