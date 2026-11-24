@@ -4220,7 +4220,8 @@ def cmd_legacy(a) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI definition (also read by spring_migrate_web.py to build its option forms)."""
     ap = argparse.ArgumentParser(prog="spring-migrate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -4285,7 +4286,11 @@ def main(argv=None) -> int:
     m.add_argument("--offline", action="store_true", help="do not query Maven Central / SDKMAN for latest versions (use built-in ones)")
     m.set_defaults(fn=cmd_migrate)
 
-    a = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None) -> int:
+    a = build_parser().parse_args(argv)
     global OFFLINE
     OFFLINE = getattr(a, "offline", False)
     try:

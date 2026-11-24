@@ -28,6 +28,32 @@ python3 spring_migrate.py migrate /path/to/project \
 The project must be a git repo with a clean tree. Run it on a copy/clone first. The default target is **4.1**
 (`--target 3.5|4.0|4.1`).
 
+## Web dashboard
+```bash
+python3 spring_migrate_web.py            # then open http://127.0.0.1:8765
+python3 spring_migrate_web.py --parallel 2 --port 9000
+```
+A local web app around the same tool (stdlib only, no install). It runs `spring_migrate.py` for you and shows:
+* **Live progress**: a timeline of the steps (pre-flight, baseline, company dependencies, each stage with duration
+  and number of tool changes, retries) and the streaming log, filterable to steps/changes or errors/TODOs
+* **Many projects**: paste several paths, browse folders, or "find projects in a folder" (Maven/Gradle builds found
+  3 levels deep, with their Boot version); each project becomes a job in a queue. Jobs run **one after the other**
+  by default, or up to 4 **at the same time** (selector in the header; parallel builds share `~/.m2`)
+* **Every option** of `migrate` (generated from the CLI, so it always matches), plus *Scan only* and *Company
+  dependency plan* jobs. The last options are remembered in the browser
+* **Work on a copy** (default): the project is copied into the dashboard's state folder, so your checkout is never
+  touched. If the copy is not a git repository of its own, or has uncommitted changes, the dashboard commits a
+  baseline in the copy
+* **Cancel** (stops Maven/Gradle too), **Re-run / resume** (a stopped migration continues from the Boot version it
+  reached, in the same copy), **Delete**
+* The **report**, the **dependency plan** and the **scan** rendered in the page, and the exact command line to
+  reproduce a job in a terminal
+
+Jobs, logs and reports are kept in `~/.spring-migrate-web` (`--state-dir`) and survive restarts. The server binds to
+`127.0.0.1` and refuses cross-site requests; it runs commands on your machine, so `--host 0.0.0.0` prints an access
+token that every request must carry. Dependency questions (`--interactive`) need a terminal; in the dashboard,
+review the plan, edit `dependency-plan.json` and pass it with the *dependency-plan* option.
+
 ## What `migrate` does
 | Stage | Action |
 |---|---|
@@ -190,7 +216,7 @@ the tool (no manual fixes):
   `acme-persistence` 1.0.0 is built on OpenJPA: the run adds the OpenJPA stage, switches it to the Hibernate 5 build
   there, then to the Hibernate 6/7 builds
 
-`tests/test_codemods.py` (`python3 -m unittest discover -s tests`) unit-tests the codemods the samples do not exercise
+`tests/test_codemods.py` and `tests/test_web.py` (`python3 -m unittest discover -s tests`) unit-test the codemods the samples do not exercise
 (Zuul, Ribbon rules, opaque/HMAC/SSO OAuth2, YAML editing, ID pinning modes, dialects, CI images, wrappers, ...).
 
 Not verified: the Gradle path (implemented, untested; dependency detection is Maven-only), multi-module and Kotlin projects, non-H2 databases, PowerMock
