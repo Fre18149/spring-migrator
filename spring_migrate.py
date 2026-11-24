@@ -464,7 +464,8 @@ def fix_ci_java(root: Path, java: int) -> tuple[list[str], list[str]]:
 
 
 def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | None = None,
-               trailing_slash: bool = False, stage_rev: str | None = None) -> tuple[list[str], list[str]]:
+               trailing_slash: bool = False, stage_rev: str | None = None, boot_version: str | None = None,
+               extra: list[str] | None = None) -> tuple[list[str], list[str]]:
     """Post-fixers after a stage's OpenRewrite recipes. Idempotent."""
     changes = fix_spring_factories(root) + fix_javax_residuals(root)
     cc, todo = fix_containers_and_ci(root, java)
@@ -476,6 +477,10 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
     jc, jt = fix_jaxb_tooling(root)
     changes += jc
     todo_extra = jt
+    if boot_version:
+        dc, dt = fix_downgraded_boot_managed(root, boot_version, local_repository(extra or [], os.environ.copy()))
+        changes += dc
+        todo_extra += dt
     changes += fix_httptrace(root)
     changes += fix_httpclient5_checked(root)
     changes += fix_hibernate_props(root)
@@ -3233,6 +3238,74 @@ def fix_jaxb_tooling(root: Path) -> tuple[list[str], list[str]]:
     return changes, todo
 
 
+def boot_managed_versions(boot_version: str, local_repo: Path) -> dict:
+    """{(groupId, artifactId): version} managed directly by spring-boot-dependencies (from the local repository)."""
+    pom = local_repo / "org/springframework/boot/spring-boot-dependencies" / boot_version / f"spring-boot-dependencies-{boot_version}.pom"
+    text = read(pom) if pom.exists() else None
+    if not text:
+        return {}
+    props = _pom_props(text)
+    dm = re.search(r"<dependencyManagement>(.*?)</dependencyManagement>", text, re.S)
+    out = {}
+    for d in re.finditer(r"<dependency>(.*?)</dependency>", dm.group(1) if dm else "", re.S):
+        b = d.group(1)
+        if "<scope>import</scope>" in b:
+            continue
+        v = _resolve_prop(_first_tag(b, "version"), props)
+        if v and "${" not in v:
+            out[(_first_tag(b, "groupId"), _first_tag(b, "artifactId"))] = v
+    return out
+
+
+def fix_downgraded_boot_managed(root: Path, boot_version: str | None, local_repo: Path) -> tuple[list[str], list[str]]:
+    """Explicit versions OLDER than what Spring Boot manages (e.g. logback-classic 1.2.x, slf4j-api 1.7.x left from Boot 2)
+    override Boot 3/4's versions and mix two generations of a library (AbstractMethodError, NoSuchMethodError ...).
+    Remove them from dependencies/<dependencyManagement> so Boot's version applies; set plugin dependencies (which Boot's
+    management does not reach) to Boot's version."""
+    changes, todo = [], []
+    managed = boot_managed_versions(boot_version, local_repo) if boot_version else {}
+    if not managed:
+        return [], []
+    props = {}
+    for bf in build_files(root):
+        if bf.name == "pom.xml":
+            props.update(_pom_props(read(bf) or ""))
+    for bf in build_files(root):
+        if bf.name != "pom.xml":
+            continue
+        t = read(bf) or ""
+        plugin_spans = [m.span() for m in re.finditer(r"<plugin>.*?</plugin>", t, re.S)]
+        edits = []
+        for m in re.finditer(r"<dependency>((?:(?!<dependency>).)*?)</dependency>", t, re.S):
+            b = m.group(1).split("<exclusions>")[0]
+            key = (_first_tag(b, "groupId"), _first_tag(b, "artifactId"))
+            raw = _first_tag(b, "version")
+            if key not in managed or not raw:
+                continue
+            v = _resolve_prop(raw, props)
+            if "${" in v or vtuple(v)[:2] >= vtuple(managed[key])[:2]:
+                continue
+            in_plugin = any(a <= m.start() < z for a, z in plugin_spans)
+            blk = m.group(0)
+            if in_plugin:
+                new_blk = blk.replace(f"<version>{raw}</version>", f"<version>{managed[key]}</version>", 1)
+                what = f"set to Boot's {managed[key]} (plugin dependency)"
+            else:
+                new_blk = re.sub(r"\s*<version>" + re.escape(raw) + r"</version>", "", blk, count=1)
+                what = f"version removed, Boot manages {managed[key]}"
+            edits.append((m.start(), m.end(), new_blk, f"{key[0]}:{key[1]} {v}: {what}"))
+        new = t
+        for a, z, blk, msg in sorted(edits, reverse=True):
+            new = new[:a] + blk + new[z:]
+            changes.append(f"{rel(bf, root)}: {msg}")
+        if edits:
+            write_if_changed(bf, t, new)
+    if changes:
+        todo.append("Explicit versions older than Spring Boot's were dropped (they mixed Boot 2 and Boot 3 jars): " +
+                    "; ".join(c.split(": ", 1)[1] for c in changes[:6]))
+    return changes, todo
+
+
 HTTPTRACE_JAVA = [
     ("org.springframework.boot.actuate.trace.http.InMemoryHttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.InMemoryHttpExchangeRepository"),
     ("org.springframework.boot.actuate.trace.http.HttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository"),
@@ -3631,7 +3704,7 @@ DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.8.1"
 HIBERNATE_LINE = "2.7-hibernate"   # plan key applied in the OpenJPA -> Hibernate stage (Boot 2.7, javax)
 PLAN_LINES = (HIBERNATE_LINE, "3.5", "4.0", "4.1")
 # handled by OpenRewrite / the codemods / Boot's own dependency management
-DEP_SKIP_GROUPS = ("org.springframework", "io.springfox", "org.springdoc", "com.netflix", "org.powermock", "org.apache.openjpa", "org.apache.httpcomponents",
+DEP_SKIP_GROUPS = ("org.springframework", "io.springfox", "org.springdoc", "org.slf4j", "ch.qos.logback", "org.apache.logging.log4j", "com.netflix", "org.powermock", "org.apache.openjpa", "org.apache.httpcomponents",
                    "javax.", "jakarta.", "org.junit", "junit", "org.openrewrite", "io.micrometer", "org.hibernate", "com.h2database")
 PUBLIC_GROUPS = ("org.apache", "com.fasterxml", "com.google", "org.projectlombok", "org.mockito", "org.postgresql", "com.mysql", "mysql",
                  "org.mariadb", "io.github.resilience4j", "org.springdoc", "org.slf4j", "ch.qos", "org.yaml", "org.assertj", "org.hamcrest",
@@ -4285,6 +4358,18 @@ def _pin_version(text: str, g: str, a: str, v: str, plugin_a: str | None, lineno
     return text[:m.start()] + add(m.group(0)) + text[m.end():]
 
 
+def stage_boot_version(root: Path, builder, env: dict) -> str | None:
+    """The Boot version the build now uses: from the POM, else through the company parent (Maven)."""
+    v = detect_build(root)["boot_version"]
+    if not (v and not v.startswith("${")):
+        v = effective_boot_version(root, builder.exe, builder.extra, env) if builder.tool == "maven" else None
+    if v and builder.tool == "maven":
+        repo = MavenRepo(root, builder.exe, builder.extra, env, builder.log_dir)
+        if not repo.path("org.springframework.boot", "spring-boot-dependencies", v, "pom").exists():
+            repo.resolve([("org.springframework.boot", "spring-boot-dependencies", v, "pom")], "boot-bom")
+    return v
+
+
 def apply_plan_safely(root: Path, plan: dict, line: str, exe: str, extra: list[str], env: dict) -> tuple[list[str], list[str]]:
     """apply_dependency_plan, plus: versions the old parent/BOM managed but the new one does not are pinned."""
     moves = [d for d in plan.get("dependencies", []) if d.get("kind") in ("parent", "bom") and d.get("upgrades", {}).get(line)]
@@ -4805,7 +4890,8 @@ def cmd_migrate(a) -> int:
         if st.java_fix:
             changes, todo = run_fixers(root, a.java, st.boot_line or "3.5", base_rev,
                                        trailing_slash=st.key.startswith("2-") and not a.no_trailing_slash_compat,
-                                       stage_rev=stage_rev)
+                                       stage_rev=stage_rev, boot_version=stage_boot_version(root, builder, env),
+                                       extra=builder.extra)
             todo_all += todo
             for c in changes:
                 say(f"  fixer: {c}")

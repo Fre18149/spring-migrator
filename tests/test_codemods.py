@@ -457,6 +457,40 @@ class JaxbVersionAndPluginDepsTest(unittest.TestCase):
         pr.close()
 
 
+class DowngradedBootManagedTest(unittest.TestCase):
+    def test_older_explicit_versions_yield_to_boot(self):
+        with tempfile.TemporaryDirectory() as t:
+            local = Path(t) / "repo"
+            bom = local / "org/springframework/boot/spring-boot-dependencies/3.5.16/spring-boot-dependencies-3.5.16.pom"
+            bom.parent.mkdir(parents=True)
+            bom.write_text("<project><properties><logback.version>1.5.34</logback.version><slf4j.version>2.0.18</slf4j.version></properties>"
+                           "<dependencyManagement><dependencies>"
+                           "<dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId><version>${logback.version}</version></dependency>"
+                           "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>${slf4j.version}</version></dependency>"
+                           "</dependencies></dependencyManagement></project>")
+            pr = Project({"pom.xml": """<project><properties><old.slf4j>1.7.36</old.slf4j></properties>
+  <dependencyManagement><dependencies>
+    <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>${old.slf4j}</version></dependency>
+  </dependencies></dependencyManagement>
+  <dependencies>
+    <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId><version>1.2.13</version></dependency>
+    <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-core</artifactId><version>1.2.13</version></dependency>
+  </dependencies>
+  <build><plugins><plugin><artifactId>exec-maven-plugin</artifactId><dependencies>
+    <dependency><groupId>ch.qos.logback</groupId><artifactId>logback-classic</artifactId><version>1.2.13</version></dependency>
+  </dependencies></plugin></plugins></build>
+</project>"""})
+            changes, todo = sm.fix_downgraded_boot_managed(pr.root, "3.5.16", local)
+            pom = pr["pom.xml"]
+            self.assertIn("<artifactId>slf4j-api</artifactId></dependency>", pom)                   # managed entry dropped its version
+            self.assertIn("<artifactId>logback-classic</artifactId></dependency>", pom)             # dependency: Boot's version
+            self.assertIn("<artifactId>logback-classic</artifactId><version>1.5.34</version>", pom) # plugin dependency: set
+            self.assertIn("<artifactId>logback-core</artifactId><version>1.2.13</version>", pom)    # not managed here: untouched
+            self.assertEqual(len(changes), 3)
+            self.assertEqual(sm.fix_downgraded_boot_managed(pr.root, "3.5.16", local)[0], [])        # idempotent
+            pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>
