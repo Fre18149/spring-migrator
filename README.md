@@ -119,6 +119,22 @@ After the 3.5 recipes:
 * Maven wrapper < 3.6.3 and Gradle wrapper below the Boot minimum bumped
 * Third-party: MapStruct < 1.5.5, Lombok pinned in `annotationProcessorPaths`, Querydsl `jakarta` classifier
 
+## Multi-module builds
+Point the tool at the **root** (aggregator) project; all modules are migrated together, in one branch, with one build
+gate per stage over the whole reactor:
+* OpenRewrite runs over every module; the codemods work per module (Hystrix in one module only changes that module's
+  POM, config and code; Resilience4j/AOP starters go only where the code needs them).
+* Versions managed in the root's `<dependencyManagement>` are cleaned up when a library is replaced, and a BOM that a
+  module needs (e.g. Spring Cloud) is added once, to the top of the build, instead of to each module.
+* Every Spring Boot application module gets its own trailing-slash filter, but only web modules.
+* The build's own modules (the root as `<parent>` of the children, sibling modules as dependencies) are never treated
+  as libraries to upgrade from your repository; a company parent or BOM above the root still is.
+* If the children only inherit Boot through the root, the Boot version is read from the modules that resolve it.
+
+If your company parent POM is a project of its own, with the applications in separate repositories: migrate the
+parent first and release it. Then migrate the applications (several at once in the dashboard): the dependency check
+finds the released parent version that is built for each Boot line and moves them to it.
+
 ## Company parents, BOMs and internal libraries (Artifactory / Nexus)
 OpenRewrite only upgrades `spring-boot-starter-parent` and libraries it knows. A **company parent POM** that inherits
 from Boot, an internal **BOM**, or **internal starters** built against Boot 2 are left alone. The last case is the worst:
@@ -199,7 +215,7 @@ with file:line, the report repeats them, and a leftover reference fails the stag
   and schema mapping against your real database; lazy loading; the end-of-report checklist
 
 ## Verified
-`tests/e2e.sh` (Maven, JDK 21) migrates five Boot 2.7 sample projects to **Boot 4.1.3**. Each has tests that are
+`tests/e2e.sh` (Maven, JDK 21) migrates six Boot 2.7 sample projects to **Boot 4.1.3**. Each has tests that are
 green on the original code and must stay green after every stage, and the script checks that every commit came from
 the tool (no manual fixes):
 * `examples/legacy-demo`: JPA, Security, MVC, validation, JUnit 4, `spring.factories`, Actuator httptrace, Docker/CI
@@ -210,6 +226,8 @@ the tool (no manual fixes):
   `openjdk` images, Maven wrapper 3.6.0
 * `examples/legacy-authserver`: `@EnableAuthorizationServer` with HMAC-signed JWTs; a token is fetched from
   `/oauth/token` before and after migration
+* `examples/legacy-multimodule`: root POM with `<dependencyManagement>`, a JPA library module, a web app using it
+  and a worker app with Hystrix (version managed in the root); tests cross module boundaries
 * `examples/legacy-company`: company parent (`acme-parent` 1.4.0 on Boot 2.7) and an internal javax /
   `spring.factories` starter, served from a fake Artifactory (`tests/build-company-repo.sh` builds a file-based Maven
   repo plus `settings.xml`); the test checks the starter's filter is still auto-configured after every stage. Its
@@ -219,6 +237,6 @@ the tool (no manual fixes):
 `tests/test_codemods.py` and `tests/test_web.py` (`python3 -m unittest discover -s tests`) unit-test the codemods the samples do not exercise
 (Zuul, Ribbon rules, opaque/HMAC/SSO OAuth2, YAML editing, ID pinning modes, dialects, CI images, wrappers, ...).
 
-Not verified: the Gradle path (implemented, untested; dependency detection is Maven-only), multi-module and Kotlin projects, non-H2 databases, PowerMock
+Not verified: the Gradle path (implemented, untested; dependency detection is Maven-only), Gradle multi-project builds, Kotlin projects, non-H2 databases, PowerMock
 (cannot run on JDK 21 at all, so no green baseline was possible here; the OpenRewrite recipe handles it).
 Review the diff and run your integration tests against your real database before going live.

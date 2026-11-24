@@ -6,13 +6,13 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${TARGET:-4.1}"
 run() {  # run <example-dir-name>; leaves you in the migrated copy
-  local work; work="$(mktemp -d)"; cp -r "$here/examples/$1" "$work/p"; rm -rf "$work/p/target"; cd "$work/p"
+  local work; work="$(mktemp -d)"; cp -r "$here/examples/$1" "$work/p"; find "$work/p" -name target -type d -prune -exec rm -rf {} +; cd "$work/p"
   git init -q -b main && git add -A && git -c user.name=t -c user.email=t@t commit -qm baseline
   git config user.name t; git config user.email t@t
   python3 "$here/spring_migrate.py" migrate . --target "$TARGET" --report-dir "$work/report" ${BUILD_ARGS:+--build-args "$BUILD_ARGS"}
   [ -n "${NO_BOOT_IN_POM:-}" ] || grep -q "<version>${TARGET}\." pom.xml
   grep -q "all stages completed" "$work/report/MIGRATION_REPORT.md"
-  ! grep -rqE "javax\.(servlet|persistence|validation)" src
+  ! grep -rqE "javax\.(servlet|persistence|validation)" --include=*.java .
   ! git log --format=%s | grep -qv "^chore(migration)\|^baseline$"   # every commit came from the tool
   echo "$1 OK (report: $work/report/MIGRATION_REPORT.md)"
 }
@@ -52,8 +52,19 @@ company() {
   git show "$(git log -1 --format=%H --grep='OpenJPA -> Hibernate'):pom.xml" | grep -A1 "<artifactId>acme-persistence</artifactId>" | grep -q "<version>1.1.0</version>"
   grep -A1 "<artifactId>acme-persistence</artifactId>" pom.xml | grep -q "<version>3.0.0</version>"
 }
+multimodule() {
+  # root pom + library + web app + worker app; Hystrix version managed in the root's <dependencyManagement>
+  run legacy-multimodule
+  ! grep -qi "hystrix" pom.xml shop-*/pom.xml
+  grep -q "spring-cloud-starter-circuitbreaker-resilience4j" shop-worker/pom.xml
+  grep -q "spring-boot-starter-aspectj" shop-worker/pom.xml
+  ! grep -q "spring-boot-starter-aspectj" pom.xml shop-core/pom.xml shop-web/pom.xml
+  test -f shop-web/src/main/java/com/acme/shop/web/TrailingSlashCompatibilityConfig.java
+  ! test -f shop-worker/src/main/java/com/acme/shop/worker/TrailingSlashCompatibilityConfig.java
+  grep -q 'sequenceName = "hibernate_sequence"' shop-core/src/main/java/com/acme/shop/core/Product.java
+}
 case "${1:-all}" in
-  demo|openjpa|cloud|authserver|company) "$1";;
-  all) demo; openjpa; cloud; authserver; company;;
-  *) echo "usage: $0 [demo|openjpa|cloud|authserver|company|all]"; exit 2;;
+  demo|openjpa|cloud|authserver|company|multimodule) "$1";;
+  all) demo; openjpa; cloud; authserver; company; multimodule;;
+  *) echo "usage: $0 [demo|openjpa|cloud|authserver|company|multimodule|all]"; exit 2;;
 esac

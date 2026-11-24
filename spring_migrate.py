@@ -1012,6 +1012,12 @@ def build_remove_deps(p: Path, text: str, pred) -> tuple[str, list[str]]:
             if pred(g, a):
                 text = text[:s] + text[e:]
                 removed.append(f"{g}:{a}")
+        # multi-module builds pin versions in the root's <dependencyManagement>; drop those entries as well
+        def strip_managed(m):
+            block, _ = _strip_blocks(m.group(0), "dependency", lambda b: "<scope>import</scope>" not in b and
+                                     pred(_first_tag(b.split("<exclusions>")[0], "groupId"), _first_tag(b.split("<exclusions>")[0], "artifactId")))
+            return block
+        text = re.sub(r"<dependencyManagement>.*?</dependencyManagement>", strip_managed, text, flags=re.S)
         return text, removed
     out = []
     for line in text.splitlines(keepends=True):
@@ -1021,6 +1027,51 @@ def build_remove_deps(p: Path, text: str, pred) -> tuple[str, list[str]]:
             continue
         out.append(line)
     return "".join(out), removed
+
+
+def pom_coords(text: str) -> tuple[str, str]:
+    """(groupId, artifactId) of a POM itself (groupId inherited from <parent> when absent)."""
+    own = re.sub(r"<(parent|dependencies|dependencyManagement|build|profiles|plugins|reporting)>.*?</\1>", "", text, flags=re.S)
+    pm = re.search(r"<parent>(.*?)</parent>", text, re.S)
+    return (_first_tag(own, "groupId") or (_first_tag(pm.group(1), "groupId") if pm else "")), _first_tag(own, "artifactId")
+
+
+def reactor_coords(root: Path) -> set[tuple[str, str]]:
+    """Modules of the build itself (they are never upgraded from a repository)."""
+    return {pom_coords(read(p) or "") for p in walk(root) if p.name == "pom.xml"}
+
+
+def reactor_ancestors(root: Path, pom: Path) -> list[Path]:
+    """pom, then its parents that are part of this build (via <relativePath>, default ../pom.xml)."""
+    chain, cur = [pom], pom
+    coords = reactor_coords(root)
+    for _ in range(10):
+        t = read(cur) or ""
+        pm = re.search(r"<parent>(.*?)</parent>", t, re.S)
+        if not pm:
+            break
+        pg, pa = _first_tag(pm.group(1), "groupId"), _first_tag(pm.group(1), "artifactId")
+        if (pg, pa) not in coords:
+            break
+        relp = re.search(r"<relativePath>([^<]*)</relativePath>", pm.group(1))
+        cand = (cur.parent / (relp.group(1) if relp and relp.group(1) else "../pom.xml")).resolve()
+        if cand.is_dir():
+            cand = cand / "pom.xml"
+        if not cand.exists() or not str(cand).startswith(str(root.resolve())) or cand in chain:
+            match = next((p for p in walk(root) if p.name == "pom.xml" and pom_coords(read(p) or "") == (pg, pa)), None)
+            if not match or match in chain:
+                break
+            cand = match
+        chain.append(cand)
+        cur = cand
+    return chain
+
+
+def reactor_text(root: Path, bf: Path) -> str:
+    """A module's build file plus the in-build parents it inherits from."""
+    if bf.name != "pom.xml":
+        return (read(bf) or "") + (read(root / "build.gradle") or "") + (read(root / "build.gradle.kts") or "")
+    return "\n".join(read(p) or "" for p in reactor_ancestors(root, bf))
 
 
 def build_add_dep(p: Path, text: str, group: str, artifact: str, version: str | None = None, scope: str | None = None) -> str:
@@ -1043,15 +1094,26 @@ def build_add_dep(p: Path, text: str, group: str, artifact: str, version: str | 
     return text.rstrip("\n") + "\n\ndependencies {\n" + line + "}\n"
 
 
+def _top_level(text: str, tag: str) -> re.Match | None:
+    """First <tag> that is a direct child of <project> (not inside dependencyManagement/build/profiles/...)."""
+    nested = [m.span() for m in re.finditer(r"<(dependencyManagement|build|profiles|reporting|parent|pluginManagement)>.*?</\1>", text, re.S)]
+    for m in re.finditer(r"[ \t]*<" + tag + r">", text):
+        if not any(a <= m.start() < b for a, b in nested):
+            return m
+    return None
+
+
 def pom_set_property(text: str, name: str, value: str) -> str:
     rx = re.compile(r"(<" + re.escape(name) + r">)[^<]*(</" + re.escape(name) + r">)")
     if rx.search(text):
         return rx.sub(lambda m: m.group(1) + value + m.group(2), text, count=1)
-    m = re.search(r"<properties>[ \t]*\n", text)
+    m = _top_level(text, "properties")
     if m:
-        return text[:m.end()] + f"    <{name}>{value}</{name}>\n" + text[m.end():]
-    m = re.search(r"[ \t]*<dependencies>", text)
-    return text[:m.start()] + f"  <properties>\n    <{name}>{value}</{name}>\n  </properties>\n" + text[m.start():]
+        end = text.index(">", m.end() - 1) + 1
+        return text[:end] + f"\n    <{name}>{value}</{name}>" + text[end:]
+    anchor = _top_level(text, "dependencyManagement") or _top_level(text, "dependencies") or _top_level(text, "build")
+    pos = anchor.start() if anchor else text.rindex("</project>")
+    return text[:pos] + f"  <properties>\n    <{name}>{value}</{name}>\n  </properties>\n" + text[pos:]
 
 
 def pom_ensure_bom(text: str, group: str, artifact: str, version_expr: str) -> str:
@@ -1059,12 +1121,13 @@ def pom_ensure_bom(text: str, group: str, artifact: str, version_expr: str) -> s
         return text
     dep = (f"      <dependency>\n        <groupId>{group}</groupId>\n        <artifactId>{artifact}</artifactId>\n"
            f"        <version>{version_expr}</version>\n        <type>pom</type>\n        <scope>import</scope>\n      </dependency>\n")
-    m = re.search(r"<dependencyManagement>\s*<dependencies>[ \t]*\n", text)
+    m = re.search(r"<dependencyManagement>\s*<dependencies>[ \t]*\n?", text)
     if m:
-        return text[:m.end()] + dep + text[m.end():]
+        return text[:m.end()] + ("" if text[m.end() - 1] == "\n" else "\n") + dep + text[m.end():]
     block = f"  <dependencyManagement>\n    <dependencies>\n{dep}    </dependencies>\n  </dependencyManagement>\n"
-    m = re.search(r"^[ \t]*<dependencies>", text, re.M)
-    return text[:m.start()] + block + text[m.start():]
+    anchor = _top_level(text, "dependencies") or _top_level(text, "build")
+    pos = anchor.start() if anchor else text.rindex("</project>")
+    return text[:pos] + block + text[pos:]
 
 
 # ---- Spring config files (application*.properties / *.yml) ------------------
@@ -1667,12 +1730,24 @@ def cm_hystrix(root: Path) -> tuple[list[str], list[str]]:
     for bf in list(build_files(root)):
         t = read(bf) or ""
         new, removed = build_remove_deps(bf, t, lambda g, a: "hystrix" in (a or "").lower() or (g or "") == "com.netflix.hystrix")
+        if not removed and write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: removed Hystrix from <dependencyManagement>")
+            continue
         if removed or (module_of(bf, root) in mods and changes):
             new = build_add_dep(bf, new, "org.springframework.cloud", "spring-cloud-starter-circuitbreaker-resilience4j")
             new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-aop")
-            if bf.name == "pom.xml" and "spring-cloud-dependencies" not in new and "spring-cloud-starter-parent" not in new:
-                new = pom_set_property(new, "spring-cloud.version", cloud_version_for("3.5"))
-                new = pom_ensure_bom(new, "org.springframework.cloud", "spring-cloud-dependencies", "${spring-cloud.version}")
+            inherited = reactor_text(root, bf)
+            if bf.name == "pom.xml" and not re.search(r"spring-cloud-dependencies|spring-cloud-starter-parent", new + inherited):
+                top = reactor_ancestors(root, bf)[-1]
+                if top == bf:
+                    new = pom_set_property(new, "spring-cloud.version", cloud_version_for("3.5"))
+                    new = pom_ensure_bom(new, "org.springframework.cloud", "spring-cloud-dependencies", "${spring-cloud.version}")
+                else:
+                    tt = read(top) or ""
+                    tt2 = pom_ensure_bom(pom_set_property(tt, "spring-cloud.version", cloud_version_for("3.5")),
+                                         "org.springframework.cloud", "spring-cloud-dependencies", "${spring-cloud.version}")
+                    if write_if_changed(top, tt, tt2):
+                        changes.append(f"{rel(top, root)}: added the Spring Cloud BOM (inherited by {rel(bf, root)})")
             if write_if_changed(bf, t, new):
                 changes.append(f"{rel(bf, root)}: {', '.join(removed) or 'Hystrix'} -> spring-cloud-starter-circuitbreaker-resilience4j + spring-boot-starter-aop")
     if changes:
@@ -1736,6 +1811,8 @@ def cm_ribbon(root: Path) -> tuple[list[str], list[str]]:
     for bf in list(build_files(root)):
         t = read(bf) or ""
         new, removed = build_remove_deps(bf, t, lambda g, a: "ribbon" in (a or "").lower())
+        if not removed and write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: removed Ribbon from <dependencyManagement>")
         if removed:
             new = build_add_dep(bf, new, "org.springframework.cloud", "spring-cloud-starter-loadbalancer")
             if write_if_changed(bf, t, new):
@@ -1759,6 +1836,8 @@ def cm_zuul(root: Path) -> tuple[list[str], list[str]]:
     for bf in list(build_files(root)):
         t = read(bf) or ""
         new, removed = build_remove_deps(bf, t, lambda g, a: "zuul" in (a or "").lower())
+        if not removed and write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: removed Zuul from <dependencyManagement>")
         if removed:
             zuul_dep = True
             new = build_add_dep(bf, new, "org.springframework.cloud", "spring-cloud-starter-gateway-server-webmvc",
@@ -2044,6 +2123,8 @@ def cm_legacy_oauth2(root: Path) -> tuple[list[str], list[str]]:
             continue
         new, removed = build_remove_deps(bf, t, LEGACY_OAUTH_DEP)
         if not removed:
+            if write_if_changed(bf, t, new):
+                changes.append(f"{rel(bf, root)}: removed spring-security-oauth2 from <dependencyManagement>")
             continue
         if has_rs:
             new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-oauth2-resource-server")
@@ -2836,10 +2917,13 @@ def fix_boot4_aspectj(root: Path, stage_rev: str | None) -> list[str]:
     """Boot 4 replaced spring-boot-starter-aop with spring-boot-starter-aspectj; the OpenRewrite 4.0 recipe removes the old
     starter without adding the new one, which silently disables @Aspect / Resilience4j / @Retryable annotations."""
     changes = []
-    needs_aop = any(re.search(r"@Aspect\b|io\.github\.resilience4j\.\w+\.annotation|@EnableAspectJAutoProxy|@Retryable", read(p) or "")
-                    for p in java_sources(root, main_only=True))
+    aop_rx = r"@Aspect\b|io\.github\.resilience4j\.\w+\.annotation|@EnableAspectJAutoProxy|@Retryable"
     for bf in build_files(root):
         t = read(bf) or ""
+        mod = bf.parent
+        # per module: in a multi-module build only the modules whose own code needs AOP get the starter
+        needs_aop = "<packaging>pom</packaging>" not in t and any(
+            re.search(aop_rx, read(p) or "") for p in java_sources(mod, main_only=True) if module_of(p, root) == mod)
         had = "spring-boot-starter-aop" in t
         if stage_rev and not had:
             r = subprocess.run(["git", "show", f"{stage_rev}:{rel(bf, root)}"], cwd=root, capture_output=True, text=True)
@@ -2941,19 +3025,29 @@ public class TrailingSlashCompatibilityConfig {{
 
 
 def fix_trailing_slash(root: Path) -> list[str]:
-    builds = " ".join(read(b) or "" for b in build_files(root))
-    servlet = re.search(r"spring-boot-starter-web(?![\w-])|spring-boot-starter-webmvc", builds)
-    reactive = "spring-boot-starter-webflux" in builds and not servlet
-    if not (servlet or reactive) or re.search(r"setUseTrailingSlashMatch\s*\(\s*true|UrlHandlerFilter", " ".join(read(p) or "" for p in java_sources(root))):
-        return []
-    pkg, d = main_package(root)
-    if not pkg:
-        return []
-    target = d / "TrailingSlashCompatibilityConfig.java"
-    if target.exists():
-        return []
-    target.write_text((TRAILING_SLASH_SERVLET if servlet else TRAILING_SLASH_REACTIVE).format(pkg=pkg), encoding="utf-8")
-    return [f"{rel(target, root)}: keeps Spring 5 trailing-slash matching (UrlHandlerFilter, runs before Spring Security)"]
+    """One filter per Spring Boot application (multi-module builds can have several apps)."""
+    changes = []
+    for app in java_sources(root, main_only=True):
+        t = read(app) or ""
+        if "@SpringBootApplication" not in t:
+            continue
+        mod = module_of(app, root)
+        bf = module_build_file(mod)
+        builds = reactor_text(root, bf) if bf else ""
+        servlet = re.search(r"spring-boot-starter-web(?![\w-])|spring-boot-starter-webmvc", builds)
+        reactive = "spring-boot-starter-webflux" in builds and not servlet
+        mod_src = " ".join(read(p) or "" for p in java_sources(mod))
+        if not (servlet or reactive) or re.search(r"setUseTrailingSlashMatch\s*\(\s*true|UrlHandlerFilter", mod_src):
+            continue
+        pm = re.search(r"^\s*package\s+([\w.]+)\s*;", t, re.M)
+        if not pm:
+            continue
+        target = app.parent / "TrailingSlashCompatibilityConfig.java"
+        if target.exists():
+            continue
+        target.write_text((TRAILING_SLASH_SERVLET if servlet else TRAILING_SLASH_REACTIVE).format(pkg=pm.group(1)), encoding="utf-8")
+        changes.append(f"{rel(target, root)}: keeps Spring 5 trailing-slash matching (UrlHandlerFilter, runs before Spring Security)")
+    return changes
 
 
 DIALECT_MAP = [
@@ -3273,8 +3367,10 @@ def collect_dependency_refs(root: Path) -> list[DepRef]:
     for p in poms:
         props.update(_pom_props(read(p) or ""))
 
+    own = reactor_coords(root)
+
     def add(kind, g, a, v, p):
-        if not (g and a and v) or g.startswith(DEP_SKIP_GROUPS):
+        if not (g and a and v) or g.startswith(DEP_SKIP_GROUPS) or (g, a) in own:
             return
         prop = None
         m = re.fullmatch(r"\$\{([\w.\-]+)\}", v.strip())
@@ -3705,13 +3801,19 @@ def apply_dependency_plan(root: Path, plan: dict, line: str) -> list[str]:
 
 def effective_boot_version(root: Path, exe: str, extra: list[str], env: dict) -> str | None:
     """Boot version when it comes through a company parent/BOM: the resolved org.springframework.boot:spring-boot."""
-    with tempfile.TemporaryDirectory() as tmp:
-        out = Path(tmp) / "deps.txt"
-        r = subprocess.run([exe, "-B", "-ntp", "-q", f"{DEP_PLUGIN}:list", "-DincludeGroupIds=org.springframework.boot",
-                            "-DincludeArtifactIds=spring-boot", f"-DoutputFile={out}", "-DexcludeTransitive=false"] + extra,
-                           cwd=root, env=env, capture_output=True, text=True)
-        m = re.search(r"org\.springframework\.boot:spring-boot:jar:([\w.\-]+)", read(out) or "") if out.exists() else None
-        return m.group(1) if m else None
+    # relative outputFile = one file per module (a single absolute file would be overwritten by every module);
+    # -fae: in a multi-module build, modules depending on unbuilt siblings fail here, the others still answer
+    name = "target/spring-migrate-boot.txt"
+    subprocess.run([exe, "-B", "-ntp", "-q", "-fae", f"{DEP_PLUGIN}:list", "-DincludeGroupIds=org.springframework.boot",
+                    "-DincludeArtifactIds=spring-boot", f"-DoutputFile={name}", "-DexcludeTransitive=false"] + extra,
+                   cwd=root, env=env, capture_output=True, text=True)
+    found = []
+    for f in root.rglob("spring-migrate-boot.txt"):
+        m = re.search(r"org\.springframework\.boot:spring-boot:jar:([\w.\-]+)", read(f) or "")
+        if m:
+            found.append(m.group(1))
+        f.unlink()
+    return max(found, key=vtuple) if found else None
 
 
 # --------------------------------------------------------------------------- #
@@ -3847,12 +3949,14 @@ rootProject {{
         """Resolved runtime+test classpath (Maven only); empty if it cannot be resolved."""
         if self.tool != "maven":
             return []
-        out = self.log_dir / "classpath.txt"
-        code = run([self.exe, "-B", "-ntp", "-q", f"{DEP_PLUGIN}:build-classpath", f"-Dmdep.outputFile={out}", "-Dmdep.includeScope=runtime"] + self.extra,
-                   self.root, self.log_dir / "classpath.log", self.env)
-        if code != 0 or not out.exists():
-            return []
-        return [x for x in (read(out) or "").strip().split(os.pathsep) if x]
+        # compile: lets the reactor resolve sibling modules; one output file per module (relative path)
+        run([self.exe, "-B", "-ntp", "-q", "-fae", "compile", f"{DEP_PLUGIN}:build-classpath", "-Dmdep.outputFile=target/spring-migrate-cp.txt",
+             "-Dmdep.includeScope=runtime"] + self.extra, self.root, self.log_dir / "classpath.log", self.env)
+        cp = []
+        for f in self.root.rglob("spring-migrate-cp.txt"):
+            cp += [x for x in (read(f) or "").strip().split(os.pathsep) if x and x not in cp]
+            f.unlink()
+        return cp
 
     def verify(self, stage: str) -> int:
         log = self.log_dir / f"{stage}-build.log"

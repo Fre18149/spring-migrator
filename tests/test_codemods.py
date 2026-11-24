@@ -408,6 +408,69 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class MultiModuleTest(unittest.TestCase):
+    ROOT = """
+        <project>
+          <parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>2.7.13</version></parent>
+          <groupId>com.acme.shop</groupId><artifactId>shop-parent</artifactId><version>1.0.0</version><packaging>pom</packaging>
+          <modules><module>core</module><module>web</module><module>worker</module></modules>
+          <properties><java.version>11</java.version></properties>
+          <dependencyManagement><dependencies>
+            <dependency><groupId>com.acme.shop</groupId><artifactId>shop-core</artifactId><version>1.0.0</version></dependency>
+            <dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-starter-netflix-hystrix</artifactId><version>2.2.10.RELEASE</version></dependency>
+          </dependencies></dependencyManagement>
+        </project>
+        """
+    CHILD = """
+        <project>
+          <parent><groupId>com.acme.shop</groupId><artifactId>shop-parent</artifactId><version>1.0.0</version></parent>
+          <artifactId>{a}</artifactId>
+          <dependencies>{deps}</dependencies>
+        </project>
+        """
+
+    def project(self):
+        web = '<dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>'
+        hx = '<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-starter-netflix-hystrix</artifactId></dependency>'
+        return Project({
+            "pom.xml": self.ROOT,
+            "core/pom.xml": self.CHILD.format(a="shop-core", deps=""),
+            "web/pom.xml": self.CHILD.format(a="web", deps=web + '<dependency><groupId>com.acme.shop</groupId><artifactId>shop-core</artifactId><version>1.0.0</version></dependency>'),
+            "worker/pom.xml": self.CHILD.format(a="worker", deps=hx),
+            "web/src/main/java/a/web/WebApp.java": "package a.web;\n@SpringBootApplication\npublic class WebApp {}\n",
+            "worker/src/main/java/a/worker/WorkerApp.java": "package a.worker;\nimport com.netflix.hystrix.contrib.javanica.annotation.HystrixCommand;\n"
+                "@SpringBootApplication\npublic class WorkerApp {\n    @HystrixCommand(fallbackMethod = \"fb\")\n    public int x() { return 1; }\n"
+                "    public int fb() { return 2; }\n}\n",
+        })
+
+    def test_own_modules_are_not_dependencies(self):
+        pr = self.project()
+        refs = {(r.group, r.artifact) for r in sm.collect_dependency_refs(pr.root)}
+        self.assertNotIn(("com.acme.shop", "shop-parent"), refs)     # the children's parent is the build itself
+        self.assertNotIn(("com.acme.shop", "shop-core"), refs)       # sibling module
+        self.assertEqual([p.parent.name for p in sm.reactor_ancestors(pr.root, pr.root / "worker/pom.xml")], ["worker", pr.root.name])
+        pr.close()
+
+    def test_hystrix_in_child_cleans_root_management_and_puts_bom_in_root(self):
+        pr = self.project()
+        sm.cm_hystrix(pr.root)
+        root, worker = pr["pom.xml"], pr["worker/pom.xml"]
+        self.assertNotIn("hystrix", root)                                  # managed entry removed
+        self.assertIn("spring-cloud-dependencies", root)                   # BOM added once, at the top
+        self.assertNotIn("spring-cloud-dependencies", worker)
+        self.assertIn("spring-cloud-starter-circuitbreaker-resilience4j", worker)
+        self.assertNotIn("resilience4j", root)                             # not forced on every module
+        self.assertNotIn("resilience4j", pr["web/pom.xml"])
+        pr.close()
+
+    def test_trailing_slash_only_for_web_apps(self):
+        pr = self.project()
+        sm.fix_trailing_slash(pr.root)
+        self.assertTrue(pr.exists("web/src/main/java/a/web/TrailingSlashCompatibilityConfig.java"))
+        self.assertFalse(pr.exists("worker/src/main/java/a/worker/TrailingSlashCompatibilityConfig.java"))
+        pr.close()
+
+
 class CompanyDependenciesTest(unittest.TestCase):
     """Classification works on files in the local Maven repo; MavenRepo.resolve is replaced by a no-op."""
 
