@@ -3213,10 +3213,15 @@ def fix_jaxb_tooling(root: Path) -> tuple[list[str], list[str]]:
             new = re.sub(r"\borg\.jvnet\.jaxb2_commons\.", "org.jvnet.jaxb.", new)
             for a, b in JAXB_RUNTIME_RENAMES.items():
                 new = re.sub(r"\b" + a + r"\b", b, new)
-        elif p.suffix in (".xjb", ".xml") and "http://java.sun.com/xml/ns/jaxb" in t and p.name != "pom.xml":
-            new = new.replace("http://java.sun.com/xml/ns/jaxb/xjc", "https://jakarta.ee/xml/ns/jaxb/xjc")
-            new = new.replace("http://java.sun.com/xml/ns/jaxb", "https://jakarta.ee/xml/ns/jaxb")
-            new = re.sub(r'(<(?:\w+:)?bindings\b[^>]*\bversion=")2\.\d(")', r"\g<1>3.0\g<2>", new)
+        elif p.suffix in (".xjb", ".xml") and p.name != "pom.xml" and re.search(
+                r"http://java\.sun\.com/xml/ns/(?:jaxb|jaxws)|https://jakarta\.ee/xml/ns/jaxb/xjc", t):
+            # Jakarta moved the JAXB and JAX-WS customization namespaces. The XJC extension namespace (xjc:javaType,
+            # xjc:simple, ...) is RI-specific and did NOT move - wsimport/xjc reject https://jakarta.ee/xml/ns/jaxb/xjc.
+            new = new.replace("https://jakarta.ee/xml/ns/jaxb/xjc", "http://java.sun.com/xml/ns/jaxb/xjc")  # repair earlier runs
+            new = re.sub(r"http://java\.sun\.com/xml/ns/jaxb(?=[\"'])", "https://jakarta.ee/xml/ns/jaxb", new)
+            new = re.sub(r"http://java\.sun\.com/xml/ns/jaxws(?=[\"'])", "https://jakarta.ee/xml/ns/jaxws", new)
+            if "https://jakarta.ee/xml/ns/jaxb\"" in new or "https://jakarta.ee/xml/ns/jaxb'" in new:
+                new = re.sub(r'(<(?:\w+:)?bindings\b[^>]*\bversion=")2\.\d(")', r"\g<1>3.0\g<2>", new)
         if write_if_changed(p, t, new):
             changes.append(f"{rel(p, root)}: JAXB {'runtime classes' if p.suffix in ('.java', '.kt') else 'binding namespace'} -> Jakarta")
     if changes:

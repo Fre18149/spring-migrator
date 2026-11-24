@@ -408,6 +408,26 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class JaxbBindingTest(unittest.TestCase):
+    def test_xjc_namespace_stays_and_earlier_runs_are_repaired(self):
+        xjb = ('<jaxb:bindings xmlns:jaxb="http://java.sun.com/xml/ns/jaxb" xmlns:xjc="http://java.sun.com/xml/ns/jaxb/xjc" '
+               'jaxb:extensionBindingPrefixes="xjc" version="2.1">\n  <jaxb:globalBindings><xjc:javaType name="java.time.LocalDate" '
+               'xmlType="xs:date" adapter="a.B"/></jaxb:globalBindings>\n</jaxb:bindings>\n')
+        jaxws = '<jaxws:bindings xmlns:jaxws="http://java.sun.com/xml/ns/jaxws" wsdlLocation="UrvService.wsdl"/>\n'
+        broken = xjb.replace("http://java.sun.com/xml/ns/jaxb/xjc", "https://jakarta.ee/xml/ns/jaxb/xjc")
+        pr = Project({"src/main/resources/binding/datetime.xjb.xml": xjb, "src/main/resources/binding/jaxws.binding.xml": jaxws,
+                      "src/main/resources/binding/old.xjb": broken})
+        sm.fix_jaxb_tooling(pr.root)
+        for name in ("datetime.xjb.xml", "old.xjb"):
+            out = pr["src/main/resources/binding/" + name]
+            self.assertIn('xmlns:jaxb="https://jakarta.ee/xml/ns/jaxb"', out)
+            self.assertIn('xmlns:xjc="http://java.sun.com/xml/ns/jaxb/xjc"', out)   # XJC namespace did not move
+            self.assertIn('version="3.0"', out)
+        self.assertIn('xmlns:jaxws="https://jakarta.ee/xml/ns/jaxws"', pr["src/main/resources/binding/jaxws.binding.xml"])
+        self.assertEqual(sm.fix_jaxb_tooling(pr.root)[0], [])                       # idempotent
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>

@@ -179,7 +179,7 @@ plugin's `<dependencies>`), listed as a TODO in the report.
 -> `org.jvnet.jaxb:jaxb-plugins(-runtime)` 4.x (`jaxb2-value-constructor` is part of it), `maven-jaxb2-plugin` ->
 `org.jvnet.jaxb:jaxb-maven-plugin` 4.x, `jaxws-maven-plugin` -> `com.sun.xml.ws:jaxws-maven-plugin` 4.x; Java code
 `org.jvnet.jaxb2_commons.*` -> `org.jvnet.jaxb.*` (`ToString2` -> `ToString`, ...); `.xjb` bindings to the Jakarta
-namespace (version 3.0).
+namespace (version 3.0; the XJC extension namespace `http://java.sun.com/xml/ns/jaxb/xjc` stays), JAX-WS binding files to `https://jakarta.ee/xml/ns/jaxws`.
 
 To choose yourself:
 ```bash
