@@ -203,6 +203,22 @@ OpenRewrite has no recipe for this, so the tool does it itself, as its own stage
   `pooled-lo` optimizer, so new ids continue after the existing ones instead of restarting at 1
 * Identifier naming kept as written (`PhysicalNamingStrategyStandardImpl`)
 
+## Frontend builds and other non-Java plugins
+OpenRewrite's Maven goal first builds the project up to `process-test-classes`, which also runs every plugin bound
+to those phases. For frontend-maven-plugin that means `npm install`, which can fail where npm cannot reach its
+registry. The recipes only need Java sources and dependencies, so:
+* frontend-maven-plugin (npm/yarn/pnpm/bun, node install, webpack/gulp/...) is **skipped during the OpenRewrite step
+  by default**; the build gates still build the frontend like your normal build (`--rewrite-frontend` to keep it in
+  the OpenRewrite step too)
+* `--skip-frontend` skips it in every build (baseline and gates as well) for environments where npm cannot work
+* `--rewrite-args "-Dexec.skip -Ddocker.skip ..."` passes extra arguments to the OpenRewrite step only, for other
+  plugins that fail outside your CI
+* `--rewrite-no-fork` does not build before rewriting at all (`rewrite:runNoFork`); code that uses generated sources
+  then gets less precise type information
+
+When a build fails, the tool prints the lines that explain it (npm errors, compiler errors, failing tests) before
+Maven's generic ones.
+
 ## What still needs a human
 The tool does every mechanical step; these are design decisions or need runtime knowledge. The scanner lists each
 with file:line, the report repeats them, and a leftover reference fails the stage's build gate:
