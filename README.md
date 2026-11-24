@@ -1,11 +1,14 @@
 # spring-migrate
 
-Staged, **local-only** migration of a Spring Boot **2.7.x** project to **3.5** and then **4.0**.
-It drives [OpenRewrite](https://docs.openrewrite.org) (the standard engine for Spring upgrades), adds a pre-flight
-scanner, extra fixers for things OpenRewrite leaves behind, and build/test gates between stages.
+Staged, **local-only** migration of a Spring Boot **2.7.x** project to **3.5**, **4.0** and **4.1**.
+It drives [OpenRewrite](https://docs.openrewrite.org) (the standard engine for Spring upgrades), and adds what OpenRewrite
+does not do: codemods for removed libraries (Netflix OSS, legacy spring-security-oauth2, OpenJPA), behaviour-preserving
+fixes (ID generation, trailing slashes, token formats), repairs for things the recipes get wrong, and build/test gates
+between stages.
 
-**Your code never leaves your machine.** Nothing is uploaded; the only network traffic is Maven/Gradle downloading
-OpenRewrite recipes and dependencies from the repositories your build already uses.
+**Your code never leaves your machine.** Nothing is uploaded. Network traffic is Maven/Gradle downloading recipes and
+dependencies from the repositories your build already uses, plus version lookups (`maven-metadata.xml` on Maven Central,
+the SDKMAN version list) to pick the latest patch releases. `--offline` skips the lookups and uses built-in versions.
 
 ## Requirements
 Python 3.9+ (stdlib only) - JDK 17+ (21 is fine) - Maven (or `./mvnw`) or Gradle (or `./gradlew`) - git.
@@ -15,79 +18,129 @@ Python 3.9+ (stdlib only) - JDK 17+ (21 is fine) - Maven (or `./mvnw`) or Gradle
 # 1. Read-only analysis. Start here.
 python3 spring_migrate.py scan /path/to/project --out scan.md
 
-# 2. Preview the whole change as a patch (modifies nothing)
+# 2. Preview the OpenRewrite part as a patch (modifies nothing)
 python3 spring_migrate.py migrate /path/to/project --dry-run
 
 # 3. Real run: new branch, one commit per stage, build+tests after each stage
-python3 spring_migrate.py migrate /path/to/project --target 4.0 \
+python3 spring_migrate.py migrate /path/to/project \
         --build-args "-s /path/to/corporate-settings.xml"      # optional: your Artifactory/Nexus mirror
 ```
-The project must be a git repo with a clean tree. Run it on a copy/clone first.
+The project must be a git repo with a clean tree. Run it on a copy/clone first. The default target is **4.1**
+(`--target 3.5|4.0|4.1`).
 
 ## What `migrate` does
 | Stage | Action |
 |---|---|
-| preflight | JDK check, clean-tree check, scan; **stops on blockers** (Springfox, Ribbon/Hystrix/Zuul, legacy OAuth2 server) unless `--force` |
-| baseline | build + tests on the original code, so old failures are not blamed on the migration (stops if it fails; `--skip-baseline`) |
+| preflight | JDK check, clean-tree check, scan. Stops only on findings that are still manual *and* blockers (`--force` to continue) |
+| baseline | build + tests on the original code, so old failures are not blamed on the migration (`--skip-baseline`) |
 | 1 | 2.7.13 -> latest 2.7.x (safe checkpoint) |
-| 1b | **OpenJPA -> Hibernate** (only when OpenJPA is detected, see below) |
-| 2 | Boot 3.5: Spring 6, Jakarta EE 10, Security 6, Hibernate 6, Java 17/21, JUnit 4->5 (auto when detected) |
-| 3 | Boot 4.0: Spring 7, modular starters, test annotations (`--target 3.5` stops after stage 2) |
+| 1b | **OpenJPA -> Hibernate** on Boot 2.7 / Hibernate 5.6 (only when OpenJPA is detected) |
+| 2 | legacy-library codemods, then Boot 3.5: Spring 6, Jakarta EE 10, Security 6, Hibernate 6, Java 17/21, JUnit 4->5 |
+| 3 | Boot 4.0: Spring 7, modular starters, Security 7 |
+| 4 | Boot 4.1: version bump to the latest 4.1.x + `SpringBootProperties_4_1` (OpenRewrite has no 4.1 upgrade recipe) |
 
-After every stage the automated changes are **committed first**, then build+tests run. If a stage fails, your manual
-fixes show up as a separate diff on top. Re-run the same command to **resume** - it detects the current Boot version.
+After every stage the changes are **committed first**, then build+tests run **with `spring-boot-properties-migrator`
+on the classpath**. Renames it reports are applied to your `application*.properties|yml`, committed, and the build is
+re-run without it. If a stage fails, your fixes show up as a separate diff on top; re-run the same command to
+**resume** (it detects the current Boot version). After the last stage the runtime classpath is scanned for jars that
+still reference `javax.*` EE types.
 
-Built-in fixers (idempotent, run after stages 2 and 3): leftover `javax.*` -> `jakarta.*` in resources/strings;
-`spring.factories` `EnableAutoConfiguration` -> `AutoConfiguration.imports`; Java version in GitHub Actions,
-`.java-version` and Dockerfile tags (`postgres:11` etc. are untouched; deprecated `openjdk` images are only reported).
+## What is automated
+**By OpenRewrite** (`UpgradeSpringBoot_3_5` already contains these): Springfox -> springdoc (annotations, Docket ->
+`springdoc.group-configs`), Sleuth -> Micrometer Tracing, PowerMock -> Mockito, HttpClient 4 -> 5, Hibernate 5 type
+mappings -> hypersistence-utils, version-specific dialects, `WebMvcConfigurerAdapter`, `ListenableFuture`,
+`getRawStatusCode`, Spring Cloud 2025, Security DSL, `javax` -> `jakarta`, property renames.
 
-Output (next to the project, or `--report-dir`): `MIGRATION_REPORT.md`, `scan-before.md`, `scan-after.md`, `logs/`.
+**By this tool**, before the 3.5 recipes (result still compiles on 2.7, because the rewrite plugin compiles first):
+* **Hystrix -> Resilience4j**: `@HystrixCommand` -> `@CircuitBreaker` (commandKey/method name, fallback gets the
+  `Throwable` parameter Resilience4j requires), `@HystrixProperty`/`hystrix.command.*` settings ->
+  `resilience4j.*`, `ignoreExceptions`, Feign circuit breaker flag; starter swap (+ Spring Cloud BOM if missing)
+* **Ribbon -> Spring Cloud LoadBalancer**: `@RibbonClient(s)`, `RandomRule`/`RoundRobinRule` beans ->
+  `ReactorLoadBalancer` beans, `<client>.ribbon.listOfServers` -> `spring.cloud.discovery.client.simple.instances`
+* **Zuul -> Spring Cloud Gateway MVC** (servlet, like Zuul 1): `zuul.routes.*` (path/url/serviceId, `zuul.prefix`) ->
+  `spring.cloud.gateway.server.webmvc.routes` with `StripPrefix` and Zuul's default sensitive-header stripping
+* **Legacy OAuth2 resource server** -> `oauth2ResourceServer` `SecurityFilterChain` (your rules kept): JWK set URI,
+  PEM public key, HMAC key (generates a `JwtDecoder`), `token-info-uri` -> opaque-token introspection, `resourceId` ->
+  `audiences`, a `JwtAuthenticationConverter` that keeps the legacy `authorities` claim, `#oauth2.hasScope(...)` ->
+  `hasAuthority('SCOPE_...')`
+* **Legacy OAuth2 client**: `@EnableOAuth2Sso` -> `oauth2Login()`, `security.oauth2.client.*` ->
+  `spring.security.oauth2.client.registration/provider.*`
+* **ID generation**: implicit `@GeneratedValue` (AUTO/SEQUENCE without generator) pinned to the Hibernate 5 behaviour
+  (`hibernate_sequence`, increment 1; IDENTITY for MySQL-family with `new_generator_mappings=false`), so Hibernate 6 does
+  not switch to `<entity>_seq` tables and collide with existing rows
+* JDBC-style `?` JPQL parameters numbered (`createQuery`, `@Query`, `@NamedQuery`, `orm.xml`; native queries untouched)
+* Stale pins of Boot-managed versions removed (`mockito.version`, `hibernate.version`, `lombok.version`, ...)
+
+After the 3.5 recipes:
+* **Legacy authorization server -> Spring Authorization Server**: in-memory clients -> `RegisteredClient`s (secrets,
+  grants, scopes, redirect URIs, token lifetimes with the legacy defaults of 12 h / 30 days, autoApprove -> consent,
+  opaque vs JWT format), the **same signing key** (HMAC key or keystore) so existing resource servers keep verifying
+  tokens, a `client_id` claim, and the **legacy endpoint paths** `/oauth/token`, `/oauth/authorize`,
+  `/oauth/check_token`; a login chain when the app had none
+* Trailing slashes: a `TrailingSlashCompatibilityConfig` (`UrlHandlerFilter`, ordered **before** Spring Security, so
+  `/admin/` is checked as `/admin`) keeps Spring 5 matching (`--no-trailing-slash-compat` to skip)
+* Fixes for OpenRewrite output: quoted values written into `.properties` (they become part of the value), the unused
+  springdoc `Info` method (-> `OpenAPI` bean), `/v2/api-docs` security rules, HttpClient 5's now-checked
+  `ParseException`, `spring-boot-starter-aop` dropped by the 4.0 recipe without its replacement
+  `spring-boot-starter-aspectj` (would silently disable `@Aspect`/Resilience4j annotations), Authorization Server
+  configurer package moved in Spring Security 7
+* httptrace -> httpexchanges (classes, `management.trace.http.*`, endpoint exposure)
+* Hibernate 5 settings: version-specific dialects -> generic, `new_generator_mappings` removed
+* Spring Cloud release train aligned to each Boot line (3.5 -> 2025.0, 4.0/4.1 -> 2025.1, latest patch)
+* Containers and CI: deprecated `openjdk`/`adoptopenjdk` images -> `eclipse-temurin`, `maven:*-openjdk-11` images,
+  Jenkins `jdk` tools, GitLab/Travis/Azure/Bitbucket/CircleCI pins, `.sdkmanrc` (resolved via SDKMAN), `.tool-versions`,
+  GitHub Actions, `.java-version`, Dockerfile tags
+* Maven wrapper < 3.6.3 and Gradle wrapper below the Boot minimum bumped
+* Third-party: MapStruct < 1.5.5, Lombok pinned in `annotationProcessorPaths`, Querydsl `jakarta` classifier
 
 ## OpenJPA -> Hibernate
-OpenRewrite has no recipe for this, so the tool does it itself, as its own stage **on Boot 2.7 (Hibernate 5.6, still `javax`)**
-*before* the Spring 6 jump. That way a persistence regression is caught on its own commit with a green/red test gate,
-not mixed into the Jakarta/Hibernate 6 upgrade. Run it alone with `spring_migrate.py openjpa PATH` (no build, no git).
+OpenRewrite has no recipe for this, so the tool does it itself, as its own stage on Boot 2.7 (Hibernate 5.6, still
+`javax`) *before* the Spring 6 jump, so a persistence regression is caught on its own commit. Run it alone with
+`spring_migrate.py openjpa PATH` (no build, no git).
 
-Automatic:
-* `persistence.xml`: provider -> Hibernate; `openjpa.ConnectionURL/Driver/User/Password`, `jdbc.Schema`, `jdbc.SynchronizeMappings`
-  mapped to `javax.persistence.*` / `hibernate.*`; every other `openjpa.*` property is commented out with a `TODO(spring-migrate)`
-  line that keeps the original value (dialect, cache, log, enhancement settings are dropped on purpose and listed in the report)
-* pom/Gradle: OpenJPA dependencies, the enhancer plugin and `openjpa.version` removed; `spring-boot-starter-data-jpa` added
-  if there is no Hibernate; Hibernate exclusions on the JPA starter removed
-* `PersistenceProviderImpl` / `OpenJpaVendorAdapter` / `OpenJpaDialect` in code or XML -> Hibernate equivalents
-* `application.properties`: identifier naming kept as-written (`PhysicalNamingStrategyStandardImpl`) so Boot's snake_case default
-  does not break an OpenJPA-created schema (only matters when Boot's JPA auto-config is used)
+* `persistence.xml`: provider -> Hibernate; known `openjpa.*` properties mapped, the rest commented out with the reason
+* pom/Gradle: OpenJPA dependencies, enhancer plugin, `openjpa.version` removed; `spring-boot-starter-data-jpa` added
+* `PersistenceProviderImpl` / `OpenJpaVendorAdapter` / `OpenJpaDialect` -> Hibernate equivalents
+* **API**: `OpenJPAPersistence.cast(...)` -> `unwrap(Session/Query/SessionFactory.class)`; `OpenJPAEntityManager`,
+  `OpenJPAQuery`, `OpenJPAEntityManagerFactory` types; `getObjectId` (-> `PersistenceUnitUtil.getIdentifier`, which like
+  OpenJPA works on detached entities), `evictAll`, `persistAll/removeAll/detachAll/refreshAll`
+* **Annotations**: `@DataCache` -> `@Cacheable`, `@FetchGroup(s)` -> `@NamedEntityGraph(s)`, `@Persistent` -> `@Basic`,
+  `@PersistentCollection/Map` -> `@ElementCollection`, `@ReadOnly` -> `@Column(updatable = false)`, OpenJPA `@Index` ->
+  `@Table(indexes = ...)`, `@Dependent/@ElementDependent` -> `orphanRemoval`, `@Externalizer`/`@Factory` -> a generated
+  `AttributeConverter`, `@ForeignKey` removed
+* `openjpa.*` properties set in code or `application.properties` translated; the enhancer `-javaagent` removed from
+  Dockerfiles/scripts
+* **IDs**: implicit `@GeneratedValue` pinned to OpenJPA's own `OPENJPA_SEQUENCE_TABLE` via `@TableGenerator` with the
+  `pooled-lo` optimizer, so new ids continue after the existing ones instead of restarting at 1
+* Identifier naming kept as written (`PhysicalNamingStrategyStandardImpl`)
 
-Manual (inventoried with file:line and the closest replacement): `OpenJPAEntityManager`/`OpenJPAQuery`/`FetchPlan`,
-`@DataCache`, `@ReadOnly`, `@Persistent`, `@Externalizer`, `@Dependent`... A leftover reference makes the stage's build fail, which
-stops the run so you can fix it on top of the committed automatic changes and re-run.
+## What still needs a human
+The tool does every mechanical step; these are design decisions or need runtime knowledge. The scanner lists each
+with file:line, the report repeats them, and a leftover reference fails the stage's build gate:
+* `ZuulFilter` implementations and programmatic Hystrix (`HystrixCommand` subclasses, `HystrixRequestContext`)
+* custom Ribbon `IRule`/`IPing`/`ServerList`, `OAuth2RestTemplate`, OpenJPA `FetchPlan`
+* the OAuth2 `password` and `implicit` grants (removed from OAuth 2.1; the clients are migrated without them),
+  JDBC client/token stores, `TokenEnhancer`s
+* internal or third-party jars without a Jakarta version (detected after the last stage)
+* behaviour only tests can show: Resilience4j does not time out synchronous calls the way Hystrix did; ID sequences
+  and schema mapping against your real database; lazy loading; the end-of-report checklist
 
-The biggest risks are **not** compile errors but data behaviour; the report lists every `@GeneratedValue` entity and a checklist:
-ID sequences (OpenJPA's `OPENJPA_SEQUENCE_TABLE` vs `hibernate_sequence` -> duplicate keys), schema/type mapping
-(validate against a copy of production with `ddl-auto=validate`), lazy loading/detachment, collection ordering, JPQL strictness
-(`?` parameters), caching, locking.
+## Verified
+`tests/e2e.sh` (Maven, JDK 21) migrates four Boot 2.7.13 sample projects to **Boot 4.1.3**. Each has tests that are
+green on the original code and must stay green after every stage, and the script checks that every commit came from
+the tool (no manual fixes):
+* `examples/legacy-demo`: JPA, Security, MVC, validation, JUnit 4, `spring.factories`, Actuator httptrace, Docker/CI
+* `examples/legacy-openjpa`: runs on real OpenJPA 3.2.2 (enhancer, `persistence.xml`, OpenJPA API and annotations,
+  `@Externalizer`, `@ReadOnly`, positional parameters) -> Hibernate 5.6 -> 6 -> 7
+* `examples/legacy-cloud`: Springfox, Hystrix (fallback test), Ribbon settings, Sleuth, legacy OAuth2 resource server
+  (401 tests), HttpClient 4, trailing-slash tests (including security on `/path/`), stale Mockito pin, Jenkinsfile,
+  `openjdk` images, Maven wrapper 3.6.0
+* `examples/legacy-authserver`: `@EnableAuthorizationServer` with HMAC-signed JWTs; a token is fetched from
+  `/oauth/token` before and after migration
 
-## Safety nets
-* OpenRewrite exits 0 even when it could not download artifacts and silently skips edits (seen with rate limiting / a
-  wrong mirror). The tool detects this, discards the partial edits, retries (`--retries`) and then fails loudly.
-* Never touches the working tree unless it is clean (or `--allow-dirty`); always works on `migrate/spring-boot-<target>`.
+`tests/test_codemods.py` (`python3 -m unittest discover -s tests`) unit-tests the codemods the samples do not exercise
+(Zuul, Ribbon rules, opaque/HMAC/SSO OAuth2, YAML editing, ID pinning modes, dialects, CI images, wrappers, ...).
 
-## What it cannot do (needs a human)
-Springfox -> springdoc, Sleuth -> Micrometer Tracing, Netflix OSS -> LoadBalancer/Resilience4j/Gateway, legacy
-spring-security-oauth2, PowerMock, Hibernate 5 type mappings, HttpClient 4 -> 5, `GenerationType.AUTO` sequence naming
-(can break existing schemas), trailing-slash matching, internal/third-party libraries without Jakarta versions.
-The scanner lists each with file:line; the report ends with a checklist of things only tests can reveal.
-
-## Boot 4.1
-Boot 3.5 reached OSS end-of-life on 2026-06-30 and 4.0 follows at the end of 2026; 4.1 is the line with the longest
-support. OpenRewrite has no 4.1 recipe yet (rewrite-spring 6.37 only ships `UpgradeSpringBoot_4_0`), so after stage 3
-bump the parent to the latest 4.1.x by hand and read the 4.1 release notes. Use `--extra-recipe` for your own recipes.
-
-## Verified / not verified
-Verified end-to-end (`tests/e2e.sh`) with Maven on JDK 21:
-* `examples/legacy-demo`: 2.7.13 -> 3.5.16 -> 4.0.10 (JPA, Security, MVC, validation, JUnit 4, spring.factories, Docker/CI)
-* `examples/legacy-openjpa`: a project that really runs on OpenJPA 3.2.2 (enhancer plugin, `persistence.xml`, test persists and
-  queries an entity) -> Hibernate 5.6 -> Boot 3.5 / Hibernate 6 -> Boot 4.0, with the same test green after every stage.
-  Not covered by tests: OpenJPA-specific API/annotation rewrites (reported, not automated), non-H2 databases, Gradle.
-**The Gradle path is implemented (init-script) but untested**; multi-module and Kotlin projects are untested.
-Treat the result as a very good first 80-90%, not a finished migration: review the diff and run your integration tests.
+Not verified: the Gradle path (implemented, untested), multi-module and Kotlin projects, non-H2 databases, PowerMock
+(cannot run on JDK 21 at all, so no green baseline was possible here; the OpenRewrite recipe handles it).
+Review the diff and run your integration tests against your real database before going live.

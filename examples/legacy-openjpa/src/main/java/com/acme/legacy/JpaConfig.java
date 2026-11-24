@@ -25,6 +25,8 @@ public class JpaConfig {
         f.setDataSource(ds);
         f.setPersistenceUnitName("legacy");
         f.setPersistenceProvider(new PersistenceProviderImpl());
+        f.getJpaPropertyMap().put("openjpa.Log", "DefaultLevel=WARN");
+        f.getJpaPropertyMap().put("openjpa.ConnectionURL", "jdbc:h2:mem:legacy;DB_CLOSE_DELAY=-1");
         return f;
     }
 

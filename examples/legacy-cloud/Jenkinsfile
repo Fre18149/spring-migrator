@@ -1,0 +1,5 @@
+pipeline {
+  agent { docker { image 'maven:3.8-openjdk-11' } }
+  tools { jdk 'jdk11' }
+  stages { stage('build') { steps { sh 'mvn -B verify' } } }
+}

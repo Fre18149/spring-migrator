@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-spring-migrate - staged, local-only Spring Boot 2.7 -> 3.5 -> 4.0 migration tool.
+spring-migrate - staged, local-only Spring Boot 2.7 -> 3.5 -> 4.0 -> 4.1 migration tool.
 
 Everything runs on YOUR machine. The tool never uploads code anywhere. The only
 network traffic is Maven/Gradle downloading OpenRewrite recipes and dependencies
@@ -10,8 +10,11 @@ from whatever repositories your build is already configured to use (pass
 Commands
   scan     read-only pre-flight analysis -> Markdown/JSON report
   migrate  staged migration on a new git branch, one commit per stage
+  legacy   run only the legacy-library codemods (Netflix OSS, legacy OAuth2
+           resource/authorization server, id pinning, JPQL params, stale pins)
+  openjpa  run only the OpenJPA -> Hibernate conversion
   fix      run only the built-in post-fixers (javax->jakarta in resources,
-           spring.factories -> AutoConfiguration.imports, CI/Docker Java bump)
+           spring.factories, CI/Docker/wrappers, httptrace, dialects, ...)
 
 Python 3.9+, standard library only.
 """
@@ -32,7 +35,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 IGNORE_DIRS = {".git", "target", "build", "node_modules", ".gradle", ".idea", ".mvn", "out", ".settings"}
 MAX_FILE_BYTES = 2_000_000
@@ -134,70 +137,85 @@ RULES = [
          r"^\s*(?:spring\.redis\.|spring\.profiles\s*[=:]|spring\.profiles\.(?!active|include|group|default)|server\.max-http-header-size|"
          r"spring\.config\.use-legacy-processing|management\.metrics\.export\.|spring\.data\.cassandra\.(?!.*\.)|spring\.elasticsearch\.rest)",
          "OpenRewrite migrates .properties/.yml keys; verify with spring-boot-properties-migrator (see report)."),
-    Rule("springfox", "Springfox / Swagger 2 (incompatible with Boot 3)", "blocker", "manual", BUILD + SRC,
+    Rule("springfox", "Springfox / Swagger 2 (incompatible with Boot 3)", "high", "auto", BUILD + SRC,
          r"springfox|@EnableSwagger2",
-         "Replace with springdoc-openapi-starter-webmvc-ui (OpenAPI 3) and migrate annotations - NOT automatic."),
-    Rule("netflix-oss", "Netflix Ribbon/Hystrix/Zuul (removed from Spring Cloud)", "blocker", "manual", BUILD + SRC,
+         "OpenRewrite SpringFoxToSpringDoc + post-fixer (OpenAPI info bean, /v3/api-docs security paths, unquoted properties)."),
+    Rule("netflix-oss", "Netflix Ribbon/Hystrix/Zuul (removed from Spring Cloud)", "high", "auto", BUILD + SRC,
          r"netflix-(?:ribbon|hystrix|zuul)|starter-(?:hystrix|ribbon|zuul)|@EnableZuulProxy|@EnableHystrix|@EnableCircuitBreaker",
-         "Replace with Spring Cloud LoadBalancer / Resilience4j / Spring Cloud Gateway."),
-    Rule("sleuth", "Spring Cloud Sleuth / Brave (removed)", "high", "manual", BUILD + SRC,
+         "Hystrix -> Resilience4j @CircuitBreaker (+ settings), Ribbon -> LoadBalancer (listOfServers, Random/RoundRobin rules), Zuul routes -> Gateway MVC routes."),
+    Rule("sleuth", "Spring Cloud Sleuth / Brave (removed)", "high", "auto", BUILD + SRC,
          r"spring-cloud-(?:starter-)?sleuth|@NewSpan|brave\.",
-         "Replace with Micrometer Tracing (+ bridge for Brave or OpenTelemetry)."),
-    Rule("legacy-oauth2", "Legacy spring-security-oauth2 (Authorization/Resource server)", "blocker", "manual", BUILD + SRC,
+         "OpenRewrite MigrateCloudSleuthToMicrometerTracing (part of UpgradeSpringBoot_3_5)."),
+    Rule("legacy-oauth2", "Legacy spring-security-oauth2 (Authorization/Resource server)", "high", "auto", BUILD + SRC,
          r"org\.springframework\.security\.oauth:|spring-security-oauth2-autoconfigure|@EnableAuthorizationServer|@EnableResourceServer",
-         "Move to spring-security-oauth2-resource-server / spring-authorization-server. Needs design work."),
-    Rule("powermock", "PowerMock (no Jakarta / modern JDK support)", "high", "manual", BUILD + SRC, r"powermock",
-         "Rewrite tests with Mockito (mockStatic/mockConstruction) - NOT automatic."),
-    Rule("httpclient4", "Apache HttpClient 4.x (Spring 6 requires HttpClient 5)", "medium", "manual", BUILD + SRC,
+         "Resource server -> oauth2ResourceServer (jwt/opaque/HMAC, audiences, authorities claim kept); client props -> spring.security.oauth2.client; authorization server -> Spring Authorization Server."),
+    Rule("powermock", "PowerMock (no Jakarta / modern JDK support)", "high", "auto", BUILD + SRC, r"powermock",
+         "OpenRewrite ReplacePowerMockito (part of UpgradeSpringBoot_3_5); remaining Whitebox/whenNew edge cases fail the test gate."),
+    Rule("httpclient4", "Apache HttpClient 4.x (Spring 6 requires HttpClient 5)", "medium", "auto", BUILD + SRC,
          r"<artifactId>httpclient</artifactId>|org\.apache\.http\.|HttpComponentsClientHttpRequestFactory",
-         "Move to org.apache.httpcomponents.client5:httpclient5 and org.apache.hc.* APIs."),
-    Rule("hibernate-gen-auto", "GenerationType.AUTO / bare @GeneratedValue (Hibernate 6 changes strategy)", "high", "behavior", SRC,
+         "OpenRewrite UpgradeApacheHttpClient_5 (part of UpgradeSpringBoot_3_5)."),
+    Rule("hibernate-gen-auto", "GenerationType.AUTO / bare @GeneratedValue (Hibernate 6 changes strategy)", "high", "auto", SRC,
          r"GenerationType\.AUTO|@GeneratedValue(?!\s*\()",
          "Hibernate 6 maps AUTO to per-entity sequences (<entity>_seq) on sequence-capable DBs -> can break existing schemas. "
-         "Pin the strategy explicitly or set hibernate.id.db_structure_naming_strategy=legacy."),
-    Rule("hibernate-types", "Hibernate 5 type mappings (@TypeDef, @Type(type=...), hibernate-types)", "high", "manual", SRC + BUILD,
+         "Pinned to the Hibernate 5 sequence (hibernate_sequence, increment 1) or IDENTITY, so Hibernate 6 keeps using the existing schema."),
+    Rule("hibernate-types", "Hibernate 5 type mappings (@TypeDef, @Type(type=...), hibernate-types)", "high", "auto", SRC + BUILD,
          r"@TypeDefs?\b|@Type\s*\(\s*type\s*=|hibernate-types",
-         "Removed/changed in Hibernate 6; use @JdbcTypeCode / AttributeConverter / hypersistence-utils."),
-    Rule("hibernate-dialect", "Explicit Hibernate dialect / legacy generator props", "medium", "manual", CFG,
+         "OpenRewrite MigrateToHypersistenceUtilsHibernate6x (part of UpgradeSpringBoot_3_5)."),
+    Rule("hibernate-dialect", "Explicit Hibernate dialect / legacy generator props", "medium", "auto", CFG,
          r"dialect\s*[=:]|new[_-]generator[_-]mappings|hibernate\.ejb\.",
-         "Hibernate 6 auto-detects the dialect; old names (PostgreSQL95Dialect, MySQL5Dialect, Oracle12cDialect...) were removed."),
-    Rule("httpstatus", "ResponseEntity.getStatusCode() now returns HttpStatusCode", "medium", "manual", SRC,
+         "Version-specific dialects -> generic ones; new_generator_mappings removed (ids are pinned instead)."),
+    Rule("httpstatus", "ResponseEntity.getStatusCode() now returns HttpStatusCode", "medium", "auto", SRC,
          r"getRawStatusCode\(\)|HttpStatus\s+\w+\s*=\s*[^;]*\.getStatusCode\(\)",
-         "Use HttpStatusCode, or HttpStatus.resolve(code.value())."),
-    Rule("webmvc-adapter", "WebMvcConfigurerAdapter (removed in Spring 6)", "high", "manual", SRC, r"WebMvcConfigurerAdapter",
-         "Implement WebMvcConfigurer directly."),
-    Rule("httptrace", "Actuator httptrace (renamed to httpexchanges)", "medium", "manual", SRC + CFG,
+         "OpenRewrite getRawStatusCode/HttpStatusCode recipes (part of UpgradeSpringBoot_3_5)."),
+    Rule("webmvc-adapter", "WebMvcConfigurerAdapter (removed in Spring 6)", "high", "auto", SRC, r"WebMvcConfigurerAdapter",
+         "OpenRewrite MigrateWebMvcConfigurerAdapter."),
+    Rule("httptrace", "Actuator httptrace (renamed to httpexchanges)", "medium", "auto", SRC + CFG,
          r"httptrace|HttpTraceRepository", "Use HttpExchangeRepository / endpoint id 'httpexchanges'."),
-    Rule("listenablefuture", "ListenableFuture (removed in Spring Framework 7 / Boot 4)", "medium", "manual", SRC,
+    Rule("listenablefuture", "ListenableFuture (removed in Spring Framework 7 / Boot 4)", "medium", "auto", SRC,
          r"\bListenableFuture\b|ListenableFutureCallback", "Switch to CompletableFuture."),
 ]
 
 RULES += [
     Rule("openjpa-deps", "OpenJPA dependencies / build plugins", "high", "auto", BUILD,
          r"org\.apache\.openjpa|openjpa-maven-plugin|<artifactId>openjpa[\w-]*</artifactId>|openjpa\.version",
-         "Removed by the OpenJPA->Hibernate stage; spring-boot-starter-data-jpa (Hibernate) is added if missing."),
+         "OpenRewrite ListenableToCompletableFuture."),
     Rule("openjpa-persistence-xml", "OpenJPA provider/properties in persistence.xml", "high", "auto", ("persistence.xml",),
          r"org\.apache\.openjpa|openjpa\.",
          "Provider switched to Hibernate; known openjpa.* properties mapped, the rest commented out with a TODO."),
     Rule("openjpa-spring-adapter", "OpenJPA persistence provider / Spring adapter wiring", "high", "auto", SRC + CFG + ("*.xml",),
          r"\bOpenJpa(?:VendorAdapter|Dialect)\b|\bPersistenceProviderImpl\b|org\.apache\.openjpa\.persistence\.PersistenceProviderImpl",
          "PersistenceProviderImpl -> HibernatePersistenceProvider, OpenJpa* adapters -> Hibernate equivalents."),
-    Rule("openjpa-api", "OpenJPA-specific API / annotations in code", "high", "manual", SRC,
+    Rule("openjpa-api", "OpenJPA-specific API / annotations in code", "high", "auto", SRC,
          r"org\.apache\.openjpa|\bOpenJPA\w+",
-         "No mechanical equivalent - see the symbol inventory below for the closest JPA/Hibernate replacement."),
-    Rule("openjpa-props-code", "openjpa.* properties set from code or application config", "medium", "manual", SRC + CFG,
+         "OpenJPAPersistence.cast/OpenJPAEntityManager/Query/Factory -> Hibernate unwrap; @DataCache/@FetchGroup/@Persistent*/@ReadOnly/@Index/@Externalizer/@Dependent... -> JPA. FetchPlan usage is reported as residual."),
+    Rule("openjpa-props-code", "openjpa.* properties set from code or application config", "medium", "auto", SRC + CFG,
          r"[\"']openjpa\.|^\s*openjpa\.",
-         "Map to hibernate.* / javax.persistence.* equivalents by hand (see report); Hibernate ignores unknown keys silently."),
-    Rule("openjpa-agent", "OpenJPA enhancer / javaagent in scripts or images", "medium", "manual",
+         "Translated to javax.persistence.*/hibernate.* (or commented with the reason)."),
+    Rule("openjpa-agent", "OpenJPA enhancer / javaagent in scripts or images", "medium", "auto",
          ("Dockerfile", "Dockerfile.*", "*.sh", "*.cmd", "*.bat", "*.service", "*.env", "Jenkinsfile"),
          r"javaagent[^\n]*openjpa|openjpa[-\w.]*\.jar|PCEnhancer", "Hibernate needs no enhancement agent - remove it."),
-    Rule("jpql-jdbc-params", "JDBC-style '?' parameters in JPQL (rejected by Hibernate 5.3+)", "high", "manual", SRC,
+    Rule("jpql-jdbc-params", "JDBC-style '?' parameters in JPQL (rejected by Hibernate 5.3+)", "high", "auto", SRC,
          r"(?:createQuery|createNamedQuery|@NamedQuery)\b[^\n]*\"[^\"]*\?(?!\d)",
-         "Use positional ?1 / named :param parameters."),
+         "Numbered automatically (?1, ?2, ...) in createQuery/@Query/@NamedQuery/orm.xml."),
+]
+
+RULES += [
+    # What is still genuinely manual after the codemods: the scanner reports these from the post-migration code.
+    Rule("zuul-filter", "ZuulFilter implementations", "high", "manual", SRC, r"extends\s+ZuulFilter|RequestContext\.getCurrentContext",
+         "Port to a Spring Cloud Gateway MVC filter function (BeforeFilterFunctions / HandlerFilterFunction)."),
+    Rule("hystrix-api", "Programmatic Hystrix API", "high", "manual", SRC, r"extends\s+Hystrix(?:Observable)?Command|HystrixRequestContext",
+         "Use CircuitBreakerFactory.create(name).run(supplier, fallback)."),
+    Rule("ribbon-custom", "Custom Ribbon rules / server lists", "medium", "manual", SRC,
+         r"implements\s+IRule|extends\s+AbstractLoadBalancerRule|IPing\b|ServerList<",
+         "Implement ReactorServiceInstanceLoadBalancer / ServiceInstanceListSupplier."),
+    Rule("oauth2-rest-template", "OAuth2RestTemplate (legacy client)", "medium", "manual", SRC, r"\bOAuth2RestTemplate\b|ClientCredentialsResourceDetails",
+         "Use RestClient with OAuth2ClientHttpRequestInterceptor + OAuth2AuthorizedClientManager."),
+    Rule("openjpa-fetchplan", "OpenJPA FetchPlan / FetchConfiguration", "medium", "manual", SRC, r"\b(?:JDBC)?FetchPlan\b|FetchConfiguration",
+         "Use an EntityGraph hint (jakarta.persistence.fetchgraph) or JOIN FETCH."),
 ]
 
 CHECKLIST = [
-    "Trailing slashes: Spring 6 no longer matches /users/ to @GetMapping(\"/users\"). Check clients, gateways and tests.",
+    "Trailing slashes: a TrailingSlashCompatibilityConfig filter keeps /users/ working; remove it once clients no longer send trailing slashes.",
     "Hibernate 6: `ORDER BY`/HQL parsing is stricter; native-query result mapping and sequence naming changed. Run integration tests against your real DB engine (Testcontainers).",
     "Run once with `spring-boot-properties-migrator` on the classpath (runtime scope) to surface leftover property renames, then remove it.",
     "Actuator/Micrometer: metric and tag names changed in places; verify dashboards and alerts.",
@@ -419,10 +437,43 @@ def fix_ci_java(root: Path, java: int) -> tuple[list[str], list[str]]:
     return changes, todo
 
 
-def run_fixers(root: Path, java: int) -> tuple[list[str], list[str]]:
+def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | None = None,
+               trailing_slash: bool = False, stage_rev: str | None = None) -> tuple[list[str], list[str]]:
+    """Post-fixers after a stage's OpenRewrite recipes. Idempotent."""
     changes = fix_spring_factories(root) + fix_javax_residuals(root)
-    ci, todo = fix_ci_java(root, java)
-    return changes + ci, todo
+    cc, todo = fix_containers_and_ci(root, java)
+    ci, todo2 = fix_ci_java(root, java)
+    changes += cc + ci
+    changes += fix_quoted_properties(root, base_rev)
+    changes += fix_springdoc_leftovers(root)
+    changes += fix_httptrace(root)
+    changes += fix_httpclient5_checked(root)
+    changes += fix_hibernate_props(root)
+    changes += fix_build_wrappers(root, boot_line)
+    changes += fix_spring_cloud_train(root, boot_line)
+    changes += fix_third_party(root)
+    changes += fix_temporary_versions(root)
+    if boot_line.startswith("4"):
+        changes += fix_boot4_aspectj(root, stage_rev)
+        changes += fix_sas_configurer_package(root)
+    if trailing_slash:
+        changes += fix_trailing_slash(root)
+    return changes, todo + todo2
+
+
+def run_legacy_codemods(root: Path, phase: str = "pre") -> tuple[list[str], list[str]]:
+    """Replacements for libraries that do not exist on Boot 3.
+    pre:  on the Boot 2.7 code, before the 3.5 recipes (the result must still compile on 2.7 - the rewrite plugin compiles first).
+    post: after the 3.5 recipes, for generated code that only compiles on Boot 3 (Spring Authorization Server)."""
+    changes, todo = [], []
+    fns = {"pre": (cm_stale_version_pins, cm_pin_generated_ids, cm_jpql_positional, cm_netflix, cm_legacy_oauth2, cm_openjpa_agent),
+           "post": (cm_authorization_server,)}[phase] if phase != "all" else \
+        (cm_stale_version_pins, cm_pin_generated_ids, cm_jpql_positional, cm_netflix, cm_authorization_server, cm_legacy_oauth2, cm_openjpa_agent)
+    for fn in fns:
+        c, t = fn(root)
+        changes += c
+        todo += t
+    return changes, todo
 
 
 # --------------------------------------------------------------------------- #
@@ -670,7 +721,15 @@ def migrate_openjpa(root: Path) -> tuple[list[str], list[str]]:
     c2, t2 = openjpa_build_files(root)
     c3 = openjpa_spring_adapters(root)
     c4 = openjpa_naming_defaults(root)
-    return c1 + c2 + c3 + c4, t1 + t2
+    changes, todo = c1 + c2 + c3 + c4, t1 + t2
+    for fn in (cm_openjpa_api, cm_openjpa_annotations, cm_openjpa_code_props, cm_openjpa_agent, cm_jpql_positional,
+               lambda r: cm_pin_generated_ids(r, "openjpa")):
+        c, t = fn(root)
+        changes += c
+        todo += t
+    if any("OPENJPA_SEQUENCE_TABLE" in c for c in changes):
+        changes += openjpa_pooled_lo(root)
+    return changes, todo
 
 
 def openjpa_present(result: dict) -> bool:
@@ -729,6 +788,2434 @@ def openjpa_section(root: Path) -> list[str]:
         out.append("")
     out += ["### What to verify"] + [""] + [f"- {c}" for c in OPENJPA_CHECKLIST] + [""]
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Source editing helpers (Java text, build files, Spring config files)
+# --------------------------------------------------------------------------- #
+def write_if_changed(p: Path, old: str, new: str) -> bool:
+    if new != old:
+        p.write_text(new, encoding="utf-8")
+        return True
+    return False
+
+
+def skip_java_literal(text: str, i: int) -> int:
+    """i points at a quote; return the index just after the literal (handles text blocks)."""
+    q = text[i]
+    if q == '"' and text.startswith('"""', i):
+        j = text.find('"""', i + 3)
+        while j != -1 and text[j - 1] == "\\":
+            j = text.find('"""', j + 1)
+        return len(text) if j == -1 else j + 3
+    j = i + 1
+    while j < len(text):
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == q or text[j] == "\n":
+            return j + 1
+        j += 1
+    return j
+
+
+def balanced(text: str, i: int, open_ch="(", close_ch=")") -> int:
+    """i points at open_ch; return index of the matching close_ch (string/char literals and comments skipped), or -1."""
+    depth, j = 0, i
+    while j < len(text):
+        c = text[j]
+        if c in "\"'":
+            j = skip_java_literal(text, j)
+            continue
+        if text.startswith("//", j):
+            j = text.find("\n", j)
+            if j == -1:
+                return -1
+            continue
+        if text.startswith("/*", j):
+            j = text.find("*/", j)
+            if j == -1:
+                return -1
+            j += 2
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def split_top_level(s: str, sep=",") -> list[str]:
+    parts, depth, cur, j = [], 0, [], 0
+    while j < len(s):
+        c = s[j]
+        if c in "\"'":
+            k = skip_java_literal(s, j)
+            cur.append(s[j:k]); j = k
+            continue
+        if c in "([{<":
+            depth += 1
+        elif c in ")]}>":
+            depth -= 1
+        if c == sep and depth == 0:
+            parts.append("".join(cur)); cur = []
+        else:
+            cur.append(c)
+        j += 1
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return [p.strip() for p in parts]
+
+
+def annotation_spans(text: str, name: str):
+    """Yield (start, end, args or None) for every @name / @name(...) annotation (simple or qualified name)."""
+    for m in re.finditer(r"@(?:[\w.]+\.)?" + re.escape(name) + r"\b(?!\.)", text):
+        j = m.end()
+        k = j
+        while k < len(text) and text[k] in " \t":
+            k += 1
+        if k < len(text) and text[k] == "(":
+            e = balanced(text, k)
+            if e == -1:
+                continue
+            yield m.start(), e + 1, text[k + 1:e]
+        else:
+            yield m.start(), j, None
+
+
+def ann_attr(args: str | None, key: str) -> str | None:
+    """Value of key=... in annotation args (raw text); 'value' also matches a bare single argument."""
+    if args is None:
+        return None
+    for part in split_top_level(args):
+        m = re.match(r"(\w+)\s*=\s*(.*)$", part, re.S)
+        if m and m.group(1) == key:
+            return m.group(2).strip()
+        if not m and key == "value":
+            return part.strip()
+    return None
+
+
+def unquote_java(s: str | None) -> str | None:
+    if s is None:
+        return None
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    return s
+
+
+def java_imports(text: str) -> list[str]:
+    return re.findall(r"^\s*import\s+(?:static\s+)?([\w.*]+)\s*;", text, re.M)
+
+
+def add_import(text: str, fqcn: str) -> str:
+    simple = fqcn.rsplit(".", 1)[-1]
+    pkg = fqcn.rsplit(".", 1)[0]
+    imps = java_imports(text)
+    if fqcn in imps or f"{pkg}.*" in imps:
+        return text
+    if any(i.rsplit(".", 1)[-1] == simple for i in imps):
+        return text  # a different class with that simple name is imported; caller should use the FQCN
+    m = list(re.finditer(r"^\s*import\s+[^;]+;[ \t]*\n", text, re.M))
+    line = f"import {fqcn};\n"
+    if m:
+        return text[:m[-1].end()] + line + text[m[-1].end():]
+    pm = re.search(r"^\s*package\s+[\w.]+\s*;[ \t]*\n", text, re.M)
+    if pm:
+        return text[:pm.end()] + "\n" + line + text[pm.end():]
+    return line + text
+
+
+def remove_import(text: str, pattern: str) -> str:
+    """Remove imports whose name matches the regex pattern (anchored)."""
+    return re.sub(r"^[ \t]*import\s+(?:static\s+)?(?:" + pattern + r")\s*;[ \t]*\r?\n", "", text, flags=re.M)
+
+
+def remove_annotation(text: str, name: str) -> tuple[str, int]:
+    n = 0
+    for s, e, _ in sorted(annotation_spans(text, name), reverse=True):
+        ls = text.rfind("\n", 0, s) + 1
+        le = text.find("\n", e)
+        le = len(text) if le == -1 else le
+        if text[ls:s].strip() == "" and text[e:le].strip() == "":
+            text = text[:ls] + text[le + 1:]
+        else:
+            text = text[:s] + text[e:].lstrip(" ")
+        n += 1
+    return text, n
+
+
+def uses_simple_name(text: str, simple: str) -> bool:
+    body = re.sub(r"^\s*import\s+[^;]+;", "", text, flags=re.M)
+    return re.search(r"\b" + re.escape(simple) + r"\b", body) is not None
+
+
+def drop_unused_imports(text: str, fqcns) -> str:
+    for f in fqcns:
+        if not uses_simple_name(text, f.rsplit(".", 1)[-1]):
+            text = remove_import(text, re.escape(f))
+    return text
+
+
+def persistence_pkg(text: str) -> str:
+    return "jakarta.persistence" if "jakarta.persistence" in text else "javax.persistence"
+
+
+def main_package(root: Path) -> tuple[str | None, Path | None]:
+    """Package and source dir of the @SpringBootApplication class."""
+    for p in walk(root):
+        if p.suffix != ".java" or "/src/main/java/" not in p.as_posix():
+            continue
+        t = read(p) or ""
+        if "@SpringBootApplication" in t:
+            m = re.search(r"^\s*package\s+([\w.]+)\s*;", t, re.M)
+            return (m.group(1) if m else None), p.parent
+    return None, None
+
+
+def java_sources(root: Path, main_only=False):
+    for p in walk(root):
+        if p.suffix == ".java" and (not main_only or "/src/main/" in p.as_posix()):
+            yield p
+
+
+# ---- build files ------------------------------------------------------------
+def build_files(root: Path):
+    for p in walk(root):
+        if p.name == "pom.xml" or p.name in ("build.gradle", "build.gradle.kts"):
+            yield p
+
+
+def pom_dependency_blocks(text: str):
+    """(start, end, groupId, artifactId) for each <dependency> outside dependencyManagement/plugins."""
+    excl = [m.span() for m in re.finditer(r"<(dependencyManagement|plugins|pluginManagement|exclusions)>.*?</\1>", text, re.S)]
+    for m in re.finditer(r"[ \t]*<dependency>(?:(?!<dependency>).)*?</dependency>[ \t]*\r?\n?", text, re.S):
+        if any(a <= m.start() < b for a, b in excl):
+            continue
+        b = m.group(0).split("<exclusions>")[0]
+        yield m.start(), m.end(), _first_tag(b, "groupId"), _first_tag(b, "artifactId")
+
+
+def build_has_artifact(text: str, artifact_rx: str) -> bool:
+    return re.search(r"<artifactId>" + artifact_rx + r"</artifactId>|['\":]" + artifact_rx + r"['\":]", text) is not None
+
+
+def build_remove_deps(p: Path, text: str, pred) -> tuple[str, list[str]]:
+    """pred(groupId, artifactId) -> bool. Returns new text and removed coordinates."""
+    removed = []
+    if p.name == "pom.xml":
+        for s, e, g, a in sorted(pom_dependency_blocks(text), reverse=True):
+            if pred(g, a):
+                text = text[:s] + text[e:]
+                removed.append(f"{g}:{a}")
+        return text, removed
+    out = []
+    for line in text.splitlines(keepends=True):
+        m = re.search(r"['\"]([\w.\-]+):([\w.\-]+)(?::[^'\"]*)?['\"]", line)
+        if m and re.match(r"\s*(implementation|api|compile|runtimeOnly|compileOnly|testImplementation|testRuntimeOnly|annotationProcessor|runtime)\b", line) and pred(m.group(1), m.group(2)):
+            removed.append(f"{m.group(1)}:{m.group(2)}")
+            continue
+        out.append(line)
+    return "".join(out), removed
+
+
+def build_add_dep(p: Path, text: str, group: str, artifact: str, version: str | None = None, scope: str | None = None) -> str:
+    if build_has_artifact(text, re.escape(artifact)):
+        return text
+    if p.name == "pom.xml":
+        x = f"    <dependency>\n      <groupId>{group}</groupId>\n      <artifactId>{artifact}</artifactId>\n"
+        if version:
+            x += f"      <version>{version}</version>\n"
+        if scope:
+            x += f"      <scope>{scope}</scope>\n"
+        x += "    </dependency>\n"
+        return _insert_dependency(text, x)
+    conf = {"runtime": "runtimeOnly", "test": "testImplementation", None: "implementation"}.get(scope, "implementation")
+    coord = f"{group}:{artifact}" + (f":{version}" if version else "")
+    line = f'    {conf}("{coord}")\n' if p.suffix == ".kts" else f"    {conf} '{coord}'\n"
+    m = re.search(r"^dependencies\s*\{[ \t]*\n", text, re.M)
+    if m:
+        return text[:m.end()] + line + text[m.end():]
+    return text.rstrip("\n") + "\n\ndependencies {\n" + line + "}\n"
+
+
+def pom_set_property(text: str, name: str, value: str) -> str:
+    rx = re.compile(r"(<" + re.escape(name) + r">)[^<]*(</" + re.escape(name) + r">)")
+    if rx.search(text):
+        return rx.sub(lambda m: m.group(1) + value + m.group(2), text, count=1)
+    m = re.search(r"<properties>[ \t]*\n", text)
+    if m:
+        return text[:m.end()] + f"    <{name}>{value}</{name}>\n" + text[m.end():]
+    m = re.search(r"[ \t]*<dependencies>", text)
+    return text[:m.start()] + f"  <properties>\n    <{name}>{value}</{name}>\n  </properties>\n" + text[m.start():]
+
+
+def pom_ensure_bom(text: str, group: str, artifact: str, version_expr: str) -> str:
+    if re.search(r"<artifactId>" + re.escape(artifact) + r"</artifactId>", text):
+        return text
+    dep = (f"      <dependency>\n        <groupId>{group}</groupId>\n        <artifactId>{artifact}</artifactId>\n"
+           f"        <version>{version_expr}</version>\n        <type>pom</type>\n        <scope>import</scope>\n      </dependency>\n")
+    m = re.search(r"<dependencyManagement>\s*<dependencies>[ \t]*\n", text)
+    if m:
+        return text[:m.end()] + dep + text[m.end():]
+    block = f"  <dependencyManagement>\n    <dependencies>\n{dep}    </dependencies>\n  </dependencyManagement>\n"
+    m = re.search(r"^[ \t]*<dependencies>", text, re.M)
+    return text[:m.start()] + block + text[m.start():]
+
+
+# ---- Spring config files (application*.properties / *.yml) ------------------
+class ConfigFile:
+    """Minimal editor for Spring Boot .properties and simple block-style YAML.
+    Keys are flattened Spring-style (a.b.c, list[0]). Writes add flat keys, which Boot accepts in YAML too."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.yaml = path.suffix in (".yml", ".yaml")
+        self.original = read(path) or "" if path.exists() else ""
+        self.lines = self.original.splitlines()
+        self.appended: dict[int, list[str]] = {}
+
+    # parsing -> list of dicts {key, value, line, doc}
+    def entries(self) -> list[dict]:
+        return self._yaml_entries() if self.yaml else self._props_entries()
+
+    def _props_entries(self):
+        out, i = [], 0
+        while i < len(self.lines):
+            line = self.lines[i]
+            s = line.strip()
+            start = i
+            if not s or s[0] in "#!":
+                i += 1
+                continue
+            while line.rstrip().endswith("\\") and i + 1 < len(self.lines):
+                i += 1
+                line = line.rstrip()[:-1] + self.lines[i].lstrip()
+            m = re.match(r"\s*((?:\\.|[^=:\s])+)\s*[=:\s]\s*(.*)$", line)
+            if m:
+                out.append({"key": m.group(1), "value": m.group(2).strip(), "line": start, "end": i, "doc": 0})
+            i += 1
+        return out
+
+    def _yaml_entries(self):
+        out, stack, doc = [], [], 0          # stack: (indent, keypart, kind)
+        counters: dict[tuple, int] = {}
+        key_rx = re.compile(r"('[^']*'|\"[^\"]*\"|[^#'\"\s][^:#]*?):(?:\s+(.*))?$")
+
+        def path(extra=""):
+            s = ""
+            for _, k, _ in stack:
+                s = s + k if k.startswith("[") else (s + "." + k if s else k)
+            if extra:
+                s = s + extra if extra.startswith("[") else (s + "." + extra if s else extra)
+            return s
+        for i, raw in enumerate(self.lines):
+            if raw.strip() in ("---", "..."):
+                doc += 1; stack = []; counters = {}
+                continue
+            if not raw.strip() or raw.lstrip().startswith("#"):
+                continue
+            ind = len(raw) - len(raw.lstrip())
+            body = raw.strip()
+            if body == "-" or body.startswith("- "):
+                while stack and (stack[-1][0] > ind or (stack[-1][0] == ind and stack[-1][2] == "item")):
+                    stack.pop()
+                parent = path()
+                idx = counters.get((doc, parent), -1) + 1
+                counters[(doc, parent)] = idx
+                stack.append((ind, f"[{idx}]", "item"))
+                rest = body[1:].strip()
+                km = key_rx.match(rest) if rest and rest[0] not in "'\"[{" else None
+                if km:
+                    k = km.group(1).strip("'\"")
+                    v = self._yval(km.group(2))
+                    stack.append((ind + 2, k, "key"))
+                    if v is not None:
+                        out.append({"key": path(), "value": v, "line": i, "end": i, "doc": doc})
+                else:
+                    v = self._yval(rest)
+                    if v is not None:
+                        out.append({"key": path(), "value": v, "line": i, "end": i, "doc": doc})
+                continue
+            km = key_rx.match(body)
+            if not km:
+                continue
+            while stack and stack[-1][0] >= ind:
+                stack.pop()
+            k = km.group(1).strip("'\"")
+            v = self._yval(km.group(2))
+            stack.append((ind, k, "key"))
+            if v is not None:
+                out.append({"key": path(), "value": v, "line": i, "end": i, "doc": doc})
+        return out
+
+    @staticmethod
+    def _yval(v):
+        if v is None:
+            return None
+        v = v.strip()
+        if not v or v in ("|", ">", "|-", ">-"):
+            return None
+        if v[0] in "'\"":
+            q = v[0]
+            e = v.find(q, 1)
+            return v[1:e] if e > 0 else v[1:]
+        return re.sub(r"\s+#.*$", "", v)
+
+    def get(self, key: str):
+        for e in self.entries():
+            if e["key"] == key:
+                return e["value"]
+        return None
+
+    def keys_matching(self, rx: str) -> list[dict]:
+        r = re.compile(rx)
+        return [e for e in self.entries() if r.match(e["key"])]
+
+    def remove(self, key: str) -> int | None:
+        """Remove a leaf; returns its document index or None."""
+        for e in self.entries():
+            if e["key"] == key:
+                self._delete_lines(e["line"], e["end"])
+                return e["doc"]
+        return None
+
+    def _delete_lines(self, a: int, b: int):
+        del self.lines[a:b + 1]
+        if self.yaml:
+            self._prune_empty_parents()
+
+    def _prune_empty_parents(self):
+        changed = True
+        while changed:
+            changed = False
+            for i, raw in enumerate(self.lines):
+                b = raw.strip()
+                if not b or b.startswith("#") or b == "---" or not re.match(r"[^-][^:]*:\s*$", b):
+                    continue
+                ind = len(raw) - len(raw.lstrip())
+                j = i + 1
+                while j < len(self.lines) and (not self.lines[j].strip() or self.lines[j].lstrip().startswith("#")):
+                    j += 1
+                nxt = self.lines[j] if j < len(self.lines) else None
+                nind = None if nxt is None else len(nxt) - len(nxt.lstrip())
+                if nxt is None or nxt.strip() == "---" or nind < ind or (nind == ind and not nxt.lstrip().startswith("-")):
+                    del self.lines[i]
+                    changed = True
+                    break
+
+    def put(self, key: str, value: str, doc: int = 0, comment: str | None = None):
+        if self.get(key) is not None:
+            self.remove(key)
+        if self.yaml:
+            v = value
+            if v == "" or re.search(r"^[\s*&!|>'\"%@`,\[\]{}#?:-]|: | #|\s$", v):
+                v = json.dumps(v)
+            line = f"{key}: {v}"
+            if comment:
+                line = f"# {comment}\n{line}"
+        else:
+            line = f"{key}={value}"
+            if comment:
+                line = f"# {comment}\n{line}"
+        self.appended.setdefault(doc, []).append(line)
+
+    def comment_out(self, key: str, note: str) -> bool:
+        for e in self.entries():
+            if e["key"] == key:
+                if self.yaml:
+                    self._delete_lines(e["line"], e["end"])
+                    self.appended.setdefault(e["doc"], []).append(f"# TODO(spring-migrate) removed {key}={e['value']}: {note}")
+                else:
+                    for i in range(e["line"], e["end"] + 1):
+                        self.lines[i] = "# " + self.lines[i]
+                    self.lines.insert(e["line"], f"# TODO(spring-migrate): {note}")
+                return True
+        return False
+
+    def text(self) -> str:
+        lines = list(self.lines)
+        if self.appended:
+            # insert appended lines at the end of their document
+            doc_ends, doc = {}, 0
+            for i, l in enumerate(lines):
+                if l.strip() == "---":
+                    doc_ends[doc] = i
+                    doc += 1
+            doc_ends.setdefault(doc, len(lines))
+            for d in sorted(self.appended, reverse=True):
+                at = doc_ends.get(d, len(lines))
+                while at > 0 and not lines[at - 1].strip():
+                    at -= 1
+                lines[at:at] = self.appended[d]
+        s = "\n".join(lines)
+        return s + "\n" if s else ""
+
+    def save(self) -> bool:
+        new = self.text()
+        if new != (self.original if self.original.endswith("\n") or not self.original else self.original + "\n"):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(new, encoding="utf-8")
+            return True
+        return False
+
+
+def config_files(root: Path, include_test=True) -> list[Path]:
+    out = []
+    for p in walk(root):
+        pp = p.as_posix()
+        if not re.match(r"(application|bootstrap)([-.][\w-]+)?\.(properties|ya?ml)$", p.name):
+            continue
+        if "/src/main/resources" in pp or (include_test and "/src/test/resources" in pp) or p.parent == root or p.parent.name == "config":
+            out.append(p)
+    return out
+
+
+def main_config(root: Path, module_dir: Path | None = None) -> ConfigFile:
+    base = (module_dir or root) / "src/main/resources"
+    for n in ("application.properties", "application.yml", "application.yaml"):
+        if (base / n).exists():
+            return ConfigFile(base / n)
+    return ConfigFile(base / "application.properties")
+
+
+def module_of(p: Path, root: Path) -> Path:
+    """Directory of the build module that contains p."""
+    d = p.parent
+    while d != root and d != d.parent:
+        if (d / "pom.xml").exists() or (d / "build.gradle").exists() or (d / "build.gradle.kts").exists():
+            return d
+        d = d.parent
+    return root
+
+
+def module_build_file(mod: Path) -> Path | None:
+    for n in ("pom.xml", "build.gradle", "build.gradle.kts"):
+        if (mod / n).exists():
+            return mod / n
+    return None
+
+
+def edit_build(mod: Path, fn) -> bool:
+    """fn(path, text) -> new text for the module's build file."""
+    bf = module_build_file(mod)
+    if not bf:
+        return False
+    t = read(bf) or ""
+    return write_if_changed(bf, t, fn(bf, t))
+
+
+# ---- versions from Maven Central (with offline fallbacks) -------------------
+_VERSION_CACHE: dict[str, list[str]] = {}
+OFFLINE = False
+
+
+def central_versions(group: str, artifact: str) -> list[str]:
+    key = f"{group}:{artifact}"
+    if key in _VERSION_CACHE:
+        return _VERSION_CACHE[key]
+    vs: list[str] = []
+    if not OFFLINE:
+        import urllib.request
+        url = f"https://repo1.maven.org/maven2/{group.replace('.', '/')}/{artifact}/maven-metadata.xml"
+        try:
+            with urllib.request.urlopen(url, timeout=15) as r:
+                vs = re.findall(r"<version>([^<]+)</version>", r.read().decode("utf-8", "replace"))
+        except Exception:
+            vs = []
+    _VERSION_CACHE[key] = vs
+    return vs
+
+
+def vtuple(v: str) -> tuple:
+    return tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.\-]", v)[:4])
+
+
+def latest_patch(group: str, artifact: str, line: str, fallback: str) -> str:
+    """Latest GA version that starts with `line.` (e.g. 4.1 -> 4.1.3)."""
+    cands = [v for v in central_versions(group, artifact)
+             if v.startswith(line + ".") and re.fullmatch(r"[\d.]+", v)]
+    return max(cands, key=vtuple) if cands else fallback
+
+
+BOOT_FALLBACK = {"3.5": "3.5.16", "4.0": "4.0.10", "4.1": "4.1.3"}
+# Release train -> Boot lines it accepts (read from spring-cloud-commons' CompatibilityVerifierProperties).
+CLOUD_TRAIN = {"3.5": ("2025.0", "2025.0.3"), "4.0": ("2025.1", "2025.1.5"), "4.1": ("2025.1", "2025.1.5")}
+
+
+def boot_version_for(line: str) -> str:
+    return latest_patch("org.springframework.boot", "spring-boot-dependencies", line, BOOT_FALLBACK[line])
+
+
+def cloud_version_for(boot_line: str) -> str:
+    train, fb = CLOUD_TRAIN[boot_line]
+    return latest_patch("org.springframework.cloud", "spring-cloud-dependencies", train, fb)
+
+# --------------------------------------------------------------------------- #
+# Codemods for things OpenRewrite does not migrate (run before the Boot 3.5 recipes)
+# Each returns (changes, todo). They are idempotent: running twice changes nothing.
+# --------------------------------------------------------------------------- #
+# Boot-managed version properties that legacy projects commonly override. A Boot 2.x-era pin left in place
+# overrides the version Boot 3/4 needs (e.g. mockito.version=4.x breaks on Boot 3.5).
+BOOT_MANAGED_PROPS = (
+    "mockito.version", "byte-buddy.version", "hibernate.version", "hibernate-validator.version", "jackson-bom.version",
+    "jackson.version", "junit-jupiter.version", "spring-framework.version", "spring.version", "spring-security.version",
+    "spring-data-bom.version", "spring-data-releasetrain.version", "tomcat.version", "jetty.version", "undertow.version",
+    "netty.version", "reactor-bom.version", "micrometer.version", "flyway.version", "liquibase.version", "h2.version",
+    "postgresql.version", "mysql.version", "mariadb.version", "lombok.version", "logback.version", "slf4j.version",
+    "log4j2.version", "snakeyaml.version", "thymeleaf.version", "httpclient.version", "httpcore.version", "assertj.version",
+    "hamcrest.version", "json-path.version", "kotlin.version", "kotlin-coroutines.version", "elasticsearch.version",
+    "kafka.version", "spring-kafka.version", "spring-amqp.version", "rabbit-amqp-client.version", "caffeine.version",
+    "ehcache3.version", "hazelcast.version", "jooq.version", "querydsl.version", "groovy.version", "jakarta-servlet.version",
+    "javax-servlet.version", "selenium.version", "testcontainers.version", "awaitility.version", "jersey.version",
+)
+
+
+def cm_stale_version_pins(root: Path) -> tuple[list[str], list[str]]:
+    changes = []
+    for p in walk(root):
+        t = read(p)
+        if t is None:
+            continue
+        new = t
+        if p.name == "pom.xml":
+            for prop in BOOT_MANAGED_PROPS:
+                new = re.sub(r"^[ \t]*<" + re.escape(prop) + r">[^<]*</" + re.escape(prop) + r">[ \t]*\r?\n", "", new, flags=re.M)
+        elif p.name == "gradle.properties":
+            for prop in BOOT_MANAGED_PROPS:
+                new = re.sub(r"^\s*" + re.escape(prop) + r"\s*[=:].*\r?\n?", "", new, flags=re.M)
+        elif p.name in ("build.gradle", "build.gradle.kts"):
+            for prop in BOOT_MANAGED_PROPS:
+                new = re.sub(r"^\s*(?:ext|extra)\s*\[\s*['\"]" + re.escape(prop) + r"['\"]\s*\]\s*=.*\r?\n?", "", new, flags=re.M)
+        if write_if_changed(p, t, new):
+            removed = [x for x in BOOT_MANAGED_PROPS if x in t and x not in new]
+            changes.append(f"{rel(p, root)}: removed stale Boot-managed version pin(s): {', '.join(removed)}")
+    return changes, []
+
+
+# ---- ID generation ----------------------------------------------------------
+_NUMERIC_ID = r"(?:java\.lang\.)?(?:Long|long|Integer|int|Short|short)|(?:java\.math\.)?(?:BigInteger|BigDecimal)"
+
+
+def _datasource_kind(root: Path) -> str:
+    urls = " ".join(e["value"] for f in config_files(root) for e in ConfigFile(f).entries() if "url" in e["key"].lower())
+    for p in walk(root):
+        if p.name == "persistence.xml":
+            urls += " " + (read(p) or "")
+    if re.search(r"jdbc:(mysql|mariadb|sqlserver|jtds|sybase)", urls):
+        return "identity-db"
+    return "sequence-db"
+
+
+def _new_generator_mappings_off(root: Path) -> bool:
+    for f in config_files(root):
+        for e in ConfigFile(f).entries():
+            if "new_generator_mappings" in e["key"] and e["value"].strip().lower() == "false":
+                return True
+    return False
+
+
+def cm_pin_generated_ids(root: Path, mode: str = "hibernate5") -> tuple[list[str], list[str]]:
+    """Make implicit id generation explicit so Hibernate 6 keeps using the existing sequence/table.
+    mode 'hibernate5': reproduce Hibernate 5.6 (Boot 2.7) AUTO/SEQUENCE defaults (hibernate_sequence, increment 1).
+    mode 'openjpa': reproduce OpenJPA's default table sequence (OPENJPA_SEQUENCE_TABLE)."""
+    changes, todo = [], []
+    identity = mode == "hibernate5" and _new_generator_mappings_off(root) and _datasource_kind(root) == "identity-db"
+    for p in java_sources(root, main_only=True):
+        t = read(p) or ""
+        if "GeneratedValue" not in t:
+            continue
+        pkg = persistence_pkg(t)
+        new, n = t, 0
+        for s, e, args in sorted(annotation_spans(t, "GeneratedValue"), reverse=True):
+            strategy = (ann_attr(args, "strategy") or "AUTO").split(".")[-1]
+            if ann_attr(args, "generator") or strategy not in ("AUTO", "SEQUENCE"):
+                continue
+            tail = new[e:e + 400]
+            stop = re.search(r"[;{]", tail)
+            decl = tail[:stop.end()] if stop else tail
+            decl = re.sub(r"@\w+(?:\s*\([^)]*\))?", " ", decl)
+            if not re.search(r"\b(?:" + _NUMERIC_ID + r")\s+\w+\s*(?:[;=]|\(\s*\))", decl):
+                continue
+            ind = re.match(r"[ \t]*", new[new.rfind("\n", 0, s) + 1:]).group(0)
+            if mode == "openjpa":
+                rep = (f'@GeneratedValue(strategy = GenerationType.TABLE, generator = "openjpa_sequence")\n{ind}'
+                       f'@TableGenerator(name = "openjpa_sequence", table = "OPENJPA_SEQUENCE_TABLE", pkColumnName = "ID", '
+                       f'valueColumnName = "SEQUENCE_VALUE", pkColumnValue = "0", allocationSize = 50)')
+                extra = [f"{pkg}.TableGenerator"]
+            elif identity:
+                rep = "@GeneratedValue(strategy = GenerationType.IDENTITY)"
+                extra = []
+            else:
+                rep = (f'@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "hibernate_sequence")\n{ind}'
+                       f'@SequenceGenerator(name = "hibernate_sequence", sequenceName = "hibernate_sequence", allocationSize = 1)')
+                extra = [f"{pkg}.SequenceGenerator"]
+            new = new[:s] + rep + new[e:]
+            for imp in [f"{pkg}.GenerationType"] + extra:
+                new = add_import(new, imp)
+            n += 1
+        if n and write_if_changed(p, t, new):
+            what = {"openjpa": "OPENJPA_SEQUENCE_TABLE (OpenJPA default)", "hibernate5": "IDENTITY" if identity else "hibernate_sequence, increment 1 (Hibernate 5 default)"}[mode]
+            changes.append(f"{rel(p, root)}: pinned {n} implicit @GeneratedValue to {what}")
+    if changes and mode == "openjpa":
+        todo.append("ID generation now reads OpenJPA's OPENJPA_SEQUENCE_TABLE through a Hibernate @TableGenerator (pooled-lo). "
+                    "On PostgreSQL the ID column is SMALLINT while Hibernate binds pkColumnValue as a string: add `stringtype=unspecified` "
+                    "to the JDBC URL or change the column type. Verify the next id against a copy of production.")
+    return changes, todo
+
+
+# ---- JPQL '?' parameters ------------------------------------------------------
+def _number_qmarks(literal_body: str, counter: list) -> str:
+    out, inq = [], False
+    for i, c in enumerate(literal_body):
+        if c == "'":
+            inq = not inq
+        if c == "?" and not inq and not (i + 1 < len(literal_body) and literal_body[i + 1].isdigit()):
+            counter[0] += 1
+            out.append(f"?{counter[0]}")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+def _renumber_args(args: str) -> str:
+    if re.search(r"\?\d", args):
+        return args  # already numbered (or mixed): leave alone
+    counter, out, j = [0], [], 0
+    while j < len(args):
+        if args[j] == '"':
+            k = skip_java_literal(args, j)
+            lit = args[j:k]
+            q = 3 if lit.startswith('"""') else 1
+            out.append(lit[:q] + _number_qmarks(lit[q:-q], counter) + lit[-q:])
+            j = k
+            continue
+        out.append(args[j]); j += 1
+    return "".join(out)
+
+
+def cm_jpql_positional(root: Path) -> tuple[list[str], list[str]]:
+    changes = []
+    for p in walk(root):
+        t = read(p)
+        if not t or "?" not in t:
+            continue
+        new = t
+        if p.suffix in (".java", ".kt"):
+            spans = []
+            for m in re.finditer(r"\bcreateQuery\s*\(|@(?:NamedQuery|Query)\s*\(", t):
+                k = t.index("(", m.start())
+                e = balanced(t, k)
+                if e == -1:
+                    continue
+                args = t[k + 1:e]
+                if m.group(0).startswith("@Query") and re.search(r"nativeQuery\s*=\s*true", args):
+                    continue
+                if m.group(0).startswith("@NamedQuery"):
+                    q = ann_attr(args, "query")
+                    if q is None:
+                        continue
+                spans.append((k + 1, e))
+            for a, b in sorted(spans, reverse=True):
+                new = new[:a] + _renumber_args(new[a:b]) + new[b:]
+        elif p.name == "orm.xml" or (p.suffix == ".xml" and "<named-query" in t):
+            new = re.sub(r"(<named-query\b[^>]*>\s*<query>)(.*?)(</query>)",
+                         lambda m: m.group(1) + (_number_qmarks(m.group(2), [0]) if not re.search(r"\?\d", m.group(2)) else m.group(2)) + m.group(3),
+                         new, flags=re.S)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: JDBC-style '?' JPQL parameters numbered (?1, ?2, ...)")
+    return changes, []
+
+
+# ---- Netflix OSS --------------------------------------------------------------
+HYSTRIX_PROP_MAP = {
+    "circuitBreaker.requestVolumeThreshold": ("circuitbreaker", "minimum-number-of-calls", ""),
+    "circuitBreaker.errorThresholdPercentage": ("circuitbreaker", "failure-rate-threshold", ""),
+    "circuitBreaker.sleepWindowInMilliseconds": ("circuitbreaker", "wait-duration-in-open-state", "ms"),
+    "metrics.rollingStats.timeInMilliseconds": ("circuitbreaker", "sliding-window-size", "s"),
+    "execution.isolation.thread.timeoutInMilliseconds": ("timelimiter", "timeout-duration", "ms"),
+}
+
+
+def _r4j_props(scope: str, name: str, prop: str, value: str):
+    """-> list of (key, value) or None if unmapped. scope: 'instances' or 'configs'."""
+    m = HYSTRIX_PROP_MAP.get(prop)
+    if not m:
+        return None
+    kind, key, unit = m
+    base = f"resilience4j.{kind}.{scope}.{name}"
+    if unit == "ms":
+        return [(f"{base}.{key}", f"{value}ms")]
+    if unit == "s":
+        try:
+            secs = max(1, int(value) // 1000)
+        except ValueError:
+            return None
+        return [(f"{base}.sliding-window-type", "TIME_BASED"), (f"{base}.{key}", str(secs))]
+    return [(f"{base}.{key}", value)]
+
+
+def _method_name_after(text: str, pos: int) -> str | None:
+    for m in re.finditer(r"(@)?\b([A-Za-z_]\w*)\s*\(", text[pos:pos + 2000]):
+        if m.group(1):
+            k = pos + m.end() - 1
+            e = balanced(text, k)
+            continue
+        if m.group(2) in ("if", "for", "while", "switch", "catch", "synchronized", "return", "new"):
+            continue
+        return m.group(2)
+    return None
+
+
+def _add_throwable_param(text: str, method: str) -> str:
+    for m in re.finditer(r"(?<![.\w\"])(?:[\w<>\[\],.?]+\s+)" + re.escape(method) + r"\s*\(", text):
+        k = m.end() - 1
+        e = balanced(text, k)
+        if e == -1:
+            continue
+        after = text[e + 1:e + 200].lstrip()
+        if not (after.startswith("{") or after.startswith("throws")):
+            continue  # a call, not a declaration
+        params = text[k + 1:e]
+        if re.search(r"\b(Throwable|Exception|\w+Exception)\s+\w+\s*$", params.strip()):
+            return text
+        new_params = (params.rstrip() + ", Throwable throwable") if params.strip() else "Throwable throwable"
+        return text[:k + 1] + new_params + text[e:]
+    return text
+
+
+def cm_hystrix(root: Path) -> tuple[list[str], list[str]]:
+    changes, todo, props, mods = [], [], [], set()
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "Hystrix" not in t and "EnableCircuitBreaker" not in t:
+            continue
+        new = t
+        for ann in ("EnableHystrix", "EnableCircuitBreaker", "EnableHystrixDashboard"):
+            new, _ = remove_annotation(new, ann)
+        for s, e, args in sorted(annotation_spans(new, "HystrixCommand"), reverse=True):
+            method = _method_name_after(new, e)
+            name = unquote_java(ann_attr(args, "commandKey")) or method or "default"
+            fb = unquote_java(ann_attr(args, "fallbackMethod"))
+            for pm in re.finditer(r"@HystrixProperty\s*\(\s*name\s*=\s*\"([^\"]+)\"\s*,\s*value\s*=\s*\"([^\"]*)\"\s*\)", args or ""):
+                mapped = _r4j_props("instances", name, pm.group(1), pm.group(2))
+                if mapped:
+                    props += [(k, v, module_of(p, root)) for k, v in mapped]
+                else:
+                    todo.append(f"{rel(p, root)}: Hystrix property {pm.group(1)}={pm.group(2)} on {method}() has no Resilience4j equivalent")
+            ign = ann_attr(args, "ignoreExceptions")
+            if ign:
+                for i, c in enumerate(re.findall(r"([\w.]+)\.class", ign)):
+                    fq = c if "." in c else next((x for x in java_imports(new) if x.endswith("." + c)), None)
+                    if not fq and c in ("RuntimeException", "IllegalArgumentException", "IllegalStateException", "Exception"):
+                        fq = "java.lang." + c
+                    if not fq:
+                        pkgm = re.search(r"^\s*package\s+([\w.]+)\s*;", new, re.M)
+                        fq = f"{pkgm.group(1)}.{c}" if pkgm else c
+                    props.append((f"resilience4j.circuitbreaker.instances.{name}.ignore-exceptions[{i}]", fq, module_of(p, root)))
+            rep = f'@CircuitBreaker(name = "{name}"' + (f', fallbackMethod = "{fb}"' if fb else "") + ")"
+            new = new[:s] + rep + new[e:]
+            if fb:
+                new = _add_throwable_param(new, fb)
+            new = add_import(new, "io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker")
+        new = remove_import(new, r"com\.netflix\.hystrix\.[\w.]+|org\.springframework\.cloud\.netflix\.hystrix\.[\w.]+|"
+                                 r"org\.springframework\.cloud\.client\.circuitbreaker\.EnableCircuitBreaker")
+        if write_if_changed(p, t, new):
+            mods.add(module_of(p, root))
+            changes.append(f"{rel(p, root)}: Hystrix -> Resilience4j (@CircuitBreaker, fallback signature)")
+        if re.search(r"\bHystrix\w*\b", re.sub(r"^\s*import.*$", "", new, flags=re.M)):
+            todo.append(f"{rel(p, root)}: still references Hystrix API (HystrixRequestContext, HystrixCommand subclasses...) - rewrite with CircuitBreakerFactory")
+    # configuration files: hystrix.command.<key>.<prop>
+    for f in config_files(root):
+        c = ConfigFile(f)
+        hit = False
+        for e in c.keys_matching(r"hystrix\."):
+            m = re.match(r"hystrix\.command\.([\w-]+)\.(.+)$", e["key"])
+            mapped = None
+            if m:
+                scope = "configs" if m.group(1) == "default" else "instances"
+                mapped = _r4j_props(scope, m.group(1), m.group(2), e["value"])
+            doc = c.remove(e["key"])
+            hit = True
+            if mapped:
+                for k, v in mapped:
+                    c.put(k, v, doc=doc or 0)
+            else:
+                todo.append(f"{rel(f, root)}: dropped Hystrix setting {e['key']}={e['value']} (no Resilience4j equivalent)")
+        for e in c.keys_matching(r"feign\.hystrix\.enabled$"):
+            doc = c.remove(e["key"]); hit = True
+            c.put("spring.cloud.openfeign.circuitbreaker.enabled", e["value"], doc=doc or 0)
+        if hit and c.save():
+            mods.add(module_of(f, root))
+            changes.append(f"{rel(f, root)}: Hystrix settings -> resilience4j.*")
+    if props:
+        by_mod: dict[Path, list] = {}
+        for k, v, m in props:
+            by_mod.setdefault(m, []).append((k, v))
+        for m, kv in by_mod.items():
+            c = main_config(root, m)
+            for k, v in kv:
+                if c.get(k) is None:
+                    c.put(k, v)
+            if c.save():
+                changes.append(f"{rel(c.path, root)}: @HystrixProperty settings -> resilience4j.*")
+    # build files
+    for bf in list(build_files(root)):
+        t = read(bf) or ""
+        new, removed = build_remove_deps(bf, t, lambda g, a: "hystrix" in (a or "").lower() or (g or "") == "com.netflix.hystrix")
+        if removed or (module_of(bf, root) in mods and changes):
+            new = build_add_dep(bf, new, "org.springframework.cloud", "spring-cloud-starter-circuitbreaker-resilience4j")
+            new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-aop")
+            if bf.name == "pom.xml" and "spring-cloud-dependencies" not in new and "spring-cloud-starter-parent" not in new:
+                new = pom_set_property(new, "spring-cloud.version", cloud_version_for("3.5"))
+                new = pom_ensure_bom(new, "org.springframework.cloud", "spring-cloud-dependencies", "${spring-cloud.version}")
+            if write_if_changed(bf, t, new):
+                changes.append(f"{rel(bf, root)}: {', '.join(removed) or 'Hystrix'} -> spring-cloud-starter-circuitbreaker-resilience4j + spring-boot-starter-aop")
+    if changes:
+        todo.append("Hystrix -> Resilience4j: Resilience4j does not time out synchronous calls (Hystrix did, default 1s) and runs on the caller "
+                    "thread (no thread-pool isolation). Add @TimeLimiter/@Bulkhead where you relied on that.")
+    return changes, todo
+
+
+def _ribbon_rule_bean(method: str, kind: str) -> str:
+    cls = "RandomLoadBalancer" if kind == "Random" else "RoundRobinLoadBalancer"
+    return (f"@Bean\n    public ReactorLoadBalancer<ServiceInstance> {method}(Environment environment, LoadBalancerClientFactory factory) {{\n"
+            f"        String name = environment.getProperty(LoadBalancerClientFactory.PROPERTY_NAME);\n"
+            f"        return new {cls}(factory.getLazyProvider(name, ServiceInstanceListSupplier.class), name);\n    }}")
+
+
+def cm_ribbon(root: Path) -> tuple[list[str], list[str]]:
+    changes, todo, mods = [], [], set()
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "Ribbon" not in t and "netflix.loadbalancer" not in t:
+            continue
+        new = t
+        new = re.sub(r"@(?:[\w.]+\.)?RibbonClients\b", "@LoadBalancerClients", new)
+        new = re.sub(r"@(?:[\w.]+\.)?RibbonClient\b", "@LoadBalancerClient", new)
+        if "@LoadBalancerClient" in new:
+            new = add_import(new, "org.springframework.cloud.loadbalancer.annotation.LoadBalancerClient")
+            if "@LoadBalancerClients" in new:
+                new = add_import(new, "org.springframework.cloud.loadbalancer.annotation.LoadBalancerClients")
+        # IRule beans with a direct LoadBalancer equivalent
+        rx = re.compile(r"@Bean\s+(?:public\s+|protected\s+)?IRule\s+(\w+)\s*\(\s*\)\s*\{\s*return\s+new\s+(Random|RoundRobin)Rule\s*\(\s*\)\s*;\s*\}")
+        if rx.search(new):
+            new = rx.sub(lambda m: _ribbon_rule_bean(m.group(1), m.group(2)), new)
+            for imp in ("org.springframework.cloud.client.ServiceInstance", "org.springframework.cloud.loadbalancer.core.ReactorLoadBalancer",
+                        "org.springframework.cloud.loadbalancer.core.RandomLoadBalancer", "org.springframework.cloud.loadbalancer.core.RoundRobinLoadBalancer",
+                        "org.springframework.cloud.loadbalancer.core.ServiceInstanceListSupplier",
+                        "org.springframework.cloud.loadbalancer.support.LoadBalancerClientFactory", "org.springframework.core.env.Environment"):
+                new = add_import(new, imp)
+            new = drop_unused_imports(new, ["org.springframework.cloud.loadbalancer.core.RandomLoadBalancer",
+                                            "org.springframework.cloud.loadbalancer.core.RoundRobinLoadBalancer"])
+        new = remove_import(new, r"org\.springframework\.cloud\.netflix\.ribbon\.[\w.]+|com\.netflix\.loadbalancer\.(?:Random|RoundRobin)Rule|com\.netflix\.loadbalancer\.IRule")
+        if write_if_changed(p, t, new):
+            mods.add(module_of(p, root))
+            changes.append(f"{rel(p, root)}: Ribbon -> Spring Cloud LoadBalancer")
+        if re.search(r"\b(IRule|IPing|ServerList|ILoadBalancer|com\.netflix\.loadbalancer)\b", re.sub(r"^\s*import.*$", "", new, flags=re.M)):
+            todo.append(f"{rel(p, root)}: custom Ribbon IRule/IPing/ServerList - implement ReactorServiceInstanceLoadBalancer / ServiceInstanceListSupplier")
+    for f in config_files(root):
+        c = ConfigFile(f)
+        hit = False
+        for e in c.keys_matching(r"(?:[\w-]+\.)?ribbon\.|spring\.cloud\.loadbalancer\.ribbon\."):
+            m = re.match(r"([\w-]+)\.ribbon\.listOfServers$", e["key"])
+            doc = c.remove(e["key"]); hit = True
+            if m:
+                for i, srv in enumerate(x.strip() for x in e["value"].split(",") if x.strip()):
+                    c.put(f"spring.cloud.discovery.client.simple.instances.{m.group(1)}[{i}].uri",
+                          srv if "://" in srv else f"http://{srv}", doc=doc or 0)
+            elif not re.search(r"ribbon\.(eureka\.enabled|enabled)$", e["key"]):
+                todo.append(f"{rel(f, root)}: dropped Ribbon setting {e['key']}={e['value']} (configure spring.cloud.loadbalancer.* / client timeouts instead)")
+        if hit and c.save():
+            mods.add(module_of(f, root))
+            changes.append(f"{rel(f, root)}: Ribbon settings -> spring.cloud.discovery.client.simple / removed")
+    for bf in list(build_files(root)):
+        t = read(bf) or ""
+        new, removed = build_remove_deps(bf, t, lambda g, a: "ribbon" in (a or "").lower())
+        if removed:
+            new = build_add_dep(bf, new, "org.springframework.cloud", "spring-cloud-starter-loadbalancer")
+            if write_if_changed(bf, t, new):
+                changes.append(f"{rel(bf, root)}: {', '.join(removed)} -> spring-cloud-starter-loadbalancer")
+    return changes, todo
+
+
+def _strip_prefix_count(path: str) -> int:
+    segs = [s for s in path.split("/") if s]
+    n = 0
+    for s in segs:
+        if "*" in s or "{" in s:
+            break
+        n += 1
+    return n
+
+
+def cm_zuul(root: Path) -> tuple[list[str], list[str]]:
+    changes, todo = [], []
+    zuul_dep = False
+    for bf in list(build_files(root)):
+        t = read(bf) or ""
+        new, removed = build_remove_deps(bf, t, lambda g, a: "zuul" in (a or "").lower())
+        if removed:
+            zuul_dep = True
+            new = build_add_dep(bf, new, "org.springframework.cloud", "spring-cloud-starter-gateway-server-webmvc",
+                                version=latest_patch("org.springframework.cloud", "spring-cloud-starter-gateway-server-webmvc", "4.3", "4.3.0"))
+            if write_if_changed(bf, t, new):
+                changes.append(f"{rel(bf, root)}: {', '.join(removed)} -> spring-cloud-starter-gateway-server-webmvc (servlet, like Zuul 1)")
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "Zuul" not in t:
+            continue
+        new = t
+        for ann in ("EnableZuulProxy", "EnableZuulServer"):
+            new, _ = remove_annotation(new, ann)
+        new = remove_import(new, r"org\.springframework\.cloud\.netflix\.zuul\.Enable\w+")
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: removed @EnableZuulProxy (Gateway MVC is auto-configured)")
+        if re.search(r"\bZuulFilter\b|RequestContext\.getCurrentContext", new):
+            todo.append(f"{rel(p, root)}: ZuulFilter - port to a Gateway MVC filter function (HandlerFilterFunction / BeforeFilterFunctions)")
+    for f in config_files(root):
+        c = ConfigFile(f)
+        ent = c.keys_matching(r"zuul\.")
+        if not ent:
+            continue
+        routes: dict[str, dict] = {}
+        glob: dict[str, str] = {}
+        doc = 0
+        for e in ent:
+            m = re.match(r"zuul\.routes\.([\w-]+)(?:\.([\w-]+))?$", e["key"])
+            if m:
+                r = routes.setdefault(m.group(1), {})
+                r[(m.group(2) or "path").replace("-", "").lower()] = e["value"]
+            else:
+                glob[e["key"].replace("-", "").lower()] = e["value"]
+            doc = c.remove(e["key"]) or doc
+        prefix = glob.get("zuul.prefix", "").rstrip("/")
+        global_strip = glob.get("zuul.stripprefix", "true").lower() != "false"
+        sensitive = glob.get("zuul.sensitiveheaders")
+        base = "spring.cloud.gateway.server.webmvc.routes"
+        for i, (rid, r) in enumerate(routes.items()):
+            path = prefix + (r.get("path") or f"/{rid}/**")
+            uri = r.get("url") or f"lb://{r.get('serviceid') or rid}"
+            c.put(f"{base}[{i}].id", rid, doc=doc)
+            c.put(f"{base}[{i}].uri", uri, doc=doc)
+            c.put(f"{base}[{i}].predicates[0]", f"Path={path}", doc=doc)
+            filters = []
+            strip = r.get("stripprefix", "true").lower() != "false"
+            n = (_strip_prefix_count(r.get("path") or f"/{rid}/**") if strip else 0) + (_strip_prefix_count(prefix) if global_strip and prefix else 0)
+            if n:
+                filters.append(f"StripPrefix={n}")
+            sens = r.get("sensitiveheaders", sensitive)
+            hdrs = ["Cookie", "Set-Cookie", "Authorization"] if sens is None else [h.strip() for h in sens.split(",") if h.strip()]
+            for h in hdrs:
+                filters.append(("RemoveResponseHeader=" if h.lower() == "set-cookie" else "RemoveRequestHeader=") + h)
+            for j, fl in enumerate(filters):
+                c.put(f"{base}[{i}].filters[{j}]", fl, doc=doc)
+            if uri.startswith("lb://"):
+                for bf in build_files(root):
+                    bt = read(bf) or ""
+                    if "gateway-server-webmvc" in bt:
+                        write_if_changed(bf, bt, build_add_dep(bf, bt, "org.springframework.cloud", "spring-cloud-starter-loadbalancer"))
+        for k, v in glob.items():
+            if k not in ("zuul.prefix", "zuul.stripprefix", "zuul.sensitiveheaders"):
+                todo.append(f"{rel(f, root)}: dropped Zuul setting {k}={v} - no direct Gateway MVC equivalent")
+        if c.save():
+            changes.append(f"{rel(f, root)}: {len(routes)} Zuul route(s) -> spring.cloud.gateway.server.webmvc.routes "
+                           f"(StripPrefix and Zuul's default sensitive-header stripping kept)")
+    if zuul_dep and not any("routes" in c for c in changes):
+        todo.append("Zuul auto-routed every discovered service (/<serviceId>/**). Gateway MVC does not: add explicit routes for each service you exposed.")
+    return changes, todo
+
+
+def cm_netflix(root: Path):
+    c1, t1 = cm_hystrix(root)
+    c2, t2 = cm_ribbon(root)
+    c3, t3 = cm_zuul(root)
+    return c1 + c2 + c3, t1 + t2 + t3
+
+
+# ---- legacy spring-security-oauth2 ------------------------------------------
+LEGACY_OAUTH_DEP = lambda g, a: (g or "") in ("org.springframework.security.oauth", "org.springframework.security.oauth.boot") or a == "spring-security-jwt"
+
+JWT_CONVERTER_BEAN = """
+    /**
+     * Added by spring-migrate: tokens from spring-security-oauth2 carry roles in an "authorities" claim; Spring Security 6
+     * only maps "scope". This keeps both so existing hasRole/hasAuthority rules keep working.
+     */
+    @Bean
+    public JwtAuthenticationConverter jwtAuthenticationConverter() {
+        JwtGrantedAuthoritiesConverter scopes = new JwtGrantedAuthoritiesConverter();
+        JwtGrantedAuthoritiesConverter authorities = new JwtGrantedAuthoritiesConverter();
+        authorities.setAuthoritiesClaimName("authorities");
+        authorities.setAuthorityPrefix("");
+        JwtAuthenticationConverter converter = new JwtAuthenticationConverter();
+        converter.setJwtGrantedAuthoritiesConverter(jwt -> {
+            Collection<GrantedAuthority> all = new ArrayList<>(scopes.convert(jwt));
+            if (jwt.hasClaim("authorities")) {
+                all.addAll(authorities.convert(jwt));
+            }
+            return all;
+        });
+        return converter;
+    }
+"""
+
+HMAC_DECODER_BEAN = """
+    /** Added by spring-migrate: the legacy resource server verified HMAC-signed JWTs with a shared key. */
+    @Bean
+    public JwtDecoder jwtDecoder(@Value("${app.legacy-oauth2.jwt.hmac-secret}") String secret) {
+        return NimbusJwtDecoder.withSecretKey(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256")).build();
+    }
+"""
+
+
+def _legacy_rs_mode(root: Path) -> tuple[str, list[str]]:
+    """Map security.oauth2.resource.* to spring.security.oauth2.resourceserver.*; returns ('jwt'|'opaque'|'hmac', changes)."""
+    changes, mode = [], "jwt"
+    for f in config_files(root):
+        c = ConfigFile(f)
+        ent = {e["key"].replace("-", "").lower(): e for e in c.keys_matching(r"security\.oauth2\.")}
+        if not ent:
+            continue
+        doc = 0
+        def take(k):
+            nonlocal doc
+            e = ent.get(k)
+            if e:
+                doc = c.remove(e["key"]) or doc
+                return e["value"]
+            return None
+        jwk = take("security.oauth2.resource.jwk.keyseturi")
+        keyval = take("security.oauth2.resource.jwt.keyvalue")
+        keyuri = take("security.oauth2.resource.jwt.keyuri")
+        info = take("security.oauth2.resource.tokeninfouri")
+        rid = take("security.oauth2.resource.id") or take("security.oauth2.resource.resourceid")
+        cid = take("security.oauth2.client.clientid")
+        csec = take("security.oauth2.client.clientsecret")
+        tok = take("security.oauth2.client.accesstokenuri")
+        auth = take("security.oauth2.client.userauthorizationuri")
+        scope = take("security.oauth2.client.scope")
+        grant = take("security.oauth2.client.granttype")
+        userinfo = take("security.oauth2.resource.userinfouri")
+        take("security.oauth2.resource.prefertokeninfo")
+        rs = "spring.security.oauth2.resourceserver"
+        if jwk:
+            c.put(f"{rs}.jwt.jwk-set-uri", jwk, doc=doc)
+        elif keyval and "BEGIN PUBLIC KEY" in keyval:
+            pem = f.parent / "legacy-oauth2-public.pem"
+            pem.write_text(keyval.replace("\\n", "\n").strip() + "\n", encoding="utf-8")
+            c.put(f"{rs}.jwt.public-key-location", f"classpath:{pem.name}", doc=doc)
+        elif keyval:
+            mode = "hmac"
+            c.put("app.legacy-oauth2.jwt.hmac-secret", keyval, doc=doc)
+        elif keyuri:
+            c.put(f"{rs}.jwt.jwk-set-uri", re.sub(r"/oauth/token_key/?$", "/oauth2/jwks", keyuri), doc=doc,
+                  comment="spring-migrate: legacy /oauth/token_key is not JWKS; this assumes the authorization server was migrated to Spring Authorization Server")
+        elif info:
+            mode = "opaque"
+            c.put(f"{rs}.opaquetoken.introspection-uri", info, doc=doc)
+            if cid:
+                c.put(f"{rs}.opaquetoken.client-id", cid, doc=doc)
+            if csec:
+                c.put(f"{rs}.opaquetoken.client-secret", csec, doc=doc)
+        if rid and mode != "opaque":
+            c.put(f"{rs}.jwt.audiences", rid, doc=doc)
+        if tok or auth:
+            reg, prov = "spring.security.oauth2.client.registration.legacy", "spring.security.oauth2.client.provider.legacy"
+            if cid:
+                c.put(f"{reg}.client-id", cid, doc=doc)
+            if csec:
+                c.put(f"{reg}.client-secret", csec, doc=doc)
+            c.put(f"{reg}.provider", "legacy", doc=doc)
+            c.put(f"{reg}.authorization-grant-type", grant or ("authorization_code" if auth else "client_credentials"), doc=doc)
+            if scope:
+                c.put(f"{reg}.scope", scope, doc=doc)
+            if auth:
+                c.put(f"{reg}.redirect-uri", "{baseUrl}/login/oauth2/code/{registrationId}", doc=doc)
+                c.put(f"{prov}.authorization-uri", auth, doc=doc)
+            if tok:
+                c.put(f"{prov}.token-uri", tok, doc=doc)
+            if userinfo:
+                c.put(f"{prov}.user-info-uri", userinfo, doc=doc)
+                c.put(f"{prov}.user-name-attribute", "name", doc=doc)
+        if c.save():
+            changes.append(f"{rel(f, root)}: security.oauth2.* -> spring.security.oauth2.* ({mode})")
+    return mode, changes
+
+
+def _rs_chain_method(body: str, mode: str) -> str:
+    dsl = {"jwt": "oauth2.jwt(Customizer.withDefaults())", "hmac": "oauth2.jwt(Customizer.withDefaults())",
+           "opaque": "oauth2.opaqueToken(Customizer.withDefaults())"}[mode]
+    body = body.rstrip()
+    if body and not body.endswith((";", "}")):
+        body += ";"
+    return ("@Bean\n    public SecurityFilterChain resourceServerSecurityFilterChain(HttpSecurity http) throws Exception {\n"
+            + (body + "\n" if body.strip() else "        http.authorizeRequests().anyRequest().authenticated();\n")
+            + f"        http.oauth2ResourceServer(oauth2 -> {dsl});\n        return http.build();\n    }}")
+
+
+def cm_legacy_oauth2(root: Path) -> tuple[list[str], list[str]]:
+    changes, todo = [], []
+    srcs = [p for p in java_sources(root) if re.search(r"org\.springframework\.security\.oauth2\.(?:config|provider|client)|@EnableOAuth2Sso|#oauth2\.", read(p) or "")]
+    has_rs = any("ResourceServerConfigurerAdapter" in (read(p) or "") or "@EnableResourceServer" in (read(p) or "") for p in srcs)
+    has_as = any("AuthorizationServerConfigurerAdapter" in (read(p) or "") or "@EnableAuthorizationServer" in (read(p) or "") for p in srcs)
+    has_sso = any("@EnableOAuth2Sso" in (read(p) or "") or "OAuth2RestTemplate" in (read(p) or "") for p in srcs)
+    if not (srcs or any(LEGACY_OAUTH_DEP(g, a) for bf in build_files(root) for _, _, g, a in pom_dependency_blocks(read(bf) or ""))):
+        return [], []
+    mode = "jwt"
+    if has_rs or has_sso:
+        mode, cc = _legacy_rs_mode(root)
+        changes += cc
+    for p in srcs:
+        t = read(p) or ""
+        new = t
+        # SpEL: #oauth2.hasScope('x') -> hasAuthority('SCOPE_x')
+        new = re.sub(r"#oauth2\.hasScope\(\s*'([^']+)'\s*\)", r"hasAuthority('SCOPE_\1')", new)
+        new = re.sub(r"#oauth2\.hasAnyScope\(([^)]*)\)", lambda m: "hasAnyAuthority(" + re.sub(r"'([^']+)'", r"'SCOPE_\1'", m.group(1)) + ")", new)
+        new = re.sub(r"#oauth2\.(?:isOAuth|isUser|isClient)\(\)", "isAuthenticated()", new)
+        if "ResourceServerConfigurerAdapter" in new:
+            new, _ = remove_annotation(new, "EnableResourceServer")
+            new = re.sub(r"\s+extends\s+ResourceServerConfigurerAdapter\b", "", new)
+            # drop configure(ResourceServerSecurityConfigurer)
+            for m in reversed(list(re.finditer(r"(?:@Override\s+)?public\s+void\s+configure\s*\(\s*(?:final\s+)?ResourceServerSecurityConfigurer\s+\w+\s*\)(?:\s*throws\s+[\w.]+)?\s*\{", new))):
+                e = balanced(new, m.end() - 1, "{", "}")
+                body = new[m.end():e]
+                rid = re.search(r"\.resourceId\(\s*\"([^\"]+)\"", body)
+                if rid:
+                    c = main_config(root, module_of(p, root))
+                    if c.get("spring.security.oauth2.resourceserver.jwt.audiences") is None:
+                        c.put("spring.security.oauth2.resourceserver.jwt.audiences", rid.group(1))
+                        c.save()
+                if re.sub(r"\w+\.resourceId\([^)]*\)\s*;|\s", "", body):
+                    todo.append(f"{rel(p, root)}: ResourceServerSecurityConfigurer settings besides resourceId were dropped: {body.strip()[:120]}")
+                s = new.rfind("\n", 0, m.start()) + 1
+                new = new[:s] + new[e + 2:] if new[e + 1:e + 2] == "\n" else new[:s] + new[e + 1:]
+            m = re.search(r"(?:@Override\s+)?public\s+void\s+configure\s*\(\s*(?:final\s+)?HttpSecurity\s+(\w+)\s*\)(?:\s*throws\s+[\w.]+)?\s*\{", new)
+            if m:
+                e = balanced(new, m.end() - 1, "{", "}")
+                body = new[m.end():e].rstrip()
+                if m.group(1) != "http":
+                    body = re.sub(r"\b" + m.group(1) + r"\b", "http", body)
+                new = new[:m.start()] + _rs_chain_method(body.strip("\n"), mode) + new[e + 1:]
+            else:
+                cls = re.search(r"\bclass\s+\w+[^{]*\{", new)
+                new = new[:cls.end()] + "\n    " + _rs_chain_method("", mode) + "\n" + new[cls.end():]
+            if mode != "opaque" and "JwtAuthenticationConverter jwtAuthenticationConverter" not in new:
+                last = new.rstrip().rfind("}")
+                new = new[:last] + JWT_CONVERTER_BEAN + ("" if mode != "hmac" else HMAC_DECODER_BEAN) + new[last:]
+            imps = ["org.springframework.context.annotation.Bean", "org.springframework.security.config.Customizer",
+                    "org.springframework.security.web.SecurityFilterChain"]
+            if mode != "opaque":
+                imps += ["java.util.ArrayList", "java.util.Collection", "org.springframework.security.core.GrantedAuthority",
+                         "org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationConverter",
+                         "org.springframework.security.oauth2.server.resource.authentication.JwtGrantedAuthoritiesConverter"]
+            if mode == "hmac":
+                imps += ["java.nio.charset.StandardCharsets", "javax.crypto.spec.SecretKeySpec", "org.springframework.beans.factory.annotation.Value",
+                         "org.springframework.security.oauth2.jwt.JwtDecoder", "org.springframework.security.oauth2.jwt.NimbusJwtDecoder"]
+            for i in imps:
+                new = add_import(new, i)
+            new = remove_import(new, r"org\.springframework\.security\.oauth2\.config\.annotation\.web\.(?:configuration|configurers)\.[\w.]+")
+        if "@EnableOAuth2Sso" in new:
+            new, _ = remove_annotation(new, "EnableOAuth2Sso")
+            new = remove_import(new, r"org\.springframework\.boot\.autoconfigure\.security\.oauth2\.client\.EnableOAuth2Sso")
+            m = re.search(r"void\s+configure\s*\(\s*(?:final\s+)?HttpSecurity\s+(\w+)\s*\)(?:\s*throws\s+[\w.]+)?\s*\{", new)
+            if m and ".oauth2Login(" not in new:
+                new = new[:m.end()] + f"\n        {m.group(1)}.oauth2Login(Customizer.withDefaults());" + new[m.end():]
+                new = add_import(new, "org.springframework.security.config.Customizer")
+            elif not m:
+                todo.append(f"{rel(p, root)}: @EnableOAuth2Sso removed - add `.oauth2Login(Customizer.withDefaults())` to your SecurityFilterChain")
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: legacy spring-security-oauth2 -> Spring Security OAuth2 ({mode})")
+        if re.search(r"\bOAuth2RestTemplate\b|\bClientCredentialsResourceDetails\b", new):
+            todo.append(f"{rel(p, root)}: OAuth2RestTemplate - use RestClient/RestTemplate with OAuth2ClientHttpRequestInterceptor and an OAuth2AuthorizedClientManager")
+    for bf in list(build_files(root)):
+        t = read(bf) or ""
+        if has_as:
+            # the legacy server code still needs these jars to compile until cm_authorization_server replaces it
+            new = t
+            if has_rs:
+                new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-oauth2-resource-server")
+            if has_sso:
+                new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-oauth2-client")
+            write_if_changed(bf, t, new)
+            continue
+        new, removed = build_remove_deps(bf, t, LEGACY_OAUTH_DEP)
+        if not removed:
+            continue
+        if has_rs:
+            new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-oauth2-resource-server")
+        if has_sso:
+            new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-oauth2-client")
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: removed {', '.join(removed)}; added the Spring Security OAuth2 starter(s)")
+    if has_rs and has_as is False and changes:
+        todo.append("OAuth2 resource server: tokens are now validated by Spring Security (signature, exp, aud if configured). "
+                    "Legacy principals used the `user_name` claim; the new principal name is `sub`.")
+    return changes, todo
+
+def _call_args(seg: str, name: str) -> list[str] | None:
+    m = re.search(r"\." + name + r"\s*\(", seg)
+    if not m:
+        return None
+    k = m.end() - 1
+    e = balanced(seg, k)
+    return split_top_level(seg[k + 1:e]) if e != -1 else None
+
+
+LEGACY_GRANTS = {"client_credentials": "CLIENT_CREDENTIALS", "authorization_code": "AUTHORIZATION_CODE", "refresh_token": "REFRESH_TOKEN"}
+
+
+def _legacy_clients(body: str):
+    """Parse clients.inMemory().withClient(..)...and().withClient(..)... -> list of dicts."""
+    m = re.search(r"\.inMemory\s*\(\s*\)", body)
+    if not m:
+        return None
+    chain = body[m.end():]
+    end = chain.find(";")
+    chain = chain[:end] if end != -1 else chain
+    out = []
+    for seg in re.split(r"\.withClient\s*\(", chain)[1:]:
+        e = balanced("(" + seg, 0)
+        cid = seg[:e - 1].strip()
+        rest = seg[e:]
+        c = {"id": cid, "secret": None, "grants": [], "scopes": [], "redirects": [], "access": None, "refresh": None,
+             "auto": None, "authorities": []}
+        if (a := _call_args(rest, "secret")):
+            c["secret"] = a[0]
+        for key, call in (("grants", "authorizedGrantTypes"), ("scopes", "scopes"), ("redirects", "redirectUris"), ("authorities", "authorities")):
+            c[key] = [unquote_java(x) for x in (_call_args(rest, call) or [])]
+        if (a := _call_args(rest, "accessTokenValiditySeconds")):
+            c["access"] = a[0]
+        if (a := _call_args(rest, "refreshTokenValiditySeconds")):
+            c["refresh"] = a[0]
+        if (a := _call_args(rest, "autoApprove")):
+            c["auto"] = a
+        out.append(c)
+    return out
+
+
+def _sas_client(c: dict, encoder: bool, todo: list, where: str, opaque: bool) -> str:
+    sec = c["secret"]
+    if sec:
+        enc = re.match(r"\w+(?:\(\))?\.encode\s*\(\s*(\"[^\"]*\")\s*\)$", sec)
+        if enc:
+            sec = f"passwordEncoder.encode({enc.group(1)})" if encoder else '"{noop}' + unquote_java(enc.group(1)) + '"'
+    grants = []
+    for g in c["grants"]:
+        if g in LEGACY_GRANTS:
+            grants.append(LEGACY_GRANTS[g])
+        else:
+            todo.append(f"{where}: client {c['id']}: grant type `{g}` does not exist in OAuth 2.1 / Spring Authorization Server and was dropped "
+                        + ("(move clients to authorization_code + PKCE or client_credentials)" if g == "password" else ""))
+    L = [f"RegisteredClient.withId({c['id']})", f"                .clientId({c['id']})"]
+    if sec:
+        L.append(f"                .clientSecret({sec})")
+        L.append("                .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_BASIC)")
+        L.append("                .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_POST)")
+    else:
+        L.append("                .clientAuthenticationMethod(ClientAuthenticationMethod.NONE)")
+    for g in grants:
+        L.append(f"                .authorizationGrantType(AuthorizationGrantType.{g})")
+    for r in c["redirects"]:
+        L.append(f'                .redirectUri("{r}")')
+    for s in c["scopes"]:
+        L.append(f'                .scope("{s}")')
+    # spring-security-oauth2 defaults: access 12h, refresh 30d; consent unless autoApprove(true)
+    access = c["access"] or "43200"
+    refresh = c["refresh"] or "2592000"
+    fmt = "\n                        .accessTokenFormat(OAuth2TokenFormat.REFERENCE)" if opaque else ""
+    L.append(f"                .tokenSettings(TokenSettings.builder()\n                        .accessTokenTimeToLive(Duration.ofSeconds({access}))\n"
+             f"                        .refreshTokenTimeToLive(Duration.ofSeconds({refresh})){fmt}\n                        .build())")
+    auto = c["auto"]
+    consent = not (auto and auto[0].strip() == "true")
+    if auto and auto[0].strip() not in ("true", "false"):
+        todo.append(f"{where}: client {c['id']}: autoApprove({', '.join(auto)}) for some scopes only - consent is now required for all scopes")
+    if "AUTHORIZATION_CODE" in grants:
+        L.append(f"                .clientSettings(ClientSettings.builder().requireAuthorizationConsent({str(consent).lower()}).build())")
+    L.append("                .build()")
+    return "\n".join(L)
+
+
+# Spring Authorization Server 1.x (Boot 3.5) vs. Spring Security 7 (Boot 4), where the configurer moved into spring-security-config
+SAS1_CONFIGURER = "org.springframework.security.oauth2.server.authorization.config.annotation.web.configurers.OAuth2AuthorizationServerConfigurer"
+SAS7_CONFIGURER = "org.springframework.security.config.annotation.web.configurers.oauth2.server.authorization.OAuth2AuthorizationServerConfigurer"
+
+
+def fix_sas_configurer_package(root: Path) -> list[str]:
+    changes = []
+    old_pkg = SAS1_CONFIGURER.rsplit(".", 1)[0] + "."
+    new_pkg = SAS7_CONFIGURER.rsplit(".", 1)[0] + "."
+    for p in java_sources(root):
+        t = read(p) or ""
+        if old_pkg in t:
+            new = t.replace(old_pkg, new_pkg)
+            if write_if_changed(p, t, new):
+                changes.append(f"{rel(p, root)}: Authorization Server configurers -> Spring Security 7 package")
+    return changes
+
+
+SAS_IMPORTS = [
+    "java.time.Duration", "java.util.UUID", "org.springframework.context.annotation.Bean", "org.springframework.context.annotation.Configuration",
+    "org.springframework.core.Ordered", "org.springframework.core.annotation.Order", "org.springframework.http.MediaType",
+    "org.springframework.security.config.Customizer", "org.springframework.security.config.annotation.web.builders.HttpSecurity",
+    SAS1_CONFIGURER,
+    "org.springframework.security.oauth2.core.AuthorizationGrantType", "org.springframework.security.oauth2.core.ClientAuthenticationMethod",
+    "org.springframework.security.oauth2.server.authorization.client.InMemoryRegisteredClientRepository",
+    "org.springframework.security.oauth2.server.authorization.client.RegisteredClient",
+    "org.springframework.security.oauth2.server.authorization.client.RegisteredClientRepository",
+    "org.springframework.security.oauth2.server.authorization.settings.AuthorizationServerSettings",
+    "org.springframework.security.oauth2.server.authorization.settings.ClientSettings",
+    "org.springframework.security.oauth2.server.authorization.settings.OAuth2TokenFormat",
+    "org.springframework.security.oauth2.server.authorization.settings.TokenSettings",
+    "org.springframework.security.oauth2.server.authorization.token.JwtEncodingContext",
+    "org.springframework.security.oauth2.server.authorization.token.OAuth2TokenCustomizer",
+    "org.springframework.security.web.SecurityFilterChain",
+    "org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint",
+    "org.springframework.security.web.util.matcher.MediaTypeRequestMatcher",
+    "com.nimbusds.jose.jwk.JWKSet", "com.nimbusds.jose.jwk.source.ImmutableJWKSet", "com.nimbusds.jose.jwk.source.JWKSource",
+    "com.nimbusds.jose.proc.SecurityContext",
+]
+
+
+def _sas_class(pkg: str, cls: str, fields: list[str], clients: list[str], key: dict, encoder: bool, default_chain: bool) -> str:
+    imps = list(SAS_IMPORTS)
+    if encoder:
+        imps.append("org.springframework.security.crypto.password.PasswordEncoder")
+    if key["kind"] == "hmac":
+        imps += ["com.nimbusds.jose.JWSAlgorithm", "com.nimbusds.jose.jwk.OctetSequenceKey", "java.nio.charset.StandardCharsets",
+                 "javax.crypto.spec.SecretKeySpec", "org.springframework.security.oauth2.jose.jws.MacAlgorithm"]
+    else:
+        imps += ["com.nimbusds.jose.jwk.RSAKey", "java.security.KeyPair", "java.security.interfaces.RSAPrivateKey", "java.security.interfaces.RSAPublicKey"]
+        if key["kind"] == "keystore":
+            imps += ["java.io.InputStream", "java.security.KeyStore", "java.security.PrivateKey", "org.springframework.core.io.ClassPathResource"]
+        else:
+            imps += ["java.security.KeyPairGenerator"]
+    if any("@Value" in f for f in fields):
+        imps.append("org.springframework.beans.factory.annotation.Value")
+    out = [f"package {pkg};", ""] + [f"import {i};" for i in sorted(set(imps))] + ["",
+        "/**",
+        " * Migrated by spring-migrate from spring-security-oauth2 (@EnableAuthorizationServer) to Spring Authorization Server.",
+        " * The legacy endpoint paths (/oauth/token, /oauth/authorize, /oauth/check_token) are kept so clients keep working;",
+        " * token lifetimes default to the legacy values (access 12h, refresh 30 days) unless the client set them.",
+        " */",
+        "@Configuration",
+        f"public class {cls} {{"]
+    for f in fields:
+        out += ["", "    " + f.strip()]
+    out += ["",
+        "    @Bean",
+        "    @Order(Ordered.HIGHEST_PRECEDENCE)",
+        "    public SecurityFilterChain authorizationServerSecurityFilterChain(HttpSecurity http) throws Exception {",
+        "        OAuth2AuthorizationServerConfigurer authorizationServer = new OAuth2AuthorizationServerConfigurer();",
+        "        http.securityMatcher(authorizationServer.getEndpointsMatcher())",
+        "                .with(authorizationServer, Customizer.withDefaults())",
+        "                .authorizeHttpRequests(authorize -> authorize.anyRequest().authenticated())",
+        "                .csrf(csrf -> csrf.ignoringRequestMatchers(authorizationServer.getEndpointsMatcher()))",
+        "                .exceptionHandling(exceptions -> exceptions.defaultAuthenticationEntryPointFor(",
+        "                        new LoginUrlAuthenticationEntryPoint(\"/login\"), new MediaTypeRequestMatcher(MediaType.TEXT_HTML)));",
+        "        return http.build();",
+        "    }"]
+    if default_chain:
+        out += ["",
+            "    /** Login for the authorization-code flow (the legacy server relied on Boot's default security). */",
+            "    @Bean",
+            "    @Order(Ordered.HIGHEST_PRECEDENCE + 1)",
+            "    public SecurityFilterChain defaultSecurityFilterChain(HttpSecurity http) throws Exception {",
+            "        http.authorizeHttpRequests(authorize -> authorize.anyRequest().authenticated())",
+            "                .formLogin(Customizer.withDefaults())",
+            "                .httpBasic(Customizer.withDefaults());",
+            "        return http.build();",
+            "    }"]
+    out += ["",
+        "    @Bean",
+        f"    public RegisteredClientRepository registeredClientRepository({'PasswordEncoder passwordEncoder' if encoder else ''}) {{",
+        "        return new InMemoryRegisteredClientRepository(" + ",\n                ".join(clients) + ");",
+        "    }",
+        ""]
+    if key["kind"] == "hmac":
+        out += ["    /** Same HMAC key the legacy JwtAccessTokenConverter signed with, so existing resource servers still verify tokens. */",
+            "    @Bean",
+            "    public JWKSource<SecurityContext> jwkSource() {",
+            f"        byte[] secret = ({key['expr']}).getBytes(StandardCharsets.UTF_8);",
+            "        OctetSequenceKey jwk = new OctetSequenceKey.Builder(new SecretKeySpec(secret, \"HmacSHA256\"))",
+            "                .keyID(UUID.nameUUIDFromBytes(secret).toString()).algorithm(JWSAlgorithm.HS256).build();",
+            "        return new ImmutableJWKSet<>(new JWKSet(jwk));",
+            "    }",
+            "",
+            "    @Bean",
+            "    public OAuth2TokenCustomizer<JwtEncodingContext> legacyTokenCustomizer() {",
+            "        return context -> {",
+            "            context.getJwsHeader().algorithm(MacAlgorithm.HS256);",
+            "            context.getClaims().claim(\"client_id\", context.getRegisteredClient().getClientId());",
+            "        };",
+            "    }"]
+    else:
+        if key["kind"] == "keystore":
+            out += ["    /** Same key pair the legacy server loaded from its keystore. */",
+                "    @Bean",
+                "    public JWKSource<SecurityContext> jwkSource() throws Exception {",
+                "        KeyStore keyStore = KeyStore.getInstance(\"" + key.get("type", "JKS") + "\");",
+                f"        try (InputStream in = new ClassPathResource({key['path']}).getInputStream()) {{",
+                f"            keyStore.load(in, ({key['storepass']}).toCharArray());",
+                "        }",
+                f"        PrivateKey privateKey = (PrivateKey) keyStore.getKey({key['alias']}, ({key['keypass']}).toCharArray());",
+                f"        KeyPair keyPair = new KeyPair(keyStore.getCertificate({key['alias']}).getPublicKey(), privateKey);"]
+        else:
+            out += ["    /** TODO(spring-migrate): generated key pair - tokens become invalid on restart. Load a persistent key (keystore/vault). */",
+                "    @Bean",
+                "    public JWKSource<SecurityContext> jwkSource() throws Exception {",
+                "        KeyPairGenerator generator = KeyPairGenerator.getInstance(\"RSA\");",
+                "        generator.initialize(2048);",
+                "        KeyPair keyPair = generator.generateKeyPair();"]
+        out += ["        RSAKey rsaKey = new RSAKey.Builder((RSAPublicKey) keyPair.getPublic()).privateKey((RSAPrivateKey) keyPair.getPrivate())",
+            "                .keyID(UUID.randomUUID().toString()).build();",
+            "        return new ImmutableJWKSet<>(new JWKSet(rsaKey));",
+            "    }",
+            "",
+            "    @Bean",
+            "    public OAuth2TokenCustomizer<JwtEncodingContext> legacyTokenCustomizer() {",
+            "        return context -> context.getClaims().claim(\"client_id\", context.getRegisteredClient().getClientId());",
+            "    }"]
+    out += ["",
+        "    @Bean",
+        "    public AuthorizationServerSettings authorizationServerSettings() {",
+        "        return AuthorizationServerSettings.builder()",
+        "                .tokenEndpoint(\"/oauth/token\")",
+        "                .authorizationEndpoint(\"/oauth/authorize\")",
+        "                .tokenIntrospectionEndpoint(\"/oauth/check_token\")",
+        "                .tokenRevocationEndpoint(\"/oauth/revoke\")",
+        "                .build();",
+        "    }",
+        "}", ""]
+    return "\n".join(out)
+
+
+def cm_authorization_server(root: Path) -> tuple[list[str], list[str]]:
+    """spring-security-oauth2 AuthorizationServerConfigurerAdapter -> Spring Authorization Server configuration."""
+    changes, todo = [], []
+    srcs = list(java_sources(root, main_only=True))
+    for p in srcs:
+        t = read(p) or ""
+        if "AuthorizationServerConfigurerAdapter" not in t:
+            continue
+        where = rel(p, root)
+        pkg = (re.search(r"^\s*package\s+([\w.]+)\s*;", t, re.M) or [None, ""])[1]
+        cls = re.search(r"\bclass\s+(\w+)", t).group(1)
+        m = re.search(r"void\s+configure\s*\(\s*(?:final\s+)?ClientDetailsServiceConfigurer\s+(\w+)\s*\)[^{]*\{", t)
+        body = t[m.end():balanced(t, m.end() - 1, "{", "}")] if m else ""
+        clients = _legacy_clients(body)
+        if clients is None:
+            todo.append(f"{where}: clients are not configured with clients.inMemory() (JDBC/custom ClientDetailsService) - "
+                        f"create a JdbcRegisteredClientRepository with the Spring Authorization Server schema and migrate the rows")
+            continue
+        # signing key
+        key = {"kind": "rsa"}
+        sk = re.search(r"\.setSigningKey\s*\(\s*([^;]+?)\s*\)\s*;", t)
+        ks = re.search(r"new\s+KeyStoreKeyFactory\s*\(\s*new\s+ClassPathResource\s*\(\s*(\"[^\"]+\")\s*\)\s*,\s*(.+?)\.toCharArray\(\)\s*\)\s*"
+                       r"\.getKeyPair\s*\(\s*(\"[^\"]+\")\s*(?:,\s*(.+?)\.toCharArray\(\))?\s*\)", t, re.S)
+        if ks:
+            key = {"kind": "keystore", "path": ks.group(1), "storepass": ks.group(2), "alias": ks.group(3), "keypass": ks.group(4) or ks.group(2),
+                   "type": "PKCS12" if ks.group(1).lower().endswith((".p12", ".pfx")) else "JKS"}
+        elif sk and "BEGIN" not in sk.group(1):
+            key = {"kind": "hmac", "expr": sk.group(1)}
+        elif sk:
+            todo.append(f"{where}: PEM signing key - load it into an RSAKey for the JWKSource (generated key used for now)")
+        else:
+            todo.append(f"{where}: no persistent signing key found - the generated JWKSource uses an in-memory RSA key")
+        opaque = "JwtAccessTokenConverter" not in t
+        fields = [f.group(0) for f in re.finditer(r"@Value\s*\(\s*\"[^\"]*\"\s*\)\s*(?:private|protected|public)?\s*[\w.<>]+\s+\w+\s*;", t)]
+        encoder = any(re.search(r"\bPasswordEncoder\s+\w+\s*\(", read(x) or "") for x in srcs) and any(
+            c["secret"] and ".encode(" in c["secret"] for c in clients)
+        others = [x for x in srcs if x != p and re.search(r"WebSecurityConfigurerAdapter|SecurityFilterChain", read(x) or "")]
+        if re.search(r"\.authenticationManager\s*\(", t):
+            todo.append(f"{where}: endpoints.authenticationManager(...) only served the password grant, which Spring Authorization Server does not support")
+        if re.search(r"JdbcTokenStore|RedisTokenStore|JdbcAuthorizationCodeServices|JdbcApprovalStore", t):
+            todo.append(f"{where}: persistent token/approval store - use JdbcOAuth2AuthorizationService / JdbcOAuth2AuthorizationConsentService")
+        if re.search(r"TokenEnhancer", t):
+            todo.append(f"{where}: TokenEnhancer - move the extra claims into the generated legacyTokenCustomizer bean")
+        client_src = [_sas_client(c, encoder, todo, where, opaque) for c in clients]
+        p.write_text(_sas_class(pkg, cls, fields, client_src, key, encoder, default_chain=not others), encoding="utf-8")
+        changes.append(f"{where}: @EnableAuthorizationServer -> Spring Authorization Server ({len(clients)} client(s), "
+                       f"{'HMAC key kept' if key['kind'] == 'hmac' else 'keystore key kept' if key['kind'] == 'keystore' else 'generated RSA key'}, "
+                       f"legacy /oauth/* endpoint paths kept)")
+        todo.append(f"{where}: /oauth/check_token now answers RFC 7662 introspection (active/scope/client_id), not the legacy check_token format")
+        for bf in build_files(root):
+            bt = read(bf) or ""
+            if not any(LEGACY_OAUTH_DEP(g, a) for _, _, g, a in pom_dependency_blocks(bt)) and "spring-security-oauth2" not in bt:
+                continue
+            new, removed = build_remove_deps(bf, bt, LEGACY_OAUTH_DEP)
+            # explicit version: the Boot 2.7 BOM does not manage it yet; fix_temporary_versions drops it after the 3.5 recipes
+            new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-oauth2-authorization-server", version=boot_version_for("3.5"))
+            if write_if_changed(bf, bt, new):
+                changes.append(f"{rel(bf, root)}: {', '.join(removed) or 'legacy oauth2'} -> spring-boot-starter-oauth2-authorization-server")
+    return changes, todo
+
+
+TEMP_VERSIONED = ("spring-boot-starter-oauth2-authorization-server", "spring-cloud-starter-gateway-server-webmvc")
+
+
+def fix_temporary_versions(root: Path) -> list[str]:
+    """Codemods pin a version on starters that the Boot 2.7 / Cloud 2021 BOMs do not know; once the BOMs manage them, drop it."""
+    changes = []
+    for bf in build_files(root):
+        t = read(bf) or ""
+        new = t
+        for art in TEMP_VERSIONED:
+            if bf.name == "pom.xml":
+                new = re.sub(r"(<artifactId>" + art + r"</artifactId>\s*)<version>[^<]*</version>\s*", r"\1", new)
+            else:
+                new = re.sub(r"(['\"][\w.\-]+:" + art + r"):[\w.\-]+(['\"])", r"\1\2", new)
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: dropped temporary versions now managed by the Boot/Cloud BOMs")
+    return changes
+
+
+# ---- OpenJPA API / annotations / properties in code / enhancer agent --------------------------------
+OPENJPA_TYPE_MAP = {
+    "OpenJPAEntityManager": "org.hibernate.Session", "OpenJPAEntityManagerSPI": "org.hibernate.Session",
+    "OpenJPAEntityManagerFactory": "org.hibernate.SessionFactory", "OpenJPAEntityManagerFactorySPI": "org.hibernate.SessionFactory",
+    "OpenJPAQuery": "org.hibernate.query.Query", "OpenJPAQuerySPI": "org.hibernate.query.Query",
+}
+# OpenJPA-only methods -> Hibernate Session equivalents (receiver is a variable of a converted type)
+# getObjectId works on detached instances in OpenJPA; Session.getIdentifier does not, PersistenceUnitUtil does.
+OPENJPA_METHOD_MAP = {"getObjectId": "getEntityManagerFactory().getPersistenceUnitUtil().getIdentifier", "evictAll": "clear"}
+OPENJPA_BULK = {"persistAll": "persist", "removeAll": "remove", "detachAll": "detach", "refreshAll": "refresh", "evictAll": "evict"}
+
+
+def _is_openjpa(text: str, simple: str) -> bool:
+    return re.search(r"import\s+org\.apache\.openjpa\.[\w.]*\b" + simple + r"\s*;|import\s+org\.apache\.openjpa\.persistence(?:\.jdbc)?\.\*\s*;|@org\.apache\.openjpa\.[\w.]*" + simple + r"\b", text) is not None
+
+
+def cm_openjpa_api(root: Path) -> tuple[list[str], list[str]]:
+    changes, todo = [], []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "org.apache.openjpa" not in t:
+            continue
+        new = t
+        vars_: dict[str, str] = {}
+        for oj, hib in OPENJPA_TYPE_MAP.items():
+            for m in re.finditer(r"\b" + oj + r"\b(?:<[^>]*>)?\s+(\w+)\s*[=;,)]", new):
+                vars_[m.group(1)] = hib
+        # X v = OpenJPAPersistence.cast(expr)  ->  X v = expr.unwrap(X.class)
+        def cast_sub(m):
+            decl_type, var = m.group(1), m.group(2)
+            k = m.end() - 1
+            e = balanced(new_holder[0], k)
+            arg = new_holder[0][k + 1:e].strip()
+            hib = OPENJPA_TYPE_MAP.get(re.sub(r"<.*", "", decl_type), "org.hibernate.Session")
+            simple = hib.rsplit(".", 1)[-1]
+            return f"{simple} {var} = {arg}.unwrap({simple}.class)", e + 1
+        new_holder = [new]
+        out, pos = [], 0
+        for m in re.finditer(r"\b(OpenJPA\w+(?:<[^>]*>)?)\s+(\w+)\s*=\s*OpenJPAPersistence\.cast\s*\(", new):
+            rep, end = cast_sub(m)
+            out.append(new[pos:m.start()] + rep)
+            pos = end
+        new = "".join(out) + new[pos:]
+        # inline OpenJPAPersistence.cast(em).foo(...)
+        def inline_sub(text):
+            res, pos = [], 0
+            for m in re.finditer(r"OpenJPAPersistence\.cast\s*\(", text):
+                if m.start() < pos:
+                    continue
+                k = m.end() - 1
+                e = balanced(text, k)
+                arg = text[k + 1:e].strip()
+                decl = re.search(r"\b(EntityManagerFactory|TypedQuery|Query|EntityManager)(?:<[^>]*>)?\s+" + re.escape(arg) + r"\b", text)
+                kind = decl.group(1) if decl else "EntityManager"
+                hib = {"EntityManagerFactory": "SessionFactory", "Query": "org.hibernate.query.Query", "TypedQuery": "org.hibernate.query.Query"}.get(kind, "Session")
+                res.append(text[pos:m.start()] + f"{arg}.unwrap({hib}.class)")
+                pos = e + 1
+            return "".join(res) + text[pos:]
+        new = inline_sub(new)
+        for var in vars_:
+            for oj, hib in OPENJPA_METHOD_MAP.items():
+                new = re.sub(r"\b" + re.escape(var) + r"\." + oj + r"\(", f"{var}.{hib}(", new)
+            for oj, hib in OPENJPA_BULK.items():
+                def bulk(m, hib=hib, var=var):
+                    k = m.end() - 1
+                    e = balanced(new_b[0], k)
+                    return None if e == -1 else (f"{new_b[0][k + 1:e].strip()}.forEach({var}::{hib})", e + 1)
+                new_b = [new]
+                res, pos = [], 0
+                for m in re.finditer(r"\b" + re.escape(var) + r"\." + oj + r"\s*\((?=\s*\w)", new):
+                    r = bulk(m)
+                    if r and m.start() >= pos:
+                        res.append(new[pos:m.start()] + r[0]); pos = r[1]
+                new = "".join(res) + new[pos:]
+        for oj, hib in sorted(OPENJPA_TYPE_MAP.items(), key=lambda kv: -len(kv[0])):
+            simple = hib.rsplit(".", 1)[-1]
+            if re.search(r"\b" + oj + r"\b", re.sub(r"^\s*import.*$", "", new, flags=re.M)):
+                q = simple if hib != "org.hibernate.query.Query" or not re.search(r"import\s+(?:javax|jakarta)\.persistence\.Query\s*;", new) else hib
+                new = re.sub(r"\b" + oj + r"\b(?!\s*;)", q, re.sub(r"^\s*import\s+org\.apache\.openjpa\.persistence\." + oj + r"\s*;\s*\n", "", new, flags=re.M))
+                if q == simple:
+                    new = add_import(new, hib)
+        for simple in ("Session", "SessionFactory"):
+            if re.search(r"\b" + simple + r"\.class\b", new):
+                new = add_import(new, "org.hibernate." + simple)
+        if "org.hibernate.query.Query.class" not in new and re.search(r"(?<![\w.])Query\.class", new) and "import org.hibernate.query.Query;" not in new \
+                and not re.search(r"import\s+(?:javax|jakarta)\.persistence\.Query\s*;", new):
+            new = add_import(new, "org.hibernate.query.Query")
+        new = remove_import(new, r"org\.apache\.openjpa\.persistence\.OpenJPAPersistence")
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: OpenJPA EntityManager/Query/Factory API -> Hibernate Session/Query/SessionFactory (unwrap)")
+        rest = re.findall(r"\b(OpenJPA\w+|FetchPlan|JDBCFetchPlan|FetchConfiguration)\b", re.sub(r"^\s*import.*$", "", new, flags=re.M))
+        if rest:
+            todo.append(f"{rel(p, root)}: OpenJPA API left without a mechanical equivalent: {', '.join(sorted(set(rest)))} "
+                        f"(FetchPlan -> EntityGraph hint `jakarta.persistence.fetchgraph`)")
+    return changes, todo
+
+
+def field_after(text: str, pos: int):
+    """The field or getter declared after pos: (type, name, start, end)."""
+    rest = text[pos:]
+    j = 0
+    while True:
+        m = re.match(r"\s*@[\w.]+", rest[j:])
+        if not m:
+            break
+        j += m.end()
+        k = j
+        while k < len(rest) and rest[k] in " \t":
+            k += 1
+        if k < len(rest) and rest[k] == "(":
+            e = balanced(rest, k)
+            j = e + 1
+    m = re.match(r"\s*((?:(?:private|protected|public|static|final|transient|volatile)\s+)*)([\w.]+(?:\s*<[^;=(){}]*>)?(?:\[\])*)\s+(\w+)\s*(=|;|\()", rest[j:])
+    if not m:
+        return None
+    return m.group(2).strip(), m.group(3), pos + j + m.start(1), pos + j + m.end()
+
+
+def _field_block(text: str, s: int):
+    """(block_start, field) for the annotation at s: block_start is the first line of the annotation block above the field."""
+    a = text.rfind("\n", 0, s) + 1
+    while a > 1:
+        ps = text.rfind("\n", 0, a - 1) + 1
+        prev = text[ps:a - 1].strip()
+        if prev.startswith("@") and not prev.endswith((";", "{", "}")):
+            a = ps
+        else:
+            break
+    return a, field_after(text, a)
+
+
+def _cut(blk: str, s: int, e: int) -> str:
+    ls = blk.rfind("\n", 0, s) + 1
+    le = blk.find("\n", e)
+    if blk[ls:s].strip() == "" and (le == -1 or blk[e:le].strip() == ""):
+        return blk[:ls] + (blk[le + 1:] if le != -1 else "")
+    return blk[:s] + blk[e:].lstrip(" ")
+
+
+def _add_ann_attr(text: str, s: int, e: int, args: str | None, attr: str) -> str:
+    """Add attr (e.g. 'updatable = false') to the annotation at text[s:e]."""
+    name = re.match(r"@[\w.]+", text[s:e]).group(0)
+    if args is None or not args.strip():
+        return text[:s] + f"{name}({attr})" + text[e:]
+    a = args.strip()
+    if "=" not in a.split(",")[0]:
+        a = "value = " + a
+    return text[:s] + f"{name}({a}, {attr})" + text[e:]
+
+
+def _converter_class(name: str, ftype: str, ext: str, fac: str | None, owner: str) -> str:
+    to_db = f"value.{ext}()" if "." not in ext else f"{ext}(value)"
+    if fac:
+        to_attr = f"{fac}(dbData)" if "." in fac else f"{owner}.{fac}(dbData)"
+    else:
+        to_attr = f"new {ftype}(dbData)"
+    return (f"\n    /** Added by spring-migrate: replaces OpenJPA @Externalizer(\"{ext}\")" + (f"/@Factory(\"{fac}\")" if fac else "") + ". */\n"
+            f"    @Converter\n    public static class {name} implements AttributeConverter<{ftype}, String> {{\n"
+            f"        @Override\n        public String convertToDatabaseColumn({ftype} value) {{\n"
+            f"            return value == null ? null : String.valueOf({to_db});\n        }}\n\n"
+            f"        @Override\n        public {ftype} convertToEntityAttribute(String dbData) {{\n"
+            f"            if (dbData == null) {{\n                return null;\n            }}\n"
+            f"            try {{\n                return {to_attr};\n            }} catch (Exception e) {{\n"
+            f"                throw new IllegalArgumentException(\"Cannot convert '\" + dbData + \"' to {ftype}\", e);\n            }}\n        }}\n    }}\n")
+
+
+def cm_openjpa_annotations(root: Path) -> tuple[list[str], list[str]]:
+    changes, todo = [], []
+    for p in java_sources(root, main_only=True):
+        t = read(p) or ""
+        if "org.apache.openjpa" not in t:
+            continue
+        new, pkg, what = t, persistence_pkg(t), []
+        owner = (re.search(r"\bclass\s+(\w+)", t) or [None, p.stem])[1]
+
+        pending_imports: list[str] = []
+
+        def imp(*names):  # deferred: adding an import mid-edit would shift the offsets being worked on
+            pending_imports.extend(n for n in names if n not in pending_imports)
+        # @DataCache
+        if _is_openjpa(new, "DataCache"):
+            for s, e, args in sorted(annotation_spans(new, "DataCache"), reverse=True):
+                off = re.search(r"enabled\s*=\s*false", args or "")
+                new = new[:s] + ("@Cacheable(false)" if off else "@Cacheable") + new[e:]
+                imp("Cacheable")
+                what.append("@DataCache -> @Cacheable")
+                if args and re.search(r"timeout|name", args):
+                    todo.append(f"{rel(p, root)}: @DataCache({args}) - configure expiry/region in your Hibernate L2 cache provider")
+        # @FetchGroup(s) -> @NamedEntityGraph(s)
+        if _is_openjpa(new, "FetchGroup") or _is_openjpa(new, "FetchGroups"):
+            for s, e, args in sorted(annotation_spans(new, "FetchGroup"), reverse=True):
+                gname = ann_attr(args, "name") or '""'
+                attrs = re.findall(r"@(?:[\w.]+\.)?FetchAttribute\s*\(\s*(?:name\s*=\s*)?(\"[^\"]+\")", args or "")
+                nodes = ", ".join(f"@NamedAttributeNode({a})" for a in attrs)
+                new = new[:s] + f"@NamedEntityGraph(name = {gname}, attributeNodes = {{{nodes}}})" + new[e:]
+            new = re.sub(r"@(?:org\.apache\.openjpa\.persistence\.)?FetchGroups\b", "@NamedEntityGraphs", new)
+            imp("NamedEntityGraph", "NamedAttributeNode")
+            if "@NamedEntityGraphs" in new:
+                imp("NamedEntityGraphs")
+            what.append("@FetchGroup -> @NamedEntityGraph")
+        # field-level annotations: one at a time, re-scanning after each edit
+        order = ["Externalizer", "Factory", "Persistent", "PersistentCollection", "PersistentMap", "ReadOnly", "Index",
+                 "ForeignKey", "Dependent", "ElementDependent", "KeyDependent"]
+        indexes, converters = [], []
+        for n in [x for x in order if _is_openjpa(t, x)]:
+            guard = 0
+            while guard < 500:
+                guard += 1
+                spans = list(annotation_spans(new, n))
+                if not spans:
+                    break
+                s0, e0, args = spans[-1]
+                a, fld = _field_block(new, s0)
+                if not fld:
+                    new = new[:s0] + new[e0:]  # not on a field: drop it, reported below
+                    todo.append(f"{rel(p, root)}: OpenJPA @{n} not on a field was removed - review")
+                    continue
+                ftype, fname, fs, _ = fld
+                blk, s1, e1 = new[a:fs], s0 - a, e0 - a
+                if n == "Persistent":
+                    keep = [x for x in split_top_level(args or "") if re.match(r"(fetch|optional)\s*=", x)]
+                    if [x for x in split_top_level(args or "") if x and x not in keep]:
+                        todo.append(f"{rel(p, root)}: @Persistent({args}) on {fname} - map cascade/mappedBy/embedded by hand")
+                    blk = blk[:s1] + ("@Basic(" + ", ".join(keep) + ")" if keep else "@Basic") + blk[e1:]
+                    imp("Basic")
+                elif n in ("PersistentCollection", "PersistentMap"):
+                    keep = [x for x in split_top_level(args or "") if re.match(r"fetch\s*=", x)]
+                    blk = blk[:s1] + ("@ElementCollection(" + ", ".join(keep) + ")" if keep else "@ElementCollection") + blk[e1:]
+                    imp("ElementCollection")
+                elif n == "ReadOnly":
+                    if args and "RESTRICT" in args:
+                        todo.append(f"{rel(p, root)}: @ReadOnly(RESTRICT) on {fname} threw on update; Hibernate silently skips the column")
+                    blk = _cut(blk, s1, e1)
+                    col = next(annotation_spans(blk, "Column"), None)
+                    if col and "updatable" not in (col[2] or ""):
+                        blk = _add_ann_attr(blk, col[0], col[1], col[2], "updatable = false")
+                    elif not col:
+                        ind = re.match(r"[ \t]*", new[a:]).group(0)
+                        blk = blk + f"@Column(updatable = false)\n{ind}" if blk.endswith(ind) else blk + "@Column(updatable = false) "
+                    imp("Column")
+                elif n == "Index":
+                    col = next(annotation_spans(blk, "Column"), None)
+                    cname = unquote_java(ann_attr(col[2], "name")) if col else None
+                    iname, uniq = ann_attr(args, "name"), ann_attr(args, "unique")
+                    indexes.append("@Index(" + (f"name = {iname}, " if iname else "") + f'columnList = "{cname or fname}"' + (f", unique = {uniq}" if uniq else "") + ")")
+                    blk = _cut(blk, s1, e1)
+                elif n == "ForeignKey":
+                    blk = _cut(blk, s1, e1)
+                    todo.append(f"{rel(p, root)}: OpenJPA @ForeignKey on {fname} removed (Hibernate creates FKs by default; name it with @JoinColumn(foreignKey=...))")
+                elif n in ("Dependent", "ElementDependent", "KeyDependent"):
+                    blk = _cut(blk, s1, e1)
+                    ra = next((x for k in ("OneToMany", "OneToOne") for x in annotation_spans(blk, k)), None)
+                    if ra and "orphanRemoval" not in (ra[2] or ""):
+                        blk = _add_ann_attr(blk, ra[0], ra[1], ra[2], "orphanRemoval = true")
+                    elif not ra:
+                        todo.append(f"{rel(p, root)}: @{n} on {fname} - add cascade = CascadeType.REMOVE by hand")
+                elif n == "Externalizer":
+                    ext = unquote_java(ann_attr(args, "value")) or "toString"
+                    fac = None
+                    fa = next(annotation_spans(blk, "Factory"), None) if _is_openjpa(t, "Factory") else None
+                    if fa:
+                        fac = unquote_java(ann_attr(fa[2], "value"))
+                    cname = fname[0].upper() + fname[1:] + "Converter"
+                    converters.append(_converter_class(cname, ftype, ext, fac, owner))
+                    blk = blk[:s1] + f"@Convert(converter = {owner}.{cname}.class)" + blk[e1:]
+                    if fa:
+                        fa = next(annotation_spans(blk, "Factory"))
+                        blk = _cut(blk, fa[0], fa[1])
+                    imp("Convert", "Converter", "AttributeConverter")
+                elif n == "Factory":
+                    todo.append(f"{rel(p, root)}: @Factory without @Externalizer on {fname} - write an AttributeConverter")
+                    blk = _cut(blk, s1, e1)
+                new = new[:a] + blk + new[fs:]
+                what.append(f"@{n}")
+        if indexes:
+            tab = next(annotation_spans(new, "Table"), None)
+            idx = ", ".join(indexes)
+            if tab and "indexes" not in (tab[2] or ""):
+                new = _add_ann_attr(new, tab[0], tab[1], tab[2], f"indexes = {{{idx}}}")
+            elif not tab:
+                cm = re.search(r"^([ \t]*)(?:public\s+|abstract\s+|final\s+)*class\s+" + owner + r"\b", new, re.M)
+                new = new[:cm.start()] + f"{cm.group(1)}@Table(indexes = {{{idx}}})\n" + new[cm.start():]
+            imp("Table", "Index")
+        if converters:
+            last = new.rstrip().rfind("}")
+            new = new[:last].rstrip("\n") + "\n" + "".join(converters) + new[last:]
+        new = remove_import(new, r"org\.apache\.openjpa\.persistence\.(?:jdbc\.)?(?:" + "|".join(
+            ["DataCache", "FetchGroups?", "FetchAttribute", "Externalizer", "Factory", "Persistent", "PersistentCollection",
+             "PersistentMap", "ReadOnly", "UpdateAction", "Index", "ForeignKey", "Dependent", "ElementDependent", "KeyDependent"]) + ")")
+        for n in pending_imports:
+            new = add_import(new, f"{pkg}.{n}")
+        new = drop_unused_imports(new, [i for i in java_imports(new) if i.startswith("org.apache.openjpa.")])
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: OpenJPA annotations -> JPA/Hibernate ({', '.join(sorted(set(what)))})")
+    return changes, todo
+
+
+def cm_openjpa_code_props(root: Path) -> tuple[list[str], list[str]]:
+    changes, todo = [], []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if '"openjpa.' not in t:
+            continue
+        lines, out, n = t.splitlines(keepends=True), [], 0
+        for line in lines:
+            m = re.search(r"\"(openjpa\.[\w.]+)\"\s*,\s*(\"(?:[^\"\\]|\\.)*\")?", line)
+            if m and line.rstrip().endswith(";"):
+                keep, note = map_openjpa_property(m.group(1), unquote_java(m.group(2)) or "")
+                if keep:
+                    line = line.replace(f'"{m.group(1)}"', f'"{keep[0][0]}"', 1)
+                    if keep[0][1] != (unquote_java(m.group(2)) or "") and m.group(2):
+                        line = line.replace(m.group(2), json.dumps(keep[0][1]), 1)
+                else:
+                    ind = re.match(r"[ \t]*", line).group(0)
+                    line = f"{ind}// TODO(spring-migrate): OpenJPA property dropped ({note}): {line.strip()}\n"
+                    todo.append(f"{rel(p, root)}: {m.group(1)} set in code: {note}")
+                n += 1
+            out.append(line)
+        new = "".join(out)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: {n} openjpa.* propert(ies) set in code translated/commented")
+    for f in config_files(root):
+        c = ConfigFile(f)
+        hit = False
+        for e in c.keys_matching(r"(?:spring\.jpa\.properties\.)?openjpa\."):
+            key = e["key"].replace("spring.jpa.properties.", "")
+            keep, note = map_openjpa_property(key, e["value"])
+            doc = c.remove(e["key"]); hit = True
+            for k, v in keep:
+                c.put("spring.jpa.properties." + k, v, doc=doc or 0)
+            if note:
+                todo.append(f"{rel(f, root)}: {e['key']}={e['value']}: {note}")
+        if hit and c.save():
+            changes.append(f"{rel(f, root)}: openjpa.* properties translated")
+    return changes, todo
+
+
+def cm_openjpa_agent(root: Path) -> tuple[list[str], list[str]]:
+    changes = []
+    agent = r"-javaagent:[^\s\"',]*openjpa[^\s\"',]*"
+    for p in walk(root):
+        if not (p.name.startswith("Dockerfile") or p.suffix in (".sh", ".cmd", ".bat", ".service", ".env", ".conf", ".yml", ".yaml")
+                or p.name in ("Jenkinsfile", "pom.xml", "build.gradle", "build.gradle.kts", "Procfile", "jvm.config")):
+            continue
+        t = read(p)
+        if not t or "openjpa" not in t.lower():
+            continue
+        new = re.sub(r"\"" + agent + r"\"\s*,\s*", "", t)            # exec-form JSON array element
+        new = re.sub(r"[ \t]*" + agent, "", new)
+        new = re.sub(r"(?im)^[ \t]*(?:COPY|ADD)\s+\S*openjpa[-\w.]*\.jar\s+\S+[ \t]*\r?\n", "", new)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: removed the OpenJPA enhancer javaagent")
+    return changes, []
+
+
+def openjpa_pooled_lo(root: Path) -> list[str]:
+    """OpenJPA's table sequence stores the next free value; Hibernate's pooled-lo optimizer reads it the same way."""
+    changes = []
+    prop = '<property name="hibernate.id.optimizer.pooled.preferred" value="pooled-lo"/>'
+    for f in walk(root):
+        if f.name == "persistence.xml":
+            t = read(f) or ""
+            if "pooled.preferred" in t or "<properties>" not in t:
+                continue
+            new = re.sub(r"([ \t]*)<properties>[ \t]*\n", lambda m: f"{m.group(0)}{m.group(1)}  {prop}\n", t, count=1)
+            if write_if_changed(f, t, new):
+                changes.append(f"{rel(f, root)}: hibernate.id.optimizer.pooled.preferred=pooled-lo (matches OpenJPA sequence semantics)")
+    for f in config_files(root, include_test=False):
+        c = ConfigFile(f)
+        if c.get("spring.jpa.properties.hibernate.id.optimizer.pooled.preferred") is None and any("data-jpa" in (read(b) or "") for b in build_files(root)):
+            c.put("spring.jpa.properties.hibernate.id.optimizer.pooled.preferred", "pooled-lo")
+            if c.save():
+                changes.append(f"{rel(f, root)}: hibernate.id.optimizer.pooled.preferred=pooled-lo")
+        break
+    return changes
+
+# --------------------------------------------------------------------------- #
+# Post-fixers that run after the OpenRewrite recipes of a stage
+# --------------------------------------------------------------------------- #
+def fix_quoted_properties(root: Path, base_rev: str | None) -> list[str]:
+    """OpenRewrite writes some new .properties values as "..." (e.g. springdoc.group-configs). In .properties the quotes
+    become part of the value. Unquote values on lines this stage added."""
+    changes = []
+    for f in config_files(root):
+        if f.suffix != ".properties":
+            continue
+        t = read(f) or ""
+        before = ""
+        if base_rev:
+            r = subprocess.run(["git", "show", f"{base_rev}:{rel(f, root)}"], cwd=root, capture_output=True, text=True)
+            before = r.stdout if r.returncode == 0 else ""
+        old_lines = set(before.splitlines())
+        out, n = [], 0
+        for line in t.splitlines():
+            m = re.match(r'^(\s*[^#!\s][^=:]*?\s*[=:]\s*)"(.*)"\s*$', line)
+            if m and line not in old_lines and (base_rev or re.match(r"\s*(springdoc|logging\.pattern)\.", line)):
+                line = m.group(1) + m.group(2)
+                n += 1
+            out.append(line)
+        if n:
+            f.write_text("\n".join(out) + ("\n" if t.endswith("\n") else ""), encoding="utf-8")
+            changes.append(f"{rel(f, root)}: unquoted {n} value(s) that OpenRewrite wrote with literal quotes")
+    return changes
+
+
+def fix_springdoc_leftovers(root: Path) -> list[str]:
+    changes = []
+    srcs = list(java_sources(root))
+    has_openapi_bean = any(re.search(r"\bOpenAPI\s+\w+\s*\(", read(p) or "") for p in srcs)
+    for p in srcs:
+        t = read(p) or ""
+        new = re.sub(r"\"/v2/api-docs(?:/\*\*)?\"", '"/v3/api-docs/**"', t)
+        if not has_openapi_bean and "io.swagger.v3.oas.models.info.Info" in new and "@Configuration" in new:
+            m = re.search(r"(?:private|protected|public)?\s*(?:static\s+)?Info\s+(\w+)\s*\(\s*\)\s*\{", new)
+            if m:
+                last = new.rstrip().rfind("}")
+                bean = (f"\n    /** Added by spring-migrate: Springfox's Docket.apiInfo(...) became springdoc's OpenAPI bean. */\n"
+                        f"    @Bean\n    public OpenAPI openApi() {{\n        return new OpenAPI().info({m.group(1)}());\n    }}\n")
+                new = new[:last].rstrip("\n") + "\n" + bean + new[last:]
+                new = add_import(new, "io.swagger.v3.oas.models.OpenAPI")
+                new = add_import(new, "org.springframework.context.annotation.Bean")
+                has_openapi_bean = True
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: springdoc follow-ups (OpenAPI info bean / /v3/api-docs paths)")
+    return changes
+
+
+def fix_httpclient5_checked(root: Path) -> list[str]:
+    """HttpClient 5's EntityUtils.toString throws the checked ParseException (unchecked in 4.x). Route calls through a
+    helper that rethrows it as IOException, which callers of the 4.x API already handle."""
+    changes = []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "org.apache.hc.core5.http.io.entity.EntityUtils" not in t or "EntityUtils.toString(" not in t or "ParseException" in t:
+            continue
+        arities = set()
+        def sub(m):
+            k = m.end() - 1
+            e = balanced(t, k)
+            args = split_top_level(t[k + 1:e])
+            arities.add("1" if len(args) == 1 else ("charset" if re.search(r"Charset|StandardCharsets", args[1]) else "string"))
+            return "entityToString("
+        new = re.sub(r"(?<![\w.])EntityUtils\.toString\s*\(", sub, t)
+        helpers = []
+        for a in sorted(arities):
+            params, call = {"1": ("org.apache.hc.core5.http.HttpEntity entity", "entity"),
+                            "charset": ("org.apache.hc.core5.http.HttpEntity entity, java.nio.charset.Charset charset", "entity, charset"),
+                            "string": ("org.apache.hc.core5.http.HttpEntity entity, String charset", "entity, charset")}[a]
+            helpers.append(f"\n    /** Added by spring-migrate: HttpClient 5 made ParseException checked; HttpClient 4 callers expect IOException. */\n"
+                           f"    private static String entityToString({params}) throws java.io.IOException {{\n"
+                           f"        try {{\n            return EntityUtils.toString({call});\n"
+                           f"        }} catch (org.apache.hc.core5.http.ParseException e) {{\n            throw new java.io.IOException(e);\n        }}\n    }}\n")
+        last = new.rstrip().rfind("}")
+        new = new[:last].rstrip("\n") + "\n" + "".join(helpers) + new[last:]
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: HttpClient 5 checked ParseException handled (EntityUtils.toString helper)")
+    return changes
+
+
+def fix_boot4_aspectj(root: Path, stage_rev: str | None) -> list[str]:
+    """Boot 4 replaced spring-boot-starter-aop with spring-boot-starter-aspectj; the OpenRewrite 4.0 recipe removes the old
+    starter without adding the new one, which silently disables @Aspect / Resilience4j / @Retryable annotations."""
+    changes = []
+    needs_aop = any(re.search(r"@Aspect\b|io\.github\.resilience4j\.\w+\.annotation|@EnableAspectJAutoProxy|@Retryable", read(p) or "")
+                    for p in java_sources(root, main_only=True))
+    for bf in build_files(root):
+        t = read(bf) or ""
+        had = "spring-boot-starter-aop" in t
+        if stage_rev and not had:
+            r = subprocess.run(["git", "show", f"{stage_rev}:{rel(bf, root)}"], cwd=root, capture_output=True, text=True)
+            had = r.returncode == 0 and "spring-boot-starter-aop" in r.stdout
+        if not (had or (needs_aop and "spring-boot-starter" in t)):
+            continue
+        new = re.sub(r"spring-boot-starter-aop\b", "spring-boot-starter-aspectj", t)
+        new = build_add_dep(bf, new, "org.springframework.boot", "spring-boot-starter-aspectj")
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: spring-boot-starter-aop -> spring-boot-starter-aspectj (Boot 4; keeps @Aspect/Resilience4j annotations working)")
+    return changes
+
+
+HTTPTRACE_JAVA = [
+    ("org.springframework.boot.actuate.trace.http.InMemoryHttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.InMemoryHttpExchangeRepository"),
+    ("org.springframework.boot.actuate.trace.http.HttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository"),
+    ("org.springframework.boot.actuate.trace.http.HttpTrace", "org.springframework.boot.actuate.web.exchanges.HttpExchange"),
+    ("org.springframework.boot.actuate.trace.http.Include", "org.springframework.boot.actuate.web.exchanges.Include"),
+]
+
+
+def fix_httptrace(root: Path) -> list[str]:
+    changes = []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "HttpTrace" not in t and "actuate.trace.http" not in t:
+            continue
+        new = t
+        for a, b in HTTPTRACE_JAVA:
+            new = new.replace(a, b)
+        for a, b in (("InMemoryHttpTraceRepository", "InMemoryHttpExchangeRepository"), ("HttpTraceRepository", "HttpExchangeRepository"),
+                     ("HttpTrace", "HttpExchange")):
+            new = re.sub(r"\b" + a + r"\b", b, new)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: HttpTrace* -> HttpExchange* (actuator httpexchanges)")
+    for f in config_files(root):
+        c = ConfigFile(f)
+        hit = False
+        for e in c.keys_matching(r"management\.trace\.http\.|management\.endpoint\.httptrace\.|management\.endpoints\.web\.exposure\.(include|exclude)$"):
+            k, v = e["key"], e["value"]
+            nk = k.replace("management.trace.http.", "management.httpexchanges.recording.").replace("management.endpoint.httptrace.", "management.endpoint.httpexchanges.")
+            nv = re.sub(r"\bhttptrace\b", "httpexchanges", v) if "exposure" in k else v
+            if (nk, nv) != (k, v):
+                doc = c.remove(k); hit = True
+                c.put(nk, nv, doc=doc or 0)
+        if hit and c.save():
+            changes.append(f"{rel(f, root)}: httptrace settings -> httpexchanges")
+    return changes
+
+
+TRAILING_SLASH_SERVLET = """package {pkg};
+
+import org.springframework.boot.web.servlet.FilterRegistrationBean;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
+import org.springframework.web.filter.UrlHandlerFilter;
+
+/**
+ * Added by spring-migrate. Spring Framework 6 no longer matches "/orders/" to {{@code @GetMapping("/orders")}}.
+ * This filter strips a trailing slash before Spring Security and Spring MVC see the request, so existing clients keep
+ * working and security rules are evaluated against the same path the controller is mapped to.
+ * Delete this class once no client relies on trailing slashes.
+ */
+@Configuration(proxyBeanMethods = false)
+public class TrailingSlashCompatibilityConfig {{
+    @Bean
+    public FilterRegistrationBean<UrlHandlerFilter> trailingSlashCompatibilityFilter() {{
+        FilterRegistrationBean<UrlHandlerFilter> registration =
+                new FilterRegistrationBean<>(UrlHandlerFilter.trailingSlashHandler("/**").wrapRequest().build());
+        registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
+        return registration;
+    }}
+}}
+"""
+
+TRAILING_SLASH_REACTIVE = """package {pkg};
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
+import org.springframework.web.filter.reactive.UrlHandlerFilter;
+
+/**
+ * Added by spring-migrate. Spring Framework 6 no longer matches "/orders/" to {{@code @GetMapping("/orders")}}.
+ * This filter strips a trailing slash before Spring Security and WebFlux see the request.
+ * Delete this class once no client relies on trailing slashes.
+ */
+@Configuration(proxyBeanMethods = false)
+public class TrailingSlashCompatibilityConfig {{
+    @Bean
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    public UrlHandlerFilter trailingSlashCompatibilityFilter() {{
+        return UrlHandlerFilter.trailingSlashHandler("/**").mutateRequest().build();
+    }}
+}}
+"""
+
+
+def fix_trailing_slash(root: Path) -> list[str]:
+    builds = " ".join(read(b) or "" for b in build_files(root))
+    servlet = re.search(r"spring-boot-starter-web(?![\w-])|spring-boot-starter-webmvc", builds)
+    reactive = "spring-boot-starter-webflux" in builds and not servlet
+    if not (servlet or reactive) or re.search(r"setUseTrailingSlashMatch\s*\(\s*true|UrlHandlerFilter", " ".join(read(p) or "" for p in java_sources(root))):
+        return []
+    pkg, d = main_package(root)
+    if not pkg:
+        return []
+    target = d / "TrailingSlashCompatibilityConfig.java"
+    if target.exists():
+        return []
+    target.write_text((TRAILING_SLASH_SERVLET if servlet else TRAILING_SLASH_REACTIVE).format(pkg=pkg), encoding="utf-8")
+    return [f"{rel(target, root)}: keeps Spring 5 trailing-slash matching (UrlHandlerFilter, runs before Spring Security)"]
+
+
+DIALECT_MAP = [
+    (r"PostgreSQL(?:8[12]|9[0-5]?|10)Dialect", "PostgreSQLDialect"), (r"PostgresPlus\w*Dialect", "PostgresPlusDialect"),
+    (r"MySQL(?:5|55|57|8)?(?:InnoDB|MyISAM)?Dialect", "MySQLDialect"), (r"MariaDB(?:10[0-9]*|53)?Dialect", "MariaDBDialect"),
+    (r"Oracle(?:8i|9i|10g|12c)Dialect", "OracleDialect"), (r"SQLServer(?:2005|2008|2012|2016)Dialect", "SQLServerDialect"),
+    (r"DB2(?:400)?V?\d*Dialect", "DB2Dialect"), (r"(?:H2|HSQL|Derby\w*)Dialect", None),
+]
+
+
+def fix_hibernate_props(root: Path) -> list[str]:
+    changes = []
+    for p in config_files(root) + [x for x in walk(root) if x.name == "persistence.xml"]:
+        t = read(p) or ""
+        new = t
+        for rx, generic in DIALECT_MAP:
+            if generic:
+                new = re.sub(r"org\.hibernate\.dialect\." + rx + r"\b", "org.hibernate.dialect." + generic, new)
+        new = re.sub(r"(?m)^[ \t]*[\w.\-]*new[_-]generator[_-]mappings[\w.\-]*\s*[=:].*\r?\n?", "", new)
+        new = re.sub(r'(?m)^[ \t]*<property\s+name="hibernate\.id\.new_generator_mappings"[^>]*/>[ \t]*\r?\n?', "", new)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: removed Hibernate 5 dialects/settings (version-specific dialect -> generic, new_generator_mappings dropped)")
+    return changes
+
+
+def _sdkman_java(major: int, vendor: str) -> str | None:
+    if OFFLINE:
+        return None
+    import urllib.request
+    try:
+        with urllib.request.urlopen("https://api.sdkman.io/2/candidates/java/linux/versions/all", timeout=15) as r:
+            ids = r.read().decode().split(",")
+    except Exception:
+        return None
+    c = [i for i in ids if re.match(rf"{major}(\.|$)", i) and i.endswith("-" + vendor) and "fx" not in i and "crac" not in i]
+    return max(c, key=lambda v: vtuple(v.split("-")[0].replace("+", "."))) if c else None
+
+
+def fix_containers_and_ci(root: Path, java: int) -> tuple[list[str], list[str]]:
+    """Replaces what fix_ci_java only reported: deprecated openjdk images and JDK pins in other CI systems."""
+    changes, todo = [], []
+    img = lambda kind, alpine: f"eclipse-temurin:{java}-{kind}" + ("-alpine" if alpine else "")
+    def images(text: str) -> str:
+        text = re.sub(r"\bmaven:3(?:\.[\d.]+)?-(?:openjdk|jdk|adoptopenjdk|amazoncorretto|eclipse-temurin)-(?:8|11)(?:-slim)?\b",
+                      f"maven:3.9-eclipse-temurin-{java}", text)
+        text = re.sub(r"\bgradle:(\d+)(?:\.[\d.]+)?-jdk(?:8|11)\b", lambda m: f"gradle:8-jdk{java}" if int(m.group(1)) < 8 else f"gradle:{m.group(1)}-jdk{java}", text)
+        text = re.sub(r"\b(?:docker\.io/)?(?:library/)?openjdk:(?:8|11|17|21)(?:[\w.\-]*)",
+                      lambda m: img("jdk" if "jre" not in m.group(0) else "jre", "alpine" in m.group(0)), text)
+        text = re.sub(r"\badoptopenjdk(?:/openjdk(?:8|11))?:[\w.\-]+", lambda m: img("jre" if "jre" in m.group(0) else "jdk", "alpine" in m.group(0)), text)
+        return text
+    for p in walk(root):
+        t = read(p)
+        if t is None:
+            continue
+        new = t
+        is_docker = p.name == "Dockerfile" or p.name.startswith("Dockerfile.") or p.suffix == ".dockerfile"
+        if is_docker:
+            new = "\n".join(images(l) if l.lstrip().upper().startswith("FROM") else l for l in t.splitlines()) + ("\n" if t.endswith("\n") else "")
+        elif p.name in ("Jenkinsfile", ".gitlab-ci.yml", "bitbucket-pipelines.yml", "azure-pipelines.yml", ".travis.yml", "docker-compose.yml",
+                        "docker-compose.yaml", "compose.yml", "compose.yaml", ".drone.yml", "cloudbuild.yaml", ".circleci/config.yml") or \
+                (p.parent.name == ".circleci" and p.suffix in (".yml", ".yaml")):
+            new = images(t)
+            new = re.sub(r"(\bjdk\s*\(?\s*['\"])(?:jdk-?)?(?:1\.)?(?:8|11)(['\"])", rf"\g<1>jdk{java}\g<2>", new)
+            new = re.sub(r"(?m)^(\s*jdk:\s*)(?:open|oracle)jdk(?:8|11)\s*$", rf"\g<1>openjdk{java}", new)
+            new = re.sub(r"(jdkVersionOption:\s*['\"]?)1\.(?:8|11)(['\"]?)", rf"\g<1>1.{java}\g<2>", new)
+            new = re.sub(r"(versionSpec:\s*['\"]?)(?:8|11)(['\"]?)", rf"\g<1>{java}\g<2>", new)
+            new = re.sub(r"\bcimg/openjdk:(?:8|11)[\w.]*", f"cimg/openjdk:{java}.0", new)
+            if p.name == "Jenkinsfile" and new != t and re.search(r"\bjdk\s*\(?\s*['\"]jdk", new):
+                todo.append(f"{rel(p, root)}: now asks Jenkins for tool `jdk{java}` - make sure that JDK tool is configured on the controller")
+        elif p.name == ".sdkmanrc":
+            m = re.search(r"(?m)^java=(?:1\.)?(?:8|11)[\w.+]*-(\w+)\s*$", t)
+            if m:
+                v = _sdkman_java(java, m.group(1))
+                if v:
+                    new = re.sub(r"(?m)^java=.*$", f"java={v}", t)
+                else:
+                    todo.append(f"{rel(p, root)}: pins JDK {m.group(0).split('=')[1]} - set a JDK {java} identifier (`sdk list java`)")
+        elif p.name == ".tool-versions":
+            m = re.search(r"(?m)^java\s+(\S+)", t)
+            if m and re.search(r"(?:^|-)(?:1\.)?(?:8|11)(?:\.|$)", m.group(1)):
+                vendor = m.group(1).split("-")[0] if "-" in m.group(1) else "temurin"
+                new = re.sub(r"(?m)^java\s+\S+", f"java latest:{vendor}-{java}", t)
+                todo.append(f"{rel(p, root)}: set to `latest:{vendor}-{java}`; run `asdf install java latest:{vendor}-{java}` and pin the exact version")
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: JDK images/tools -> Java {java}")
+    return changes, todo
+
+
+def fix_build_wrappers(root: Path, boot_line: str) -> list[str]:
+    changes = []
+    mw = root / ".mvn/wrapper/maven-wrapper.properties"
+    if mw.exists():
+        t = read(mw) or ""
+        m = re.search(r"apache-maven-([\d.]+)-bin", t)
+        if m and vtuple(m.group(1)) < (3, 6, 3):
+            mv = latest_patch("org.apache.maven", "apache-maven", "3.9", "3.9.11")
+            new = t.replace(m.group(1), mv)
+            new = re.sub(r"(?m)^distributionSha256Sum=.*\r?\n?", "", new)
+            if write_if_changed(mw, t, new):
+                changes.append(f"{rel(mw, root)}: Maven wrapper {m.group(1)} -> {mv} (Boot 3+ needs 3.6.3+)")
+    gw = root / "gradle/wrapper/gradle-wrapper.properties"
+    if gw.exists():
+        t = read(gw) or ""
+        m = re.search(r"gradle-([\d.]+)-(bin|all)\.zip", t)
+        need = (8, 14) if boot_line.startswith("4") else (7, 6, 4)
+        if m and vtuple(m.group(1))[:len(need)] < need:
+            gv = "8.14.3"
+            new = t.replace(f"gradle-{m.group(1)}-", f"gradle-{gv}-")
+            new = re.sub(r"(?m)^distributionSha256Sum=.*\r?\n?", "", new)
+            if write_if_changed(gw, t, new):
+                changes.append(f"{rel(gw, root)}: Gradle wrapper {m.group(1)} -> {gv} (Boot {boot_line} minimum)")
+    return changes
+
+
+def fix_spring_cloud_train(root: Path, boot_line: str) -> list[str]:
+    changes = []
+    for bf in build_files(root):
+        t = read(bf) or ""
+        if "spring-cloud" not in t:
+            continue
+        want = cloud_version_for(boot_line)
+        new = re.sub(r"(<spring-cloud(?:-dependencies)?\.version>)[^<]+(</spring-cloud(?:-dependencies)?\.version>)", rf"\g<1>{want}\g<2>", t)
+        new = re.sub(r"(<artifactId>spring-cloud-dependencies</artifactId>\s*<version>)(?!\$\{)[^<]+(</version>)", rf"\g<1>{want}\g<2>", new)
+        new = re.sub(r"(springCloudVersion['\"]?\s*[,=:]\s*\(?\s*['\"])[^'\"]+(['\"])", rf"\g<1>{want}\g<2>", new)
+        new = re.sub(r"(spring-cloud-dependencies:)[\w.\-]+(['\"])", rf"\g<1>{want}\g<2>", new)
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: Spring Cloud release train -> {want} (matches Boot {boot_line})")
+    gp = root / "gradle.properties"
+    if gp.exists():
+        t = read(gp) or ""
+        new = re.sub(r"(?m)^(springCloudVersion\s*=\s*).*$", rf"\g<1>{cloud_version_for(boot_line)}", t)
+        if write_if_changed(gp, t, new):
+            changes.append(f"gradle.properties: springCloudVersion -> {cloud_version_for(boot_line)}")
+    return changes
+
+
+def bump_boot(root: Path, version: str) -> list[str]:
+    changes = []
+    for bf in build_files(root):
+        t = read(bf) or ""
+        new = re.sub(r"(<artifactId>spring-boot-(?:starter-parent|dependencies)</artifactId>\s*<version>)(?!\$\{)[^<]+(</version>)", rf"\g<1>{version}\g<2>", t)
+        new = re.sub(r"(<spring-boot(?:-dependencies)?\.version>)[^<]+(</spring-boot(?:-dependencies)?\.version>)", rf"\g<1>{version}\g<2>", new)
+        new = re.sub(r"(<artifactId>spring-boot-maven-plugin</artifactId>\s*<version>)(?!\$\{)[^<]+(</version>)", rf"\g<1>{version}\g<2>", new)
+        new = re.sub(r"(id\s*\(?\s*['\"]org\.springframework\.boot['\"]\s*\)?\s*version\s*\(?\s*['\"])[^'\"]+(['\"])", rf"\g<1>{version}\g<2>", new)
+        new = re.sub(r"(springBootVersion\s*=\s*['\"])[^'\"]+(['\"])", rf"\g<1>{version}\g<2>", new)
+        new = re.sub(r"(spring-boot-(?:dependencies|gradle-plugin):)[\w.\-]+(['\"])", rf"\g<1>{version}\g<2>", new)
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: Spring Boot -> {version}")
+    for name in ("gradle.properties", "gradle/libs.versions.toml"):
+        f = root / name
+        if f.exists():
+            t = read(f) or ""
+            new = re.sub(r"(?m)^(\s*(?:springBootVersion|spring-boot|springBoot)\s*=\s*['\"]?)[\d.]+[\w.\-]*(['\"]?)", rf"\g<1>{version}\g<2>", t)
+            if write_if_changed(f, t, new):
+                changes.append(f"{name}: Spring Boot -> {version}")
+    return changes
+
+
+def fix_third_party(root: Path) -> list[str]:
+    changes = []
+    for bf in build_files(root):
+        t = read(bf) or ""
+        new = t
+        m = re.search(r"<(org\.)?mapstruct\.version>([^<]+)<", new)
+        if m and vtuple(m.group(2)) < (1, 5, 5):
+            mv = latest_patch("org.mapstruct", "mapstruct", "1.6", "1.6.3")
+            new = new.replace(m.group(0), m.group(0).replace(m.group(2), mv))
+        # Lombok pinned inside annotationProcessorPaths: follow Boot's managed version
+        new = re.sub(r"(<groupId>org\.projectlombok</groupId>\s*<artifactId>lombok</artifactId>\s*<version>)1\.18\.(?:[0-9]|1\d|2\d)(</version>)",
+                     r"\g<1>${lombok.version}\g<2>", new)
+        # Querydsl needs the jakarta classifier from Boot 3 on
+        def qd(mm):
+            b = mm.group(0)
+            if "<classifier>" in b:
+                return b
+            return re.sub(r"(<artifactId>querydsl-(?:apt|jpa)</artifactId>)", r"\1\n      <classifier>jakarta</classifier>", b, count=1)
+        new = re.sub(r"<(dependency|path)>(?:(?!<\1>).)*?<groupId>com\.querydsl</groupId>(?:(?!<\1>).)*?</\1>", qd, new, flags=re.S)
+        new = re.sub(r"(['\"]com\.querydsl:querydsl-(?:apt|jpa)(?::[\d.]+)?)(['\"])", r"\1:jakarta\2", new) if "querydsl" in new and ":jakarta" not in new and bf.name != "pom.xml" else new
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: third-party libraries -> Jakarta-compatible versions (MapStruct/Lombok/Querydsl)")
+    return changes
+
+
+# ---- spring-boot-properties-migrator ----------------------------------------
+PROPS_MIGRATOR = ("org.springframework.boot", "spring-boot-properties-migrator")
+
+
+def add_properties_migrator(root: Path) -> dict[Path, str]:
+    """Temporarily add spring-boot-properties-migrator (runtime) to every module that uses Boot. Returns originals."""
+    saved = {}
+    for bf in build_files(root):
+        t = read(bf) or ""
+        if "spring-boot-starter" not in t or "spring-boot-properties-migrator" in t:
+            continue
+        saved[bf] = t
+        bf.write_text(build_add_dep(bf, t, *PROPS_MIGRATOR, scope="runtime"), encoding="utf-8")
+    return saved
+
+
+def restore_files(saved: dict[Path, str]):
+    for p, t in saved.items():
+        p.write_text(t, encoding="utf-8")
+
+
+def parse_properties_migrator(text: str) -> tuple[dict[str, str], dict[str, str]]:
+    """-> ({old: replacement}, {key: reason}) from PropertiesMigrationListener output."""
+    renames, gone = {}, {}
+    for m in re.finditer(r"Key:\s*(\S+)\s+(?:Line:\s*\d+\s+)?Replacement:\s*(\S+)", text):
+        renames[m.group(1)] = m.group(2)
+    for m in re.finditer(r"Key:\s*(\S+)\s+(?:Line:\s*\d+\s+)?Reason:\s*([^\n]+)", text):
+        if m.group(1) not in renames:
+            gone[m.group(1)] = m.group(2).strip()
+    return renames, gone
+
+
+def collect_test_output(root: Path, log: Path) -> str:
+    parts = [read(log) or ""]
+    for p in root.rglob("*-output.txt"):
+        if "surefire-reports" in p.as_posix() or "failsafe-reports" in p.as_posix():
+            parts.append(read(p) or "")
+    for p in root.rglob("TEST-*.xml"):
+        if "build/test-results" in p.as_posix():
+            parts.append(read(p) or "")
+    return "\n".join(parts)
+
+
+def apply_property_renames(root: Path, renames: dict[str, str]) -> list[str]:
+    changes = []
+    for f in config_files(root):
+        c = ConfigFile(f)
+        n = 0
+        for old, newk in renames.items():
+            for e in c.keys_matching(re.escape(old) + r"$"):
+                doc = c.remove(e["key"])
+                c.put(newk, e["value"], doc=doc or 0)
+                n += 1
+        if n and c.save():
+            changes.append(f"{rel(f, root)}: {n} property rename(s) reported by spring-boot-properties-migrator")
+    return changes
+
+
+# ---- jars that still need javax.* -----------------------------------------
+JAVAX_EE_BYTES = re.compile(rb"javax/(?:servlet|persistence|validation|transaction(?!/xa)|ws/rs|xml/bind|mail|jms|inject|json|websocket|el|enterprise|activation|interceptor|jws|annotation/(?:PostConstruct|PreDestroy|Resource|Priority))/")
+
+
+def javax_jars(classpath: list[str]) -> list[str]:
+    """Jars on the migrated classpath whose classes still reference javax.* EE types (they will fail at runtime)."""
+    import zipfile
+    bad = []
+    for jar in classpath:
+        if not jar.endswith(".jar") or re.search(r"/javax/|/jakarta\.|/javax\.", jar):
+            continue
+        try:
+            with zipfile.ZipFile(jar) as z:
+                for n in z.namelist():
+                    if n.endswith(".class") and not n.startswith(("META-INF/versions/",)):
+                        if JAVAX_EE_BYTES.search(z.read(n)):
+                            bad.append(jar)
+                            break
+        except Exception:
+            continue
+    return bad
 
 
 # --------------------------------------------------------------------------- #
@@ -793,6 +3280,16 @@ def git(root: Path, *args: str, check=True) -> str:
     return r.stdout
 
 
+def migration_base(root: Path) -> str | None:
+    """Commit the migration started from: parent of the first chore(migration) commit, else HEAD."""
+    first = git(root, "log", "--reverse", "--format=%H", "--grep=^chore(migration)", check=False).split()
+    if first:
+        r = git(root, "rev-parse", "-q", "--verify", first[0] + "^", check=False).strip()
+        if r:
+            return r
+    return git(root, "rev-parse", "HEAD", check=False).strip() or None
+
+
 def java_major(env: dict) -> int | None:
     try:
         r = subprocess.run(["java", "-version"], capture_output=True, text=True, env=env)
@@ -850,6 +3347,17 @@ rootProject {{
         cmd = [self.exe, "--no-daemon", "--init-script", str(init), "rewriteDryRun" if dry else "rewriteRun"] + self.extra
         return run(cmd, self.root, log, self.env)
 
+    def classpath(self) -> list[str]:
+        """Resolved runtime+test classpath (Maven only); empty if it cannot be resolved."""
+        if self.tool != "maven":
+            return []
+        out = self.log_dir / "classpath.txt"
+        code = run([self.exe, "-B", "-ntp", "-q", "dependency:build-classpath", f"-Dmdep.outputFile={out}", "-Dmdep.includeScope=runtime"] + self.extra,
+                   self.root, self.log_dir / "classpath.log", self.env)
+        if code != 0 or not out.exists():
+            return []
+        return [x for x in (read(out) or "").strip().split(os.pathsep) if x]
+
     def verify(self, stage: str) -> int:
         log = self.log_dir / f"{stage}-build.log"
         cmd = [self.exe, "-B", "-ntp", "verify"] if self.tool == "maven" else [self.exe, "build"]
@@ -866,6 +3374,12 @@ class Stage:
     recipes: list
     artifacts: list
     java_fix: bool = False
+    boot_line: str | None = None      # Boot line this stage ends on (drives post-fixers / cloud train)
+    legacy: bool = False              # run the legacy-library codemods before the recipes
+    bump_to: str | None = None        # set the Boot version directly (no OpenRewrite upgrade recipe exists)
+
+
+RECIPE_PROPS_4_1 = "org.openrewrite.java.spring.boot4.SpringBootProperties_4_1"
 
 
 def plan_stages(target: str, java: int, junit4: bool, spring_v: str, extra_recipes: list[str], openjpa: bool = False) -> list[Stage]:
@@ -875,9 +3389,13 @@ def plan_stages(target: str, java: int, junit4: bool, spring_v: str, extra_recip
     if openjpa:
         stages.append(Stage(OPENJPA_STAGE, "OpenJPA -> Hibernate (on Boot 2.7 / Hibernate 5.6, before the Spring 6 jump)", [], []))
     r3 = [RECIPE_3_5, RECIPE_JAVA[java]] + ([RECIPE_JUNIT5] if junit4 else [])
-    stages.append(Stage("2-boot-3.5", f"Spring Boot 3.5 / Spring 6 / Jakarta EE 10 / Java {java}", r3, arts + [mj], java_fix=True))
-    if target == "4.0":
-        stages.append(Stage("3-boot-4.0", "Spring Boot 4.0 / Spring Framework 7", [RECIPE_4_0], arts, java_fix=True))
+    stages.append(Stage("2-boot-3.5", f"Spring Boot 3.5 / Spring 6 / Jakarta EE 10 / Java {java}", r3, arts + [mj],
+                        java_fix=True, boot_line="3.5", legacy=True))
+    if target in ("4.0", "4.1"):
+        stages.append(Stage("3-boot-4.0", "Spring Boot 4.0 / Spring Framework 7", [RECIPE_4_0], arts, java_fix=True, boot_line="4.0"))
+    if target == "4.1":
+        stages.append(Stage("4-boot-4.1", "Spring Boot 4.1 (longest-supported line)", [RECIPE_PROPS_4_1], [sp], java_fix=True,
+                            boot_line="4.1", bump_to="4.1"))
     if extra_recipes:
         stages[-1].recipes += extra_recipes
     return stages
@@ -916,11 +3434,13 @@ def cmd_migrate(a) -> int:
         major, minor = int(bv.split(".")[0]), int(bv.split(".")[1])
     except (ValueError, IndexError):
         major, minor = 2, 7
-    if major >= 4:
-        raise MigrationError(f"Project is already on Spring Boot {bv}; nothing to do.")
-    resuming = major == 3
+    target_t = tuple(int(x) for x in a.target.split("."))
+    if (major, minor) >= target_t:
+        say(f"[preflight] project is already on Spring Boot {bv}; target {a.target} reached.")
+        return 0
+    resuming = major >= 3
     (report_dir / "scan-before.md").write_text(render_scan(pre, "Pre-migration scan"), encoding="utf-8")
-    blockers = [f for f in pre["findings"].values() if f.hits and f.rule.severity == "blocker"]
+    blockers = [f for f in pre["findings"].values() if f.hits and f.rule.severity == "blocker" and f.rule.kind == "manual"]
     if blockers and not a.force:
         say("\n[preflight] BLOCKERS that automation cannot fix:")
         for f in blockers:
@@ -936,7 +3456,9 @@ def cmd_migrate(a) -> int:
     builder = Builder(root, info["tool"], env, log_dir, shlex.split(a.build_args or ""), a.rewrite_plugin_version)
 
     if resuming:
-        stages = [st for st in stages if not (st.key[0] == "1" or (st.key.startswith("2-") and minor >= 5))]
+        done = lambda st: st.key[0] == "1" or (st.key.startswith("2-") and (major, minor) >= (3, 5)) or \
+            (st.key.startswith("3-") and major >= 4)
+        stages = [st for st in stages if not done(st)]
         if not stages:
             say(f"[preflight] already on Spring Boot {bv}; target {a.target} reached.")
             return 0
@@ -1004,15 +3526,34 @@ def cmd_migrate(a) -> int:
                 say(f"  TODO {t}")
             code, dl = 0, []
         else:
+            base_rev = migration_base(root) if not a.no_git else None
+            stage_rev = git(root, "rev-parse", "HEAD").strip() if not a.no_git else None
+            pre_changes = []
+            if st.legacy and not a.no_legacy:
+                pre_changes, todo = run_legacy_codemods(root)
+                todo_all += todo
+                for c in pre_changes:
+                    say(f"  legacy: {c}")
+            if st.bump_to:
+                bv_new = boot_version_for(st.bump_to)
+                for c in bump_boot(root, bv_new):
+                    pre_changes.append(c)
+                    say(f"  bump: {c}")
             code, dl = 1, []
             for attempt in range(1, a.retries + 2):
-                code = builder.rewrite(st.key, st.recipes, st.artifacts, dry=False)
+                code = builder.rewrite(st.key, st.recipes, st.artifacts, dry=False) if st.recipes else 0
                 dl = rewrite_had_download_failures(log_dir / f"{st.key}-rewrite.log") if code == 0 else []
                 if code == 0 and not dl:
                     break
-                if not a.no_git and not a.allow_dirty:   # tree was clean when we started -> safe to discard partial edits
+                if not a.no_git and not a.allow_dirty:
+                    # tree was clean when we started -> discard partial OpenRewrite edits, then redo our deterministic pre-steps
                     git(root, "reset", "-q", "--hard", "HEAD")
                     git(root, "clean", "-fdq")
+                    if attempt <= a.retries:
+                        if st.legacy and not a.no_legacy:
+                            run_legacy_codemods(root)
+                        if st.bump_to:
+                            bump_boot(root, boot_version_for(st.bump_to))
                 if attempt <= a.retries and (dl or code != 0):
                     say(f"[stage {st.key}] attempt {attempt} failed ({'repository/download problem' if dl else 'exit ' + str(code)}); retrying in 30s")
                     time.sleep(30)
@@ -1030,12 +3571,21 @@ def cmd_migrate(a) -> int:
                     say(f"[stage {st.key}] OpenRewrite failed (exit {code}):")
                     show_errors(log_dir / f"{st.key}-rewrite.log")
                 break
+        if st.legacy and not a.no_legacy and not (code != 0 or dl):
+            post_c, post_t = run_legacy_codemods(root, "post")
+            todo_all += post_t
+            pre_changes += post_c
+            for c in post_c:
+                say(f"  legacy: {c}")
         if st.java_fix:
-            changes, todo = run_fixers(root, a.java)
+            changes, todo = run_fixers(root, a.java, st.boot_line or "3.5", base_rev,
+                                       trailing_slash=st.key.startswith("2-") and not a.no_trailing_slash_compat,
+                                       stage_rev=stage_rev)
             todo_all += todo
             for c in changes:
                 say(f"  fixer: {c}")
-        note = f"{len(changes)} post-fix change(s)"
+            changes = pre_changes + changes
+        note = f"{len(changes)} tool change(s)"
         if not a.no_git and git(root, "status", "--porcelain").strip():
             git(root, "add", "-A")
             msg = f"chore(migration): {st.title}\n\nAutomated by spring-migrate {__version__} (OpenRewrite: {', '.join(st.recipes)})"
@@ -1045,8 +3595,27 @@ def cmd_migrate(a) -> int:
             say(f"[git] committed stage {st.key}")
         ok = True
         if not a.skip_tests:
-            say(f"[stage {st.key}] build + tests")
-            ok = builder.verify(st.key) == 0
+            say(f"[stage {st.key}] build + tests" + (" (with spring-boot-properties-migrator)" if st.boot_line and not a.no_properties_migrator else ""))
+            saved = add_properties_migrator(root) if st.boot_line and not a.no_properties_migrator else {}
+            try:
+                ok = builder.verify(st.key) == 0
+            finally:
+                restore_files(saved)
+            if saved:
+                renames, gone = parse_properties_migrator(collect_test_output(root, log_dir / f"{st.key}-build.log"))
+                fixed = apply_property_renames(root, renames)
+                for k, why in gone.items():
+                    todo_all.append(f"property `{k}` is no longer supported: {why}")
+                if fixed:
+                    for c in fixed:
+                        say(f"  props-migrator: {c}")
+                    if not a.no_git:
+                        git(root, "add", "-A")
+                        git(root, "commit", "-q", "-m", f"chore(migration): property renames reported by spring-boot-properties-migrator ({st.key})")
+                    say(f"[stage {st.key}] re-running build + tests without the migrator")
+                    ok = builder.verify(st.key + "-props") == 0
+                elif renames == {} and not ok:
+                    pass
             say(f"[stage {st.key}] {'build OK' if ok else 'BUILD/TESTS FAILED'}")
             if not ok:
                 show_errors(log_dir / f"{st.key}-build.log")
@@ -1055,6 +3624,14 @@ def cmd_migrate(a) -> int:
             failed_stage = st.key
             break
 
+    # ---- jars still compiled against javax.* -------------------------------
+    if not failed_stage and not a.skip_tests:
+        bad = javax_jars(builder.classpath())
+        for j in bad:
+            todo_all.append(f"dependency `{Path(j).name}` still references javax.* EE types and will fail at runtime - "
+                            f"upgrade it to a Jakarta version (or run it through the Eclipse Transformer)")
+        if bad:
+            say(f"[check] {len(bad)} dependency jar(s) still reference javax.* - see the report")
     # ---- report ----------------------------------------------------------
     post = scan(root)
     (report_dir / "scan-after.md").write_text(render_scan(post, "Post-migration scan"), encoding="utf-8")
@@ -1133,6 +3710,17 @@ def cmd_openjpa(a) -> int:
     return 0
 
 
+def cmd_legacy(a) -> int:
+    root = Path(a.path).resolve()
+    changes, todo = run_legacy_codemods(root, "all")
+    for c in changes:
+        say(c)
+    for t in todo:
+        say(f"TODO {t}")
+    say(f"{len(changes)} change(s). Review with `git diff`; the result targets Boot 3.5 APIs (run `migrate` for the rest).")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="spring-migrate", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=__version__)
@@ -1153,9 +3741,15 @@ def main(argv=None) -> int:
     o.add_argument("path")
     o.set_defaults(fn=cmd_openjpa)
 
+    lg = sub.add_parser("legacy", help="run only the legacy-library codemods (Netflix, legacy OAuth2, id pinning, JPQL ...)")
+    lg.add_argument("path")
+    lg.add_argument("--offline", action="store_true")
+    lg.set_defaults(fn=cmd_legacy)
+
     m = sub.add_parser("migrate", help="staged migration on a new git branch")
     m.add_argument("path")
-    m.add_argument("--target", choices=("3.5", "4.0"), default="4.0", help="final Boot line (default 4.0; 3.5 is end-of-life for OSS)")
+    m.add_argument("--target", choices=("3.5", "4.0", "4.1"), default="4.1",
+                   help="final Boot line (default 4.1, the longest-supported line; 3.5 is end-of-life for OSS)")
     m.add_argument("--java", type=int, choices=(17, 21), default=17, help="target Java level (default 17)")
     m.add_argument("--java-home", help="JDK 17+ to run the build with")
     m.add_argument("--dry-run", action="store_true", help="produce rewrite.patch only; modify nothing")
@@ -1172,9 +3766,15 @@ def main(argv=None) -> int:
     m.add_argument("--rewrite-spring-version", default="RELEASE", help="rewrite-spring version (pin for reproducible runs)")
     m.add_argument("--rewrite-plugin-version", help="rewrite-maven-plugin version (default: latest)")
     m.add_argument("--extra-recipe", action="append", help="additional OpenRewrite recipe name to run in the last stage (repeatable)")
+    m.add_argument("--no-legacy", action="store_true", help="skip the legacy-library codemods (Netflix, legacy OAuth2, id pinning, ...)")
+    m.add_argument("--no-trailing-slash-compat", action="store_true", help="do not add the trailing-slash compatibility filter")
+    m.add_argument("--no-properties-migrator", action="store_true", help="do not run tests with spring-boot-properties-migrator")
+    m.add_argument("--offline", action="store_true", help="do not query Maven Central / SDKMAN for latest versions (use built-in ones)")
     m.set_defaults(fn=cmd_migrate)
 
     a = ap.parse_args(argv)
+    global OFFLINE
+    OFFLINE = getattr(a, "offline", False)
     try:
         return a.fn(a)
     except MigrationError as e:

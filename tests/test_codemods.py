@@ -1,0 +1,412 @@
+"""Unit tests for the codemods/fixers that do not need a build (python3 -m unittest discover tests)."""
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import spring_migrate as sm  # noqa: E402
+
+sm.OFFLINE = True
+
+
+class Project:
+    def __init__(self, files: dict):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        for name, text in files.items():
+            p = self.root / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(textwrap.dedent(text).lstrip("\n"), encoding="utf-8")
+
+    def __getitem__(self, name):
+        return (self.root / name).read_text(encoding="utf-8")
+
+    def exists(self, name):
+        return (self.root / name).exists()
+
+    def close(self):
+        self.tmp.cleanup()
+
+
+POM = """
+<project>
+  <parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>2.7.13</version></parent>
+  <properties>
+    <java.version>11</java.version>
+    <mockito.version>4.11.0</mockito.version>
+  </properties>
+  <dependencies>
+    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+    DEPS
+  </dependencies>
+</project>
+"""
+
+
+def pom(deps=""):
+    return POM.replace("DEPS", deps)
+
+
+class ConfigFileTest(unittest.TestCase):
+    def test_yaml_flatten_remove_put(self):
+        pr = Project({"src/main/resources/application.yml": """
+            spring:
+              application:
+                name: demo
+            zuul:
+              routes:
+                inv:
+                  path: /inv/**
+            list:
+            - a
+            - b
+            ---
+            spring.config.activate.on-profile: dev
+            """})
+        c = sm.ConfigFile(pr.root / "src/main/resources/application.yml")
+        keys = {e["key"]: e["value"] for e in c.entries()}
+        self.assertEqual(keys["zuul.routes.inv.path"], "/inv/**")
+        self.assertEqual(keys["list[1]"], "b")
+        c.remove("zuul.routes.inv.path")
+        c.put("x.y", "/a/**")
+        c.save()
+        text = pr["src/main/resources/application.yml"]
+        self.assertNotIn("zuul", text)
+        self.assertIn("list:\n- a", text)
+        self.assertIn("x.y: /a/**\n---", text)
+        pr.close()
+
+
+class NetflixTest(unittest.TestCase):
+    def test_zuul_routes_to_gateway_mvc(self):
+        pr = Project({
+            "pom.xml": pom("<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-starter-netflix-zuul</artifactId></dependency>"),
+            "src/main/resources/application.properties": """
+                zuul.routes.inventory.path=/inventory/**
+                zuul.routes.inventory.url=http://inv:8080
+                zuul.routes.users.path=/api/users/**
+                zuul.routes.users.serviceId=user-service
+                zuul.routes.users.stripPrefix=false
+                zuul.sensitive-headers=Cookie
+                """,
+            "src/main/java/a/App.java": """
+                package a;
+                import org.springframework.cloud.netflix.zuul.EnableZuulProxy;
+                @EnableZuulProxy
+                public class App {}
+                """})
+        changes, todo = sm.cm_zuul(pr.root)
+        props = pr["src/main/resources/application.properties"]
+        base = "spring.cloud.gateway.server.webmvc.routes"
+        self.assertIn(f"{base}[0].uri=http://inv:8080", props)
+        self.assertIn(f"{base}[0].predicates[0]=Path=/inventory/**", props)
+        self.assertIn(f"{base}[0].filters[0]=StripPrefix=1", props)
+        self.assertIn(f"{base}[0].filters[1]=RemoveRequestHeader=Cookie", props)
+        self.assertIn(f"{base}[1].uri=lb://user-service", props)
+        self.assertNotIn(f"{base}[1].filters[0]=StripPrefix", props)
+        self.assertNotIn("zuul.", props)
+        self.assertIn("spring-cloud-starter-gateway-server-webmvc", pr["pom.xml"])
+        self.assertIn("spring-cloud-starter-loadbalancer", pr["pom.xml"])
+        self.assertNotIn("EnableZuulProxy", pr["src/main/java/a/App.java"])
+        pr.close()
+
+    def test_ribbon_rule_and_servers(self):
+        pr = Project({
+            "pom.xml": pom("<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-starter-netflix-ribbon</artifactId></dependency>"),
+            "src/main/resources/application.properties": "stores.ribbon.listOfServers=a:1, https://b:2\nribbon.eureka.enabled=false\n",
+            "src/main/java/a/LbConfig.java": """
+                package a;
+                import com.netflix.loadbalancer.IRule;
+                import com.netflix.loadbalancer.RandomRule;
+                import org.springframework.cloud.netflix.ribbon.RibbonClient;
+                import org.springframework.context.annotation.Bean;
+                @RibbonClient(name = "stores", configuration = LbConfig.class)
+                public class LbConfig {
+                    @Bean
+                    public IRule ribbonRule() { return new RandomRule(); }
+                }
+                """})
+        sm.cm_ribbon(pr.root)
+        j = pr["src/main/java/a/LbConfig.java"]
+        self.assertIn("@LoadBalancerClient(name = \"stores\"", j)
+        self.assertIn("new RandomLoadBalancer(", j)
+        self.assertNotIn("com.netflix", j)
+        props = pr["src/main/resources/application.properties"]
+        self.assertIn("spring.cloud.discovery.client.simple.instances.stores[0].uri=http://a:1", props)
+        self.assertIn("spring.cloud.discovery.client.simple.instances.stores[1].uri=https://b:2", props)
+        self.assertNotIn("ribbon", props)
+        self.assertIn("spring-cloud-starter-loadbalancer", pr["pom.xml"])
+        pr.close()
+
+    def test_hystrix_fallback_gets_throwable_and_props(self):
+        pr = Project({
+            "pom.xml": pom("<dependency><groupId>org.springframework.cloud</groupId><artifactId>spring-cloud-starter-netflix-hystrix</artifactId></dependency>"),
+            "src/main/java/a/Svc.java": """
+                package a;
+                import com.netflix.hystrix.contrib.javanica.annotation.HystrixCommand;
+                import com.netflix.hystrix.contrib.javanica.annotation.HystrixProperty;
+                public class Svc {
+                    @HystrixCommand(commandKey = "price", fallbackMethod = "fb", ignoreExceptions = IllegalArgumentException.class,
+                        commandProperties = {@HystrixProperty(name = "circuitBreaker.sleepWindowInMilliseconds", value = "5000")})
+                    public String price(String sku, int qty) { return "x"; }
+                    public String fb(String sku, int qty) { return "y"; }
+                }
+                """})
+        sm.cm_hystrix(pr.root)
+        j = pr["src/main/java/a/Svc.java"]
+        self.assertIn('@CircuitBreaker(name = "price", fallbackMethod = "fb")', j)
+        self.assertIn("public String fb(String sku, int qty, Throwable throwable)", j)
+        props = pr["src/main/resources/application.properties"]
+        self.assertIn("resilience4j.circuitbreaker.instances.price.wait-duration-in-open-state=5000ms", props)
+        self.assertIn("resilience4j.circuitbreaker.instances.price.ignore-exceptions[0]=java.lang.IllegalArgumentException", props)
+        p = pr["pom.xml"]
+        self.assertIn("spring-cloud-starter-circuitbreaker-resilience4j", p)
+        self.assertIn("spring-cloud-dependencies", p)  # BOM added because none was present
+        pr.close()
+
+
+class OAuth2Test(unittest.TestCase):
+    RS = """
+        package a;
+        import org.springframework.context.annotation.Configuration;
+        import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+        import org.springframework.security.oauth2.config.annotation.web.configuration.EnableResourceServer;
+        import org.springframework.security.oauth2.config.annotation.web.configuration.ResourceServerConfigurerAdapter;
+        @Configuration
+        @EnableResourceServer
+        public class Rs extends ResourceServerConfigurerAdapter {
+            @Override
+            public void configure(HttpSecurity web) throws Exception {
+                web.authorizeRequests().antMatchers("/admin/**").access("#oauth2.hasScope('admin')").anyRequest().authenticated();
+            }
+        }
+        """
+    DEP = "<dependency><groupId>org.springframework.security.oauth.boot</groupId><artifactId>spring-security-oauth2-autoconfigure</artifactId><version>2.6.8</version></dependency>"
+
+    def test_opaque_token_info(self):
+        pr = Project({"pom.xml": pom(self.DEP), "src/main/java/a/Rs.java": self.RS,
+                      "src/main/resources/application.properties":
+                          "security.oauth2.resource.token-info-uri=http://auth/oauth/check_token\n"
+                          "security.oauth2.client.client-id=rs\nsecurity.oauth2.client.client-secret=s\n"})
+        sm.cm_legacy_oauth2(pr.root)
+        j = pr["src/main/java/a/Rs.java"]
+        self.assertIn("oauth2.opaqueToken(Customizer.withDefaults())", j)
+        self.assertIn("hasAuthority('SCOPE_admin')", j)
+        self.assertIn("http.authorizeRequests()", j)  # parameter renamed to http
+        props = pr["src/main/resources/application.properties"]
+        self.assertIn("spring.security.oauth2.resourceserver.opaquetoken.introspection-uri=http://auth/oauth/check_token", props)
+        self.assertIn("spring.security.oauth2.resourceserver.opaquetoken.client-id=rs", props)
+        self.assertIn("spring-boot-starter-oauth2-resource-server", pr["pom.xml"])
+        self.assertNotIn("autoconfigure", pr["pom.xml"])
+        pr.close()
+
+    def test_hmac_key(self):
+        pr = Project({"pom.xml": pom(self.DEP), "src/main/java/a/Rs.java": self.RS,
+                      "src/main/resources/application.yml": "security:\n  oauth2:\n    resource:\n      jwt:\n        key-value: s3cr3t\n"})
+        sm.cm_legacy_oauth2(pr.root)
+        j = pr["src/main/java/a/Rs.java"]
+        self.assertIn("NimbusJwtDecoder.withSecretKey", j)
+        self.assertIn("app.legacy-oauth2.jwt.hmac-secret: s3cr3t", pr["src/main/resources/application.yml"])
+        pr.close()
+
+    def test_sso_client(self):
+        pr = Project({"pom.xml": pom(self.DEP),
+                      "src/main/java/a/Web.java": """
+                          package a;
+                          import org.springframework.boot.autoconfigure.security.oauth2.client.EnableOAuth2Sso;
+                          import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+                          @EnableOAuth2Sso
+                          public class Web extends org.springframework.security.config.annotation.web.configuration.WebSecurityConfigurerAdapter {
+                              protected void configure(HttpSecurity http) throws Exception { http.authorizeRequests().anyRequest().authenticated(); }
+                          }
+                          """,
+                      "src/main/resources/application.properties":
+                          "security.oauth2.client.client-id=web\nsecurity.oauth2.client.client-secret=s\n"
+                          "security.oauth2.client.access-token-uri=http://auth/oauth/token\n"
+                          "security.oauth2.client.user-authorization-uri=http://auth/oauth/authorize\n"
+                          "security.oauth2.resource.user-info-uri=http://auth/me\n"})
+        sm.cm_legacy_oauth2(pr.root)
+        j = pr["src/main/java/a/Web.java"]
+        self.assertIn("http.oauth2Login(Customizer.withDefaults());", j)
+        self.assertNotIn("EnableOAuth2Sso", j)
+        props = pr["src/main/resources/application.properties"]
+        self.assertIn("spring.security.oauth2.client.registration.legacy.client-id=web", props)
+        self.assertIn("spring.security.oauth2.client.provider.legacy.token-uri=http://auth/oauth/token", props)
+        self.assertIn("spring.security.oauth2.client.registration.legacy.authorization-grant-type=authorization_code", props)
+        self.assertIn("spring-boot-starter-oauth2-client", pr["pom.xml"])
+        pr.close()
+
+
+class JpaTest(unittest.TestCase):
+    def test_jpql_positional(self):
+        pr = Project({"src/main/java/a/Repo.java": """
+            package a;
+            public interface Repo {
+                @Query("select u from User u where u.name = ? and u.city = 'a?b' and u.age > ?")
+                Object find(String n, int a);
+                @Query(value = "select * from users where name = ?", nativeQuery = true)
+                Object nat(String n);
+            }
+            """, "src/main/resources/META-INF/orm.xml": "<named-query name=\"q\"><query>select x from X x where x.a = ? or x.b = ?</query></named-query>"})
+        sm.cm_jpql_positional(pr.root)
+        j = pr["src/main/java/a/Repo.java"]
+        self.assertIn("u.name = ?1 and u.city = 'a?b' and u.age > ?2", j)
+        self.assertIn("where name = ?\"", j)  # native query untouched
+        self.assertIn("x.a = ?1 or x.b = ?2", pr["src/main/resources/META-INF/orm.xml"])
+        pr.close()
+
+    ENTITY = """
+        package a;
+        import javax.persistence.*;
+        @Entity
+        public class E {
+            @Id
+            @GeneratedValue
+            private Long id;
+        }
+        """
+
+    def test_pin_sequence(self):
+        pr = Project({"src/main/java/a/E.java": self.ENTITY})
+        sm.cm_pin_generated_ids(pr.root)
+        j = pr["src/main/java/a/E.java"]
+        self.assertIn('@SequenceGenerator(name = "hibernate_sequence", sequenceName = "hibernate_sequence", allocationSize = 1)', j)
+        self.assertIn("GenerationType.SEQUENCE", j)
+        # idempotent
+        self.assertEqual(sm.cm_pin_generated_ids(pr.root)[0], [])
+        pr.close()
+
+    def test_pin_identity_for_mysql_without_new_mappings(self):
+        pr = Project({"src/main/java/a/E.java": self.ENTITY.replace("Long id", "long id"),
+                      "src/main/resources/application.properties":
+                          "spring.datasource.url=jdbc:mysql://db/x\nspring.jpa.properties.hibernate.id.new_generator_mappings=false\n"})
+        sm.cm_pin_generated_ids(pr.root)
+        self.assertIn("@GeneratedValue(strategy = GenerationType.IDENTITY)", pr["src/main/java/a/E.java"])
+        pr.close()
+
+    def test_uuid_ids_untouched(self):
+        pr = Project({"src/main/java/a/E.java": self.ENTITY.replace("Long id", "java.util.UUID id")})
+        self.assertEqual(sm.cm_pin_generated_ids(pr.root)[0], [])
+        pr.close()
+
+    def test_openjpa_relations(self):
+        pr = Project({"src/main/java/a/O.java": """
+            package a;
+            import java.util.List;
+            import javax.persistence.*;
+            import org.apache.openjpa.persistence.ElementDependent;
+            import org.apache.openjpa.persistence.jdbc.ForeignKey;
+            @Entity
+            public class O {
+                @Id Long id;
+                @OneToMany(mappedBy = "o")
+                @ElementDependent
+                private List<L> lines;
+                @ManyToOne
+                @ForeignKey(name = "FK_X")
+                private O parent;
+            }
+            """})
+        _, todo = sm.cm_openjpa_annotations(pr.root)
+        j = pr["src/main/java/a/O.java"]
+        self.assertIn('@OneToMany(mappedBy = "o", orphanRemoval = true)', j)
+        self.assertNotIn("openjpa", j)
+        self.assertTrue(any("ForeignKey" in t for t in todo))
+        pr.close()
+
+    def test_dialects(self):
+        pr = Project({"src/main/resources/application.properties":
+                      "spring.jpa.database-platform=org.hibernate.dialect.PostgreSQL95Dialect\n"
+                      "spring.jpa.properties.hibernate.id.new_generator_mappings=true\nx=1\n"})
+        sm.fix_hibernate_props(pr.root)
+        self.assertEqual(pr["src/main/resources/application.properties"],
+                         "spring.jpa.database-platform=org.hibernate.dialect.PostgreSQLDialect\nx=1\n")
+        pr.close()
+
+
+class FixersTest(unittest.TestCase):
+    def test_stale_pins(self):
+        pr = Project({"pom.xml": pom()})
+        sm.cm_stale_version_pins(pr.root)
+        self.assertNotIn("mockito.version", pr["pom.xml"])
+        self.assertIn("<java.version>11</java.version>", pr["pom.xml"])
+        pr.close()
+
+    def test_images_and_ci(self):
+        pr = Project({"Dockerfile": "FROM maven:3.8-openjdk-11 AS b\nFROM openjdk:11-jre-slim\nFROM postgres:11\n",
+                      ".gitlab-ci.yml": "image: maven:3-jdk-11\n", ".travis.yml": "jdk: openjdk11\n"})
+        sm.fix_containers_and_ci(pr.root, 21)
+        self.assertEqual(pr["Dockerfile"], "FROM maven:3.9-eclipse-temurin-21 AS b\nFROM eclipse-temurin:21-jre\nFROM postgres:11\n")
+        self.assertIn("maven:3.9-eclipse-temurin-21", pr[".gitlab-ci.yml"])
+        self.assertIn("jdk: openjdk21", pr[".travis.yml"])
+        pr.close()
+
+    def test_httptrace(self):
+        pr = Project({"src/main/resources/application.properties":
+                      "management.endpoints.web.exposure.include=health,httptrace\nmanagement.trace.http.enabled=true\n",
+                      "src/main/java/a/T.java": "import org.springframework.boot.actuate.trace.http.InMemoryHttpTraceRepository;\n"
+                                                "class T { Object r = new InMemoryHttpTraceRepository(); }\n"})
+        sm.fix_httptrace(pr.root)
+        props = pr["src/main/resources/application.properties"]
+        self.assertIn("management.endpoints.web.exposure.include=health,httpexchanges", props)
+        self.assertIn("management.httpexchanges.recording.enabled=true", props)
+        self.assertIn("org.springframework.boot.actuate.web.exchanges.InMemoryHttpExchangeRepository", pr["src/main/java/a/T.java"])
+        pr.close()
+
+    def test_wrappers(self):
+        pr = Project({".mvn/wrapper/maven-wrapper.properties": "distributionUrl=https://x/apache-maven-3.6.0-bin.zip\ndistributionSha256Sum=abc\n",
+                      "gradle/wrapper/gradle-wrapper.properties": "distributionUrl=https\\://services.gradle.org/distributions/gradle-7.4-bin.zip\n"})
+        sm.fix_build_wrappers(pr.root, "4.1")
+        self.assertIn("apache-maven-3.9.11-bin", pr[".mvn/wrapper/maven-wrapper.properties"])
+        self.assertNotIn("Sha256", pr[".mvn/wrapper/maven-wrapper.properties"])
+        self.assertIn("gradle-8.14.3-bin", pr["gradle/wrapper/gradle-wrapper.properties"])
+        pr.close()
+
+    def test_trailing_slash_filter(self):
+        pr = Project({"pom.xml": pom(), "src/main/java/a/App.java": "package a;\n@SpringBootApplication\npublic class App {}\n"})
+        sm.fix_trailing_slash(pr.root)
+        self.assertIn("UrlHandlerFilter.trailingSlashHandler", pr["src/main/java/a/TrailingSlashCompatibilityConfig.java"])
+        self.assertEqual(sm.fix_trailing_slash(pr.root), [])
+        pr.close()
+
+    def test_boot_bump_and_cloud_train(self):
+        pr = Project({"pom.xml": pom().replace("2.7.13", "4.0.10").replace("<java.version>", "<spring-cloud.version>2025.0.3</spring-cloud.version>\n    <java.version>")})
+        sm.bump_boot(pr.root, "4.1.3")
+        sm.fix_spring_cloud_train(pr.root, "4.1")
+        self.assertIn("<version>4.1.3</version>", pr["pom.xml"])
+        self.assertIn("<spring-cloud.version>2025.1.5</spring-cloud.version>", pr["pom.xml"])
+        pr.close()
+
+    def test_properties_migrator_parse(self):
+        log = ("Property source 'Config resource 'class path resource [application.properties]'':\n"
+               "\tKey: spring.redis.host\n\t\tLine: 3\n\t\tReplacement: spring.data.redis.host\n"
+               "\tKey: server.max-http-header-size\n\t\tLine: 4\n\t\tReplacement: server.max-http-request-header-size\n"
+               "The use of configuration keys that are no longer supported was found in the environment:\n"
+               "\tKey: spring.foo\n\t\tLine: 5\n\t\tReason: none\n")
+        renames, gone = sm.parse_properties_migrator(log)
+        self.assertEqual(renames["spring.redis.host"], "spring.data.redis.host")
+        self.assertEqual(gone, {"spring.foo": "none"})
+        pr = Project({"src/main/resources/application.properties": "a=1\nspring.redis.host=r\n"})
+        sm.apply_property_renames(pr.root, renames)
+        self.assertEqual(pr["src/main/resources/application.properties"], "a=1\nspring.data.redis.host=r\n")
+        pr.close()
+
+    def test_httpclient5_parse_exception(self):
+        pr = Project({"src/main/java/a/C.java": """
+            package a;
+            import org.apache.hc.core5.http.io.entity.EntityUtils;
+            class C {
+                String get(org.apache.hc.core5.http.HttpEntity e) throws java.io.IOException { return EntityUtils.toString(e); }
+            }
+            """})
+        sm.fix_httpclient5_checked(pr.root)
+        j = pr["src/main/java/a/C.java"]
+        self.assertIn("return entityToString(e);", j)
+        self.assertIn("catch (org.apache.hc.core5.http.ParseException e)", j)
+        pr.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
