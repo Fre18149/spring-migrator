@@ -3905,20 +3905,43 @@ def _detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_g
         say_("[deps] no company parent, BOM or explicitly versioned library outside Spring found")
         return {"target": target, "internalGroups": internal_groups, "lines": [], "dependencies": []}
     say_(f"[deps] checking {len(refs)} parent/BOM/dependency reference(s) through your Maven settings")
-    say_(f"[deps]   1/2 reading available versions ({', '.join(r.artifact for r in refs[:6])}{' ...' if len(refs) > 6 else ''})")
-    repo.resolve([(r.group, r.artifact, "[0,)", "pom") for r in refs], "metadata", update=True)
-    candidates = {}
-    to_fetch = []
-    for r in refs:
-        newer = [v for v in repo.versions(r.group, r.artifact) if vtuple(v) > vtuple(r.version) and re.match(r"^[\d.]+(?:[.-](?:RELEASE|Final|GA))?$", v)]
-        by_major: dict[str, str] = {}
-        for v in newer:
-            by_major[v.split(".")[0]] = v       # sorted ascending -> keeps the latest of each major
-        cands = [r.version] + list(by_major.values())
-        candidates[(r.kind, r.group, r.artifact)] = cands
-        to_fetch += [(r.group, r.artifact, v, "pom" if r.kind != "dependency" else "jar") for v in cands]
-    say_(f"[deps]   2/2 downloading {len(set(to_fetch))} candidate version(s) to see what they were built against")
-    repo.resolve(sorted(set(to_fetch)), "candidates")
+    # 1) what the CURRENT versions were built against - usually already in the local repository from your builds.
+    #    Only references coupled to Spring / Java EE / OpenJPA need a new version; the rest are not looked up at all.
+    cur_items = [(r.group, r.artifact, r.version, "pom" if r.kind != "dependency" else "jar") for r in refs]
+    missing = [it for it in cur_items if not repo.path(it[0], it[1], it[2], "pom").exists()
+               or (it[3] == "jar" and not repo.path(it[0], it[1], it[2], "jar").exists())]
+    if missing:
+        say_(f"[deps]   1/3 fetching {len(missing)} current version(s) not in your local repository")
+        repo.resolve(missing, "current")
+    current = {(r.kind, r.group, r.artifact): built_against(repo, r.group, r.artifact, r.version) for r in refs}
+    coupled = [r for r in refs if boot_line_of(current[(r.kind, r.group, r.artifact)]) not in ("neutral",)
+               or current[(r.kind, r.group, r.artifact)]["openjpa"]]
+    skipped = [r for r in refs if r not in coupled]
+    if skipped:
+        say_(f"[deps]   {len(skipped)} without Spring/Java EE coupling, left as they are: {', '.join(r.artifact for r in skipped[:8])}"
+             f"{' ...' if len(skipped) > 8 else ''}")
+    candidates = {(r.kind, r.group, r.artifact): [r.version] for r in skipped}
+    if coupled:
+        # 2) version lists. A RELEASE lookup reads maven-metadata.xml (all versions) and downloads ONE pom; a version
+        #    range like [0,) would make Maven download the pom of every version in the range.
+        say_(f"[deps]   2/3 reading available versions of {len(coupled)}: {', '.join(r.artifact for r in coupled[:6])}"
+             f"{' ...' if len(coupled) > 6 else ''}")
+        repo.resolve([(r.group, r.artifact, "RELEASE", "pom") for r in coupled], "metadata", update=True)
+        to_fetch = []
+        for r in coupled:
+            newer = [v for v in repo.versions(r.group, r.artifact) if vtuple(v) > vtuple(r.version) and re.match(r"^[\d.]+(?:[.-](?:RELEASE|Final|GA))?$", v)]
+            by_major: dict[str, str] = {}
+            for v in newer:
+                by_major[v.split(".")[0]] = v       # sorted ascending -> keeps the latest of each major
+            cands = [r.version] + list(by_major.values())
+            candidates[(r.kind, r.group, r.artifact)] = cands
+            to_fetch += [(r.group, r.artifact, v, "pom" if r.kind != "dependency" else "jar") for v in cands[1:]]
+        # 3) only the newest release of each newer major line, to see what it was built against
+        to_fetch = [it for it in sorted(set(to_fetch)) if not repo.path(it[0], it[1], it[2], "pom").exists()
+                    or (it[3] == "jar" and not repo.path(it[0], it[1], it[2], "jar").exists())]
+        if to_fetch:
+            say_(f"[deps]   3/3 downloading {len(to_fetch)} candidate version(s) to see what they were built against")
+            repo.resolve(to_fetch, "candidates")
     for name, n, secs in repo.timings:
         say_(f"[deps]   {name}: {n} artifact(s) in {secs:.0f}s (log: {repo.log_dir / ('resolve-' + name + '.log')})")
     for repo_id, st in sorted(repo.traffic.items(), key=lambda kv: -kv[1]["seconds"])[:5]:
