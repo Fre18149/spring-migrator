@@ -428,6 +428,35 @@ class JaxbBindingTest(unittest.TestCase):
         pr.close()
 
 
+class JaxbVersionAndPluginDepsTest(unittest.TestCase):
+    def test_versions_bumped_in_jaxws_files_and_inline_customizations(self):
+        jaxws = ('<jaxws:bindings xmlns:jaxws="http://java.sun.com/xml/ns/jaxws" xmlns:jaxb="http://java.sun.com/xml/ns/jaxb" '
+                 'version="2.1" wsdlLocation="S.wsdl"><jaxb:bindings node="//xs:schema"><jaxb:globalBindings/></jaxb:bindings></jaxws:bindings>\n')
+        wsdl = ('<definitions xmlns="http://schemas.xmlsoap.org/wsdl/" xmlns:jaxb="http://java.sun.com/xml/ns/jaxb" '
+                'xmlns:xjc="http://java.sun.com/xml/ns/jaxb/xjc"><types><xs:schema jaxb:version="2.1" jaxb:extensionBindingPrefixes="xjc"/></types></definitions>\n')
+        pr = Project({"src/main/resources/ws/jaxws.binding.xml": jaxws, "src/main/resources/ws/S.wsdl": wsdl})
+        sm.fix_jaxb_tooling(pr.root)
+        j, w = pr["src/main/resources/ws/jaxws.binding.xml"], pr["src/main/resources/ws/S.wsdl"]
+        self.assertIn('version="3.0"', j)
+        self.assertIn('xmlns:jaxws="https://jakarta.ee/xml/ns/jaxws"', j)
+        self.assertIn('jaxb:version="3.0"', w)
+        self.assertIn('xmlns:jaxb="https://jakarta.ee/xml/ns/jaxb"', w)
+        self.assertIn('xmlns:xjc="http://java.sun.com/xml/ns/jaxb/xjc"', w)
+        pr.close()
+
+    def test_plugin_dependencies_are_planned(self):
+        pr = Project({"pom.xml": """<project><groupId>at.acme</groupId><artifactId>app</artifactId>
+  <build><plugins><plugin><groupId>org.codehaus.mojo</groupId><artifactId>exec-maven-plugin</artifactId>
+    <dependencies><dependency><groupId>at.acme.spring</groupId><artifactId>commons-lang</artifactId><version>1.48.29</version></dependency></dependencies>
+  </plugin></plugins></build></project>"""})
+        refs = {(r.group, r.artifact, r.version) for r in sm.collect_dependency_refs(pr.root)}
+        self.assertIn(("at.acme.spring", "commons-lang", "1.48.29"), refs)
+        plan = {"dependencies": [{"coordinate": "at.acme.spring:commons-lang", "upgrades": {"3.5": "2.7.4"}}]}
+        sm.apply_dependency_plan(pr.root, plan, "3.5")
+        self.assertIn("<artifactId>commons-lang</artifactId><version>2.7.4</version>", pr["pom.xml"])
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>

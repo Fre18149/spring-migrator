@@ -3213,15 +3213,18 @@ def fix_jaxb_tooling(root: Path) -> tuple[list[str], list[str]]:
             new = re.sub(r"\borg\.jvnet\.jaxb2_commons\.", "org.jvnet.jaxb.", new)
             for a, b in JAXB_RUNTIME_RENAMES.items():
                 new = re.sub(r"\b" + a + r"\b", b, new)
-        elif p.suffix in (".xjb", ".xml") and p.name != "pom.xml" and re.search(
+        elif p.suffix in (".xjb", ".xml", ".wsdl", ".xsd") and p.name != "pom.xml" and re.search(
                 r"http://java\.sun\.com/xml/ns/(?:jaxb|jaxws)|https://jakarta\.ee/xml/ns/jaxb/xjc", t):
             # Jakarta moved the JAXB and JAX-WS customization namespaces. The XJC extension namespace (xjc:javaType,
             # xjc:simple, ...) is RI-specific and did NOT move - wsimport/xjc reject https://jakarta.ee/xml/ns/jaxb/xjc.
             new = new.replace("https://jakarta.ee/xml/ns/jaxb/xjc", "http://java.sun.com/xml/ns/jaxb/xjc")  # repair earlier runs
             new = re.sub(r"http://java\.sun\.com/xml/ns/jaxb(?=[\"'])", "https://jakarta.ee/xml/ns/jaxb", new)
             new = re.sub(r"http://java\.sun\.com/xml/ns/jaxws(?=[\"'])", "https://jakarta.ee/xml/ns/jaxws", new)
-            if "https://jakarta.ee/xml/ns/jaxb\"" in new or "https://jakarta.ee/xml/ns/jaxb'" in new:
-                new = re.sub(r'(<(?:\w+:)?bindings\b[^>]*\bversion=")2\.\d(")', r"\g<1>3.0\g<2>", new)
+            if re.search(r"https://jakarta\.ee/xml/ns/jax(?:b|ws)[\"']", new):
+                # customization version 2.x -> 3.0 on every bindings element (JAXB and JAX-WS files) and on jaxb:version
+                # attributes of inline customizations (<xs:schema jaxb:version="2.1"> in a WSDL/XSD)
+                new = re.sub(r'(<(?:\w+:)?bindings\b[^>]*?\b(?:\w+:)?version=")2\.\d(")', r"\g<1>3.0\g<2>", new)
+                new = re.sub(r'(\b\w+:version=")2\.\d(")', lambda m: m.group(0) if not re.search(r"jaxb", m.group(1)) else m.group(1) + "3.0" + m.group(2), new)
         if write_if_changed(p, t, new):
             changes.append(f"{rel(p, root)}: JAXB {'runtime classes' if p.suffix in ('.java', '.kt') else 'binding namespace'} -> Jakarta")
     if changes:
@@ -3686,6 +3689,12 @@ def collect_dependency_refs(root: Path) -> list[DepRef]:
                 add(kind, _first_tag(b, "groupId"), _first_tag(b, "artifactId"), _first_tag(b, "version"), p)
         for s, e, g, a in pom_dependency_blocks(t):
             add("dependency", g, a, _first_tag(t[s:e].split("<exclusions>")[0], "version"), p)
+        # dependencies of plugins (exec:java generators, code generators ...) run with the build: a company library pinned
+        # there would mix Boot 2 jars (e.g. Logback 1.2) into a Boot 3 build
+        for pm in re.finditer(r"<plugin>.*?</plugin>", t, re.S):
+            for d in re.finditer(r"<dependency>(.*?)</dependency>", pm.group(0), re.S):
+                b = d.group(1).split("<exclusions>")[0]
+                add("dependency", _first_tag(b, "groupId"), _first_tag(b, "artifactId"), _first_tag(b, "version"), p)
     for p in build_files(root):
         if p.name == "pom.xml":
             continue
