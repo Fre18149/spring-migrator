@@ -32,6 +32,11 @@ public class ShopWebApplicationTests {
     }
 
     @Test
+    public void openApiGroupIsServed() throws Exception {
+        mvc.perform(get("/v3/api-docs/products")).andExpect(status().isOk()).andExpect(jsonPath("$.info.title").value("Shop"));
+    }
+
+    @Test
     public void validationStillApplies() throws Exception {
         mvc.perform(post("/products").contentType(MediaType.APPLICATION_JSON).content("{\"name\":\"\"}")).andExpect(status().isBadRequest());
     }

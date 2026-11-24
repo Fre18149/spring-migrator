@@ -446,6 +446,7 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
     changes += cc + ci
     changes += fix_quoted_properties(root, base_rev)
     changes += fix_springdoc_leftovers(root)
+    changes += fix_springdoc(root, boot_line)
     changes += fix_httptrace(root)
     changes += fix_httpclient5_checked(root)
     changes += fix_hibernate_props(root)
@@ -466,7 +467,8 @@ def run_legacy_codemods(root: Path, phase: str = "pre") -> tuple[list[str], list
     pre:  on the Boot 2.7 code, before the 3.5 recipes (the result must still compile on 2.7 - the rewrite plugin compiles first).
     post: after the 3.5 recipes, for generated code that only compiles on Boot 3 (Spring Authorization Server)."""
     changes, todo = [], []
-    fns = {"pre": (cm_stale_version_pins, cm_pin_generated_ids, cm_jpql_positional, cm_netflix, cm_legacy_oauth2, cm_openjpa_agent),
+    fns = {"pre": (cm_stale_version_pins, cm_pin_generated_ids, cm_jpql_positional, cm_netflix, cm_legacy_oauth2, cm_openjpa_agent,
+                   cm_springdoc_inline_versions),
            "post": (cm_authorization_server,)}[phase] if phase != "all" else \
         (cm_stale_version_pins, cm_pin_generated_ids, cm_jpql_positional, cm_netflix, cm_authorization_server, cm_legacy_oauth2, cm_openjpa_agent)
     for fn in fns:
@@ -2937,6 +2939,168 @@ def fix_boot4_aspectj(root: Path, stage_rev: str | None) -> list[str]:
     return changes
 
 
+# ---- springdoc: keep code and dependency on the same line (1.x Boot 2, 2.x Boot 3, 3.x Boot 4) -------------------
+SPRINGDOC_V2_CLASSES = {  # springdoc 1.x -> 2.x
+    "org.springdoc.core.GroupedOpenApi": "org.springdoc.core.models.GroupedOpenApi",
+    "org.springdoc.core.SpringDocUtils": "org.springdoc.core.utils.SpringDocUtils",
+    "org.springdoc.core.Constants": "org.springdoc.core.utils.Constants",
+    "org.springdoc.core.SpringDocConfigProperties": "org.springdoc.core.properties.SpringDocConfigProperties",
+    "org.springdoc.core.SwaggerUiConfigProperties": "org.springdoc.core.properties.SwaggerUiConfigProperties",
+    "org.springdoc.core.SwaggerUiConfigParameters": "org.springdoc.core.properties.SwaggerUiConfigParameters",
+    "org.springdoc.core.SwaggerUiOAuthProperties": "org.springdoc.core.properties.SwaggerUiOAuthProperties",
+    "org.springdoc.core.GenericResponseService": "org.springdoc.core.service.GenericResponseService",
+    "org.springdoc.core.OperationService": "org.springdoc.core.service.OperationService",
+    "org.springdoc.core.AbstractRequestService": "org.springdoc.core.service.AbstractRequestService",
+    "org.springdoc.core.customizers.OpenApiCustomiser": "org.springdoc.core.customizers.OpenApiCustomizer",
+}
+SPRINGDOC_V2_NAMES = {"OpenApiCustomiser": "OpenApiCustomizer", "addOpenApiCustomiser": "addOpenApiCustomizer"}
+SPRINGDOC_V2_ARTIFACTS = {  # springdoc 1.x artifact -> 2.x artifact (None: merged into springdoc-openapi-starter-common)
+    "springdoc-openapi-ui": "springdoc-openapi-starter-webmvc-ui", "springdoc-openapi-webmvc-core": "springdoc-openapi-starter-webmvc-api",
+    "springdoc-openapi-webflux-ui": "springdoc-openapi-starter-webflux-ui", "springdoc-openapi-webflux-core": "springdoc-openapi-starter-webflux-api",
+    "springdoc-openapi-common": "springdoc-openapi-starter-common", "springdoc-openapi-security": None, "springdoc-openapi-data-rest": None,
+    "springdoc-openapi-kotlin": None, "springdoc-openapi-hateoas": None,
+}
+SPRINGDOC_LINE = {"2": ("1", "springdoc-openapi-common", "1.8", "1.8.0"), "3": ("2", "springdoc-openapi-starter-common", "2.8", "2.8.17"),
+                  "4": ("3", "springdoc-openapi-starter-common", "3.0", "3.0.3")}
+
+
+def cm_springdoc_inline_versions(root: Path) -> tuple[list[str], list[str]]:
+    """Before the Boot 3.5 recipes: springdoc 1.x artifacts whose version comes from a property get the value inline.
+    OpenRewrite's springdoc upgrade bumps such a property to 2.x but leaves the 1.x artifact name, which has no 2.x
+    release. fix_springdoc renames and upgrades the artifact afterwards and puts the property back."""
+    changes = []
+    poms = [p for p in build_files(root) if p.name == "pom.xml"]
+    props = {}
+    for p in poms:
+        props.update(_pom_props(read(p) or ""))
+    for p in poms:
+        t = read(p) or ""
+        def inline(m):
+            blk = m.group(0)
+            if _first_tag(blk, "groupId") != "org.springdoc" or _first_tag(blk, "artifactId") not in SPRINGDOC_V2_ARTIFACTS:
+                return blk
+            v = _first_tag(blk, "version")
+            pm = re.fullmatch(r"\$\{([\w.\-]+)\}", v or "")
+            if not pm or not props.get(pm.group(1)):
+                return blk
+            return blk.replace(f"<version>{v}</version>", f"<version>{props[pm.group(1)]}</version><!--spring-migrate:{pm.group(1)}-->")
+        new = re.sub(r"<dependency>(?:(?!<dependency>).)*?</dependency>", inline, t, flags=re.S)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: springdoc 1.x version inlined for the upgrade (property restored afterwards)")
+    return changes, []
+
+
+def fix_springdoc(root: Path, boot_line: str) -> list[str]:
+    """OpenRewrite moves springdoc code to 2.x packages already in the Boot 2.7 stage, and only upgrades springdoc
+    dependencies that carry their own version - not one managed in a root <dependencyManagement> (often via a property)
+    or by a company parent/BOM. Then the code and the springdoc jar do not match ("package org.springdoc.core.models
+    does not exist"). Align both to the springdoc line of this stage's Boot version."""
+    changes = []
+    poms = [p for p in build_files(root) if p.name == "pom.xml"]
+    texts = {p: read(p) or "" for p in poms}
+    if not any("<groupId>org.springdoc</groupId>" in t for t in texts.values()):
+        return []
+    major, ref_artifact, line, fallback = SPRINGDOC_LINE[boot_line.split(".")[0]]
+    want = latest_patch("org.springdoc", ref_artifact, line, fallback)
+    v2 = major != "1"
+    props_to_set: dict[str, str] = {}
+    unversioned: set[str] = set()
+    managed_here: set[str] = set()
+    for p, t in texts.items():
+        new = t
+        if v2:
+            def rename(m):
+                blk = m.group(0)
+                a = _first_tag(blk, "artifactId")
+                if _first_tag(blk, "groupId") != "org.springdoc" or a not in SPRINGDOC_V2_ARTIFACTS:
+                    return blk
+                to = SPRINGDOC_V2_ARTIFACTS[a]
+                if to is None:
+                    return ""      # merged into springdoc 2's common module
+                return blk.replace(f"<artifactId>{a}</artifactId>", f"<artifactId>{to}</artifactId>")
+            new = re.sub(r"[ \t]*<dependency>(?:(?!<dependency>).)*?</dependency>[ \t]*\r?\n?", rename, new, flags=re.S)
+        dm_spans = [m.span() for m in re.finditer(r"<dependencyManagement>.*?</dependencyManagement>", new, re.S)]
+        for m in re.finditer(r"<dependency>((?:(?!<dependency>).)*?)</dependency>", new, re.S):
+            blk = m.group(1)
+            if _first_tag(blk, "groupId") != "org.springdoc":
+                continue
+            a, ver = _first_tag(blk, "artifactId"), _first_tag(blk, "version")
+            if any(x <= m.start() < y for x, y in dm_spans):
+                managed_here.add(a)
+            if not ver:
+                unversioned.add(a)
+            elif ver.startswith("${"):
+                props_to_set[ver[2:-1]] = want
+        def setver(m):
+            blk = m.group(0)
+            if _first_tag(blk, "groupId") != "org.springdoc":
+                return blk
+            ver = _first_tag(blk, "version")
+            if ver and not ver.startswith("${") and ver.split(".")[0] != major:
+                return blk.replace(f"<version>{ver}</version>", f"<version>{want}</version>")
+            return blk
+        new = re.sub(r"<dependency>(?:(?!<dependency>).)*?</dependency>", setver, new, flags=re.S)
+        texts[p] = new
+    for prop, v in props_to_set.items():
+        for p, t in texts.items():
+            m = re.search(r"<" + re.escape(prop) + r">([^<]*)</" + re.escape(prop) + r">", t)
+            if m and m.group(1).split(".")[0] != major:
+                texts[p] = t.replace(m.group(0), f"<{prop}>{v}</{prop}>")
+    # versions that come from outside the build (company parent / BOM): pin them in the top POM
+    outside = sorted(unversioned - managed_here)
+    top = root / "pom.xml" if (root / "pom.xml").exists() else (poms[0] if poms else None)
+    if outside and top:
+        t = texts[top]
+        for a in outside:
+            if a in (SPRINGDOC_V2_ARTIFACTS if v2 else {}) and SPRINGDOC_V2_ARTIFACTS.get(a) is None:
+                continue
+            dep = (f"      <dependency>\n        <groupId>org.springdoc</groupId>\n        <artifactId>{a}</artifactId>\n"
+                   f"        <version>{want}</version>\n      </dependency>\n")
+            mm = re.search(r"<dependencyManagement>\s*<dependencies>[ \t]*\n?", t)
+            if mm:
+                t = t[:mm.end()] + ("" if t[mm.end() - 1] == "\n" else "\n") + dep + t[mm.end():]
+            else:
+                block = f"  <dependencyManagement>\n    <dependencies>\n{dep}    </dependencies>\n  </dependencyManagement>\n"
+                anchor = _top_level(t, "dependencies") or _top_level(t, "build")
+                pos = anchor.start() if anchor else t.rindex("</project>")
+                t = t[:pos] + block + t[pos:]
+        texts[top] = t
+    # put back the version properties that cm_springdoc_inline_versions inlined
+    for p, t in list(texts.items()):
+        for m in list(re.finditer(r"<version>([^<]*)</version><!--spring-migrate:([\w.\-]+)-->", t)):
+            prop = m.group(2)
+            t = t.replace(m.group(0), f"<version>${{{prop}}}</version>")
+            for q in texts:
+                qt = t if q == p else texts[q]
+                pm = re.search(r"<" + re.escape(prop) + r">([^<]*)</" + re.escape(prop) + r">", qt)
+                if pm:
+                    nv = want if v2 or pm.group(1).split(".")[0] != major else pm.group(1)
+                    qt = qt.replace(pm.group(0), f"<{prop}>{nv}</{prop}>")
+                    if q == p:
+                        t = qt
+                    else:
+                        texts[q] = qt
+        texts[p] = t
+    for p, t in texts.items():
+        if write_if_changed(p, read(p) or "", t):
+            changes.append(f"{rel(p, root)}: springdoc -> {want} (Boot {boot_line} line; artifacts/managed versions aligned)")
+    # code: the class names of the same springdoc line
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "org.springdoc" not in t:
+            continue
+        new = t
+        pairs = list(SPRINGDOC_V2_CLASSES.items()) if v2 else [(b, a) for a, b in SPRINGDOC_V2_CLASSES.items()]
+        for a, b in sorted(pairs, key=lambda x: -len(x[0])):
+            new = re.sub(re.escape(a) + r"\b", b, new)
+        names = SPRINGDOC_V2_NAMES.items() if v2 else [(b, a) for a, b in SPRINGDOC_V2_NAMES.items()]
+        for a, b in names:
+            new = re.sub(r"\b" + a + r"\b", b, new)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: springdoc classes -> springdoc {major}.x names")
+    return changes
+
+
 HTTPTRACE_JAVA = [
     ("org.springframework.boot.actuate.trace.http.InMemoryHttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.InMemoryHttpExchangeRepository"),
     ("org.springframework.boot.actuate.trace.http.HttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository"),
@@ -3335,7 +3499,7 @@ DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.8.1"
 HIBERNATE_LINE = "2.7-hibernate"   # plan key applied in the OpenJPA -> Hibernate stage (Boot 2.7, javax)
 PLAN_LINES = (HIBERNATE_LINE, "3.5", "4.0", "4.1")
 # handled by OpenRewrite / the codemods / Boot's own dependency management
-DEP_SKIP_GROUPS = ("org.springframework", "io.springfox", "com.netflix", "org.powermock", "org.apache.openjpa", "org.apache.httpcomponents",
+DEP_SKIP_GROUPS = ("org.springframework", "io.springfox", "org.springdoc", "com.netflix", "org.powermock", "org.apache.openjpa", "org.apache.httpcomponents",
                    "javax.", "jakarta.", "org.junit", "junit", "org.openrewrite", "io.micrometer", "org.hibernate", "com.h2database")
 PUBLIC_GROUPS = ("org.apache", "com.fasterxml", "com.google", "org.projectlombok", "org.mockito", "org.postgresql", "com.mysql", "mysql",
                  "org.mariadb", "io.github.resilience4j", "org.springdoc", "org.slf4j", "ch.qos", "org.yaml", "org.assertj", "org.hamcrest",
@@ -3883,7 +4047,18 @@ def rewrite_had_download_failures(log: Path) -> list[str]:
         return []
     # only look at the output of the most recent invocation
     last = text.rsplit("\n$ ", 1)[-1]
-    return [l.strip()[:200] for l in last.splitlines() if DOWNLOAD_FAIL_RX.search(l)][:5]
+    hits = [l.strip() for l in last.splitlines() if DOWNLOAD_FAIL_RX.search(l)]
+    real = []
+    for l in hits:
+        m = re.search(r"Failed to download ([\w.\-]+):([\w.\-]+):([\w.\-]+)", l)
+        if m:
+            known = central_versions(m.group(1), m.group(2))
+            # a version that does not exist (often produced by a recipe, e.g. a property bump on a renamed artifact) is
+            # not a network problem; only versions that exist but could not be fetched mean skipped edits
+            if known and m.group(3) not in known:
+                continue
+        real.append(l[:200])
+    return real[:5]
 
 
 def git(root: Path, *args: str, check=True) -> str:
@@ -4242,6 +4417,10 @@ def cmd_migrate(a) -> int:
             pre_changes += post_c
             for c in post_c:
                 say(f"  legacy: {c}")
+        if not st.java_fix and st.key != OPENJPA_STAGE and not (code != 0 or dl):
+            for c in fix_springdoc(root, st.boot_line or "2.7"):
+                pre_changes.append(c)
+                say(f"  fixer: {c}")
         if st.java_fix:
             changes, todo = run_fixers(root, a.java, st.boot_line or "3.5", base_rev,
                                        trailing_slash=st.key.startswith("2-") and not a.no_trailing_slash_compat,
@@ -4250,6 +4429,8 @@ def cmd_migrate(a) -> int:
             for c in changes:
                 say(f"  fixer: {c}")
             changes = pre_changes + changes
+        if not st.java_fix:
+            changes = changes + pre_changes if st.key != OPENJPA_STAGE else changes
         note = f"{len(changes)} tool change(s)"
         if not a.no_git and git(root, "status", "--porcelain").strip():
             git(root, "add", "-A")

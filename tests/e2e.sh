@@ -62,6 +62,10 @@ multimodule() {
   test -f shop-web/src/main/java/com/acme/shop/web/TrailingSlashCompatibilityConfig.java
   ! test -f shop-worker/src/main/java/com/acme/shop/worker/TrailingSlashCompatibilityConfig.java
   grep -q 'sequenceName = "hibernate_sequence"' shop-core/src/main/java/com/acme/shop/core/Product.java
+  # springdoc 1.x managed via a root property: dependency and code must end on the same springdoc line
+  grep -q "springdoc-openapi-starter-webmvc-ui" pom.xml shop-web/pom.xml
+  grep -qE "<springdoc.version>3\." pom.xml
+  grep -q "org.springdoc.core.models.GroupedOpenApi" shop-web/src/main/java/com/acme/shop/web/SwaggerConfig.java
 }
 case "${1:-all}" in
   demo|openjpa|cloud|authserver|company|multimodule) "$1";;

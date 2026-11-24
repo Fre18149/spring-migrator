@@ -408,6 +408,57 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class SpringdocTest(unittest.TestCase):
+    ROOT = """<project>
+  <parent><groupId>{pg}</groupId><artifactId>{pa}</artifactId><version>1</version></parent>
+  <groupId>com.acme</groupId><artifactId>root</artifactId><version>1</version><packaging>pom</packaging>
+  <modules><module>web</module></modules>
+  <properties><springdoc.version>1.7.0</springdoc.version></properties>
+  {dm}
+</project>
+"""
+    WEB = ("<project><parent><groupId>com.acme</groupId><artifactId>root</artifactId><version>1</version></parent><artifactId>web</artifactId>"
+           "<dependencies><dependency><groupId>org.springdoc</groupId><artifactId>springdoc-openapi-ui</artifactId></dependency>"
+           "<dependency><groupId>org.springdoc</groupId><artifactId>springdoc-openapi-security</artifactId></dependency></dependencies></project>")
+    JAVA = ("package a;\nimport org.springdoc.core.models.GroupedOpenApi;\nimport org.springdoc.core.customizers.OpenApiCustomizer;\n"
+            "class C { Object g(OpenApiCustomizer c) { return GroupedOpenApi.builder().addOpenApiCustomizer(c).build(); } }\n")
+    DM = ("<dependencyManagement><dependencies><dependency><groupId>org.springdoc</groupId><artifactId>springdoc-openapi-ui</artifactId>"
+          "<version>${springdoc.version}</version></dependency></dependencies></dependencyManagement>")
+
+    def project(self, dm=True, parent=("org.springframework.boot", "spring-boot-starter-parent")):
+        return Project({"pom.xml": self.ROOT.format(pg=parent[0], pa=parent[1], dm=self.DM if dm else ""), "web/pom.xml": self.WEB,
+                        "web/src/main/java/a/C.java": self.JAVA})
+
+    def test_boot27_stage_keeps_springdoc1_names(self):
+        pr = self.project()
+        sm.fix_springdoc(pr.root, "2.7")
+        j = pr["web/src/main/java/a/C.java"]
+        self.assertIn("import org.springdoc.core.GroupedOpenApi;", j)
+        self.assertIn("OpenApiCustomiser", j)
+        self.assertIn("addOpenApiCustomiser", j)
+        self.assertIn("<springdoc.version>1.7.0</springdoc.version>", pr["pom.xml"])   # already a 1.x version
+        pr.close()
+
+    def test_boot35_upgrades_root_managed_property_and_artifacts(self):
+        pr = self.project()
+        sm.fix_springdoc(pr.root, "3.5")
+        root, web = pr["pom.xml"], pr["web/pom.xml"]
+        self.assertIn("<springdoc.version>2.8.17</springdoc.version>", root)
+        self.assertIn("springdoc-openapi-starter-webmvc-ui", root)
+        self.assertIn("springdoc-openapi-starter-webmvc-ui", web)
+        self.assertNotIn("springdoc-openapi-security", web)                 # merged into springdoc 2
+        self.assertIn("import org.springdoc.core.models.GroupedOpenApi;", pr["web/src/main/java/a/C.java"])
+        self.assertEqual(sm.fix_springdoc(pr.root, "3.5"), [])            # idempotent
+        pr.close()
+
+    def test_version_from_company_parent_is_pinned_in_root(self):
+        pr = self.project(dm=False, parent=("com.acme.platform", "acme-parent"))
+        sm.fix_springdoc(pr.root, "4.1")
+        root = pr["pom.xml"]
+        self.assertIn("<artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>\n        <version>3.0.3</version>", root)
+        pr.close()
+
+
 class BuilderTest(unittest.TestCase):
     def capture(self, **kw):
         seen = []

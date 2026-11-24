@@ -112,6 +112,11 @@ After the 3.5 recipes:
   configurer package moved in Spring Security 7
 * httptrace -> httpexchanges (classes, `management.trace.http.*`, endpoint exposure)
 * Hibernate 5 settings: version-specific dialects -> generic, `new_generator_mappings` removed
+* springdoc kept consistent: OpenRewrite moves springdoc code to 2.x packages already in the Boot 2.7 stage and only
+  upgrades springdoc dependencies that carry their own version. The tool keeps code and dependency on the same line
+  after every stage (1.x on Boot 2.7, 2.x on 3.5, 3.x on 4.x): artifact renames (`springdoc-openapi-ui` ->
+  `springdoc-openapi-starter-webmvc-ui`, merged modules removed) also in the root's `<dependencyManagement>`,
+  version properties, and a pin in the root when the version comes from a company parent/BOM
 * Spring Cloud release train aligned to each Boot line (3.5 -> 2025.0, 4.0/4.1 -> 2025.1, latest patch)
 * Containers and CI: deprecated `openjdk`/`adoptopenjdk` images -> `eclipse-temurin`, `maven:*-openjdk-11` images,
   Jenkins `jdk` tools, GitLab/Travis/Azure/Bitbucket/CircleCI pins, `.sdkmanrc` (resolved via SDKMAN), `.tool-versions`,
