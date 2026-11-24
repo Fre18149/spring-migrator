@@ -3199,20 +3199,28 @@ def apply_property_renames(root: Path, renames: dict[str, str]) -> list[str]:
 JAVAX_EE_BYTES = re.compile(rb"javax/(?:servlet|persistence|validation|transaction(?!/xa)|ws/rs|xml/bind|mail|jms|inject|json|websocket|el|enterprise|activation|interceptor|jws|annotation/(?:PostConstruct|PreDestroy|Resource|Priority))/")
 
 
-def javax_jars(classpath: list[str]) -> list[str]:
-    """Jars on the migrated classpath whose classes still reference javax.* EE types (they will fail at runtime)."""
+def javax_jars(classpath: list[str], direct: set[str] | None = None) -> list[str]:
+    """Jars declared directly in the build whose classes reference javax.* EE types and no jakarta.* at all.
+    (Transitive libraries such as commons-logging or Micrometer keep optional javax integrations; those are not flagged.)"""
     import zipfile
     bad = []
     for jar in classpath:
         if not jar.endswith(".jar") or re.search(r"/javax/|/jakarta\.|/javax\.", jar):
             continue
+        if direct is not None and not any(Path(jar).name.startswith(a + "-") for a in direct):
+            continue
         try:
             with zipfile.ZipFile(jar) as z:
+                javax = jakarta = False
                 for n in z.namelist():
                     if n.endswith(".class") and not n.startswith(("META-INF/versions/",)):
-                        if JAVAX_EE_BYTES.search(z.read(n)):
-                            bad.append(jar)
+                        b = z.read(n)
+                        javax = javax or JAVAX_EE_BYTES.search(b) is not None
+                        jakarta = jakarta or b"jakarta/" in b
+                        if jakarta:
                             break
+                if javax and not jakarta:
+                    bad.append(jar)
         except Exception:
             continue
     return bad
@@ -3626,7 +3634,8 @@ def cmd_migrate(a) -> int:
 
     # ---- jars still compiled against javax.* -------------------------------
     if not failed_stage and not a.skip_tests:
-        bad = javax_jars(builder.classpath())
+        direct = {a for bf in build_files(root) for _, _, _, a in pom_dependency_blocks(read(bf) or "") if a}
+        bad = javax_jars(builder.classpath(), direct)
         for j in bad:
             todo_all.append(f"dependency `{Path(j).name}` still references javax.* EE types and will fail at runtime - "
                             f"upgrade it to a Jakarta version (or run it through the Eclipse Transformer)")

@@ -42,8 +42,8 @@ The project must be a git repo with a clean tree. Run it on a copy/clone first. 
 After every stage the changes are **committed first**, then build+tests run **with `spring-boot-properties-migrator`
 on the classpath**. Renames it reports are applied to your `application*.properties|yml`, committed, and the build is
 re-run without it. If a stage fails, your fixes show up as a separate diff on top; re-run the same command to
-**resume** (it detects the current Boot version). After the last stage the runtime classpath is scanned for jars that
-still reference `javax.*` EE types.
+**resume** (it detects the current Boot version). After the last stage the runtime classpath is scanned for jars declared in your
+build that still reference only `javax.*` EE types (typically internal libraries); they are listed in the report.
 
 ## What is automated
 **By OpenRewrite** (`UpgradeSpringBoot_3_5` already contains these): Springfox -> springdoc (annotations, Docket ->
