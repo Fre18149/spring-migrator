@@ -212,6 +212,21 @@ Plan entries look like this (Gradle projects: write it by hand; it is applied to
 ```
 (`"2.7-hibernate"` is the key for the OpenJPA stage.)
 
+## Hibernate dialects (own Dialect classes, DB2 platforms)
+
+Hibernate 6 removed the version-specific dialects (`DB2390Dialect`, `PostgreSQL95Dialect`, `Oracle12cDialect`, ...) and the
+`registerHibernateType` / `supportsSequences` API. The tool converts properties, `persistence.xml` and your own dialect classes:
+
+* `extends DB2390Dialect` -> the Hibernate 6 class (`DB2zDialect`, or the one for `--db2-platform`)
+* `registerHibernateType(Types.CHAR, 1, StandardBasicTypes.STRING.getName())` -> a `resolveSqlTypeDescriptor` override
+  (`if (jdbcTypeCode == Types.CHAR && precision <= 1) return jdbcTypeRegistry.getDescriptor(Types.VARCHAR);`)
+* `supportsSequences()` -> dropped when `true` (the DB2 dialects have sequences), `getSequenceSupport()` with `NoSequenceSupport` when `false`
+* `registerColumnType`, `registerFunction`, ... -> listed as TODO in the report
+
+`--db2-platform luw|zos|ibmi` (on `migrate`, `update`, `fix`) picks the DB2 dialect: `luw` = `DB2Dialect`, `zos` = `DB2zDialect`,
+`ibmi` = `DB2iDialect`. Without it, `DB2390*` stays on z/OS and `DB2400*` on IBM i. When the database moved, e.g. from z/OS to LUW, on an
+already migrated branch: `python3 spring_migrate.py update . --db2-platform luw` (recorded in `.spring-migrate/state.json`).
+
 ## OpenJPA -> Hibernate
 OpenRewrite has no recipe for this, so the tool does it itself, as its own stage on Boot 2.7 (Hibernate 5.6, still
 `javax`) *before* the Spring 6 jump, so a persistence regression is caught on its own commit. Run it alone with

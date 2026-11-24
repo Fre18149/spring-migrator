@@ -555,6 +555,92 @@ class UpdateSupportTest(unittest.TestCase):
         pr.close()
 
 
+class CustomDialectTest(unittest.TestCase):
+    DIALECT = """
+        package at.x;
+
+        import java.sql.Types;
+        import org.hibernate.dialect.DB2390Dialect;
+        import org.hibernate.type.StandardBasicTypes;
+
+        public class CustomDb2390Dialect extends DB2390Dialect {
+
+            public CustomDb2390Dialect() {
+                registerHibernateType(Types.BIGINT, StandardBasicTypes.LONG.getName());
+                // enum domains mit l\u00e4nge 1 kommen als char
+                registerHibernateType(Types.CHAR, 1, StandardBasicTypes.STRING.getName());
+            }
+
+            @Override
+            public boolean supportsSequences() {
+                return %s;
+            }
+        }
+        """
+    F = "src/main/java/at/x/CustomDb2390Dialect.java"
+
+    def test_db2390_to_luw(self):
+        pr = Project({self.F: self.DIALECT % "true",
+                      "src/main/resources/application.properties": "spring.jpa.database-platform=org.hibernate.dialect.DB2390Dialect\n"})
+        changes, todo = sm.fix_custom_dialects(pr.root, "luw")
+        j = pr[self.F]
+        self.assertTrue(changes)
+        self.assertEqual(todo, [])
+        self.assertIn("import org.hibernate.dialect.DB2Dialect;", j)
+        self.assertIn("extends DB2Dialect {", j)
+        self.assertNotIn("DB2390", j.replace("CustomDb2390Dialect", ""))
+        self.assertNotIn("registerHibernateType", j)
+        self.assertNotIn("StandardBasicTypes", j)
+        self.assertNotIn("supportsSequences", j)
+        self.assertNotIn("public CustomDb2390Dialect()", j)        # constructor only registered types
+        self.assertIn("public JdbcType resolveSqlTypeDescriptor(String columnTypeName, int jdbcTypeCode, int precision, int scale,", j)
+        # length-specific rule first, the comment moves along
+        self.assertLess(j.index("Types.CHAR && precision <= 1"), j.index("Types.BIGINT)"))
+        self.assertLess(j.index("// enum domains"), j.index("Types.CHAR && precision <= 1"))
+        self.assertIn("return jdbcTypeRegistry.getDescriptor(Types.VARCHAR);", j)
+        self.assertIn("import org.hibernate.type.descriptor.jdbc.spi.JdbcTypeRegistry;", j)
+        self.assertEqual(sm.fix_custom_dialects(pr.root, "luw"), ([], []))
+        sm.fix_hibernate_props(pr.root, "luw")
+        self.assertIn("org.hibernate.dialect.DB2Dialect\n", pr["src/main/resources/application.properties"])
+        pr.close()
+
+    def test_default_keeps_platform_and_no_sequences(self):
+        pr = Project({self.F: self.DIALECT % "false",
+                      "src/main/resources/application.properties": "a=org.hibernate.dialect.DB2390Dialect\n"
+                                                                     "b=org.hibernate.dialect.DB2400Dialect\n"
+                                                                     "c=org.hibernate.dialect.DB297Dialect\n"
+                                                                     "d=org.hibernate.dialect.PostgreSQL95Dialect\n"
+                                                                     "e=org.hibernate.dialect.H2Dialect\n"})
+        sm.fix_custom_dialects(pr.root)
+        j = pr[self.F]
+        self.assertIn("extends DB2zDialect {", j)
+        self.assertIn("public SequenceSupport getSequenceSupport() {", j)
+        self.assertIn("return NoSequenceSupport.INSTANCE;", j)
+        self.assertIn("import org.hibernate.dialect.sequence.NoSequenceSupport;", j)
+        sm.fix_hibernate_props(pr.root)
+        self.assertEqual(pr["src/main/resources/application.properties"].split(), [
+            "a=org.hibernate.dialect.DB2zDialect", "b=org.hibernate.dialect.DB2iDialect", "c=org.hibernate.dialect.DB2Dialect",
+            "d=org.hibernate.dialect.PostgreSQLDialect", "e=org.hibernate.dialect.H2Dialect"])
+        # the platform changed later (z/OS -> LUW): update moves the already migrated class
+        sm.fix_custom_dialects(pr.root, "luw")
+        self.assertIn("extends DB2Dialect {", pr[self.F])
+        pr.close()
+
+    def test_unported_api_is_reported(self):
+        pr = Project({"src/main/java/a/D.java": """
+            package a;
+            import java.sql.Types;
+            import org.hibernate.dialect.PostgreSQL95Dialect;
+            public class D extends PostgreSQL95Dialect {
+                public D() { registerColumnType(Types.OTHER, "jsonb"); }
+            }
+            """})
+        changes, todo = sm.fix_custom_dialects(pr.root)
+        self.assertIn("extends PostgreSQLDialect", pr["src/main/java/a/D.java"])
+        self.assertTrue(any("registerColumnType" in x for x in todo))
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>

@@ -35,11 +35,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 # What each version changes for an already migrated branch (`spring_migrate.py update` prints the entries newer than the
 # version recorded in .spring-migrate/state.json). Every post-fixer is idempotent, so `update` simply runs them again.
 CHANGELOG = [
+    ("2.2.0", "own Hibernate dialects (e.g. extends DB2390Dialect): base -> Hibernate 6 class, registerHibernateType -> "
+              "resolveSqlTypeDescriptor, supportsSequences -> getSequenceSupport"),
+    ("2.2.0", "--db2-platform luw|zos|ibmi: DB2 dialects follow the platform (DB2390* = z/OS, DB2400* = IBM i by default)"),
     ("2.1.0", "Querydsl querydsl-apt:jpa classifier -> jakarta (javac 'NoClassDefFoundError: javax/persistence/Entity')"),
     ("2.1.0", "annotation processors in <annotationProcessorPaths>/plugin deps -> Jakarta (Hibernate metamodel generator, persistence-api)"),
     ("2.1.0", "Java level inherited from a company parent raised to the target Java (pattern switches compiled at -source 17)"),
@@ -482,7 +485,7 @@ def fix_ci_java(root: Path, java: int) -> tuple[list[str], list[str]]:
 
 def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | None = None,
                trailing_slash: bool = False, stage_rev: str | None = None, boot_version: str | None = None,
-               extra: list[str] | None = None) -> tuple[list[str], list[str]]:
+               extra: list[str] | None = None, db2_platform: str | None = None) -> tuple[list[str], list[str]]:
     """Post-fixers after a stage's OpenRewrite recipes. Idempotent."""
     changes = fix_spring_factories(root) + fix_javax_residuals(root)
     cc, todo = fix_containers_and_ci(root, java)
@@ -495,6 +498,10 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
     jc, jt = fix_jaxb_tooling(root)
     changes += jc
     todo_extra = jt
+    if not boot_line.startswith("2"):
+        dc_, dt_ = fix_custom_dialects(root, db2_platform)
+        changes += dc_
+        todo_extra += dt_
     changes += fix_jaxws_target(root)
     if boot_version:
         lrepo = local_repository(extra or [], os.environ.copy())
@@ -506,7 +513,7 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
         todo_extra += dt
     changes += fix_httptrace(root)
     changes += fix_httpclient5_checked(root)
-    changes += fix_hibernate_props(root)
+    changes += fix_hibernate_props(root, db2_platform)
     changes += fix_build_wrappers(root, boot_line)
     changes += fix_spring_cloud_train(root, boot_line)
     changes += fix_third_party(root)
@@ -3659,18 +3666,156 @@ DIALECT_MAP = [
     (r"PostgreSQL(?:8[12]|9[0-5]?|10)Dialect", "PostgreSQLDialect"), (r"PostgresPlus\w*Dialect", "PostgresPlusDialect"),
     (r"MySQL(?:5|55|57|8)?(?:InnoDB|MyISAM)?Dialect", "MySQLDialect"), (r"MariaDB(?:10[0-9]*|53)?Dialect", "MariaDBDialect"),
     (r"Oracle(?:8i|9i|10g|12c)Dialect", "OracleDialect"), (r"SQLServer(?:2005|2008|2012|2016)Dialect", "SQLServerDialect"),
-    (r"DB2(?:400)?V?\d*Dialect", "DB2Dialect"), (r"(?:H2|HSQL|Derby\w*)Dialect", None),
+    (r"(?:H2|HSQL|Derby\w*)Dialect", None),
 ]
 
 
-def fix_hibernate_props(root: Path) -> list[str]:
+DB2_PLATFORM_DIALECT = {"luw": "DB2Dialect", "zos": "DB2zDialect", "ibmi": "DB2iDialect"}
+# Hibernate 6/7 core still has these DB2 dialects; every other DB2 dialect (DB2390Dialect, DB2400Dialect, DB297Dialect, ...)
+# is gone in Hibernate 7 (DB2400* only deprecated in 6.6).
+_DB2_RX = r"DB2(?:390|400|z|i)?(?:V\d+R?\d*|\d+)?Dialect"
+
+
+def db2_dialect(name: str, platform: str | None) -> str:
+    """Hibernate 6 DB2 dialect for a Hibernate 5 one. Without an explicit platform each dialect keeps its platform
+    (DB2390* = z/OS, DB2400* = IBM i); with one (e.g. the database moved from z/OS to LUW) all of them go there."""
+    if platform:
+        return DB2_PLATFORM_DIALECT[platform]
+    if re.match(r"DB2(?:390|z)", name):
+        return "DB2zDialect"
+    if re.match(r"DB2(?:400|i)", name):
+        return "DB2iDialect"
+    return "DB2Dialect"
+
+
+def h6_dialect(name: str, platform: str | None) -> str | None:
+    """Hibernate 6 replacement for a (simple) Hibernate dialect class name, None when it stays."""
+    if re.fullmatch(_DB2_RX, name):
+        new = db2_dialect(name, platform)
+        return new if new != name else None
+    for rx, generic in DIALECT_MAP:
+        if generic and re.fullmatch(rx, name) and generic != name:
+            return generic
+    return None
+
+
+# Hibernate 5 type names (StandardBasicTypes.X.getName() / "x") -> the JDBC type whose descriptor gives that Java type
+_BASIC_TO_JDBC = {
+    "LONG": "BIGINT", "STRING": "VARCHAR", "INTEGER": "INTEGER", "SHORT": "SMALLINT", "BYTE": "TINYINT",
+    "BIG_DECIMAL": "NUMERIC", "BIG_INTEGER": "NUMERIC", "DOUBLE": "DOUBLE", "FLOAT": "FLOAT", "BOOLEAN": "BOOLEAN",
+    "DATE": "DATE", "TIME": "TIME", "TIMESTAMP": "TIMESTAMP", "CHARACTER": "CHAR", "BINARY": "VARBINARY",
+    "TEXT": "LONGVARCHAR", "CLOB": "CLOB", "BLOB": "BLOB", "MATERIALIZED_CLOB": "CLOB", "MATERIALIZED_BLOB": "BLOB",
+}
+_SEQUENCE_BASES = re.compile(r"DB2|Oracle|PostgreSQL|PostgresPlus|H2|HSQL|SQLServer|MariaDB|Derby|CockroachDB|HANA|Informix|Ingres")
+_REGISTER_TYPE_RX = re.compile(
+    r"(?P<comments>(?:^[ \t]*//[^\n]*\n)*)^[ \t]*(?:this\.)?registerHibernateType\(\s*(?:java\.sql\.)?Types\.(?P<code>\w+)\s*,"
+    r"\s*(?:(?P<len>\d+)L?\s*,\s*)?(?:(?:org\.hibernate\.type\.)?StandardBasicTypes\.(?P<basic>\w+)\.getName\(\)|\"(?P<name>\w+)\")"
+    r"\s*\)\s*;[ \t]*\r?\n", re.M)
+_SUPPORTS_SEQ_RX = re.compile(r"(?:^[ \t]*@Override\s*\n)?^([ \t]*)public\s+boolean\s+supportsSequences\s*\(\s*\)\s*\{\s*return\s+(true|false)\s*;\s*\}[ \t]*\r?\n", re.M)
+_REMOVED_DIALECT_API = ("registerColumnType", "registerFunction", "supportsPooledSequences", "getSequenceNextValString",
+                        "getQuerySequencesString", "getCreateSequenceString", "getLimitString", "supportsLimit",
+                        "getIdentityColumnString", "registerHibernateType")
+
+
+def _class_end(text: str) -> int:
+    return text.rstrip().rfind("}")
+
+
+def fix_custom_dialects(root: Path, db2_platform: str | None = None) -> tuple[list[str], list[str]]:
+    """Own Dialect subclasses (e.g. `CustomDb2390Dialect extends DB2390Dialect`) on Hibernate 6/7: the removed
+    version-specific base dialect -> its Hibernate 6 class, registerHibernateType(...) -> a resolveSqlTypeDescriptor
+    override, supportsSequences() -> getSequenceSupport(). Also plain references to removed dialect classes."""
+    changes, todo = [], []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "org.hibernate.dialect" not in t and "registerHibernateType" not in t:
+            continue
+        new, notes = t, []
+        # 1. removed dialect classes (imports, FQNs, then simple names when the import was swapped)
+        for m in sorted(set(re.findall(r"\borg\.hibernate\.dialect\.(\w+Dialect)\b", new))):
+            repl = h6_dialect(m, db2_platform)
+            if not repl:
+                continue
+            simple_imported = re.search(rf"^\s*import\s+org\.hibernate\.dialect\.{m}\s*;", new, re.M) is not None
+            new = re.sub(rf"\borg\.hibernate\.dialect\.{m}\b", f"org.hibernate.dialect.{repl}", new)
+            if simple_imported:
+                body_start = new.find(f"import org.hibernate.dialect.{repl};")
+                head, tail = new[:body_start], new[body_start:]
+                tail = re.sub(rf"(?<![\w.]){m}\b", repl, tail)
+                new = head + tail
+                # the same import twice (the class already imported the new name too)
+                imp = f"import org.hibernate.dialect.{repl};\n"
+                while new.count(imp) > 1:
+                    i = new.rfind(imp)
+                    new = new[:i] + new[i + len(imp):]
+            notes.append(f"{m} -> {repl}")
+        cls = re.search(r"\bclass\s+(\w+)\s+extends\s+([\w.]+Dialect)\b", new)
+        if cls:
+            name, base = cls.group(1), cls.group(2).rsplit(".", 1)[-1]
+            # 2. registerHibernateType -> resolveSqlTypeDescriptor
+            rules = []
+            for rm in list(_REGISTER_TYPE_RX.finditer(new)):
+                basic = (rm.group("basic") or rm.group("name") or "").upper()
+                jdbc = _BASIC_TO_JDBC.get(basic)
+                if not jdbc:
+                    continue
+                rules.append((rm.group("comments"), rm.group("code"), rm.group("len"), jdbc))
+            if rules and "resolveSqlTypeDescriptor" not in new:
+                new = _REGISTER_TYPE_RX.sub(lambda rm: "" if _BASIC_TO_JDBC.get((rm.group("basic") or rm.group("name") or "").upper())
+                                            else rm.group(0), new)
+                ind = re.search(rf"^([ \t]*)(?:public|protected|private)?\s*{name}\s*\(", new, re.M)
+                i1 = ind.group(1) if ind else "    "
+                i2 = i1 + ("\t" if i1.startswith("\t") else "    ")
+                i3 = i2 + ("\t" if i1.startswith("\t") else "    ")
+                rules.sort(key=lambda r: r[2] is None)  # length-specific rules first, like Hibernate 5's TypeNames
+                body = []
+                for comments, code, length, jdbc in rules:
+                    for c in comments.splitlines():
+                        body.append(i2 + c.strip())
+                    cond = f"jdbcTypeCode == Types.{code}" + (f" && precision <= {length}" if length else "")
+                    body += [f"{i2}if ({cond}) {{", f"{i3}return jdbcTypeRegistry.getDescriptor(Types.{jdbc});", f"{i2}}}"]
+                method = (f"\n{i1}@Override\n{i1}public JdbcType resolveSqlTypeDescriptor(String columnTypeName, int jdbcTypeCode, "
+                          f"int precision, int scale,\n{i1}        JdbcTypeRegistry jdbcTypeRegistry) {{\n" + "\n".join(body) +
+                          f"\n{i2}return super.resolveSqlTypeDescriptor(columnTypeName, jdbcTypeCode, precision, scale, jdbcTypeRegistry);\n"
+                          f"{i1}}}\n")
+                end = _class_end(new)
+                new = new[:end].rstrip() + "\n" + method + new[end:]
+                # a constructor that only registered types is now empty
+                new = re.sub(rf"\n(?:[ \t]*\n)*[ \t]*public\s+{name}\s*\(\s*\)\s*\{{\s*(?:super\(\s*\)\s*;\s*)?\}}[ \t]*\n", "\n", new)
+                for imp in ("java.sql.Types", "org.hibernate.type.descriptor.jdbc.JdbcType",
+                            "org.hibernate.type.descriptor.jdbc.spi.JdbcTypeRegistry"):
+                    new = add_import(new, imp)
+                new = drop_unused_imports(new, ["org.hibernate.type.StandardBasicTypes"])
+                notes.append(f"registerHibernateType -> resolveSqlTypeDescriptor ({len(rules)} rule(s))")
+            # 3. supportsSequences() (removed) -> getSequenceSupport()
+            sm = _SUPPORTS_SEQ_RX.search(new)
+            if sm and sm.group(2) == "true" and _SEQUENCE_BASES.search(base):
+                new = new[:sm.start()] + new[sm.end():]
+                new = re.sub(r"\n([ \t]*\n){2,}", "\n\n", new)
+                notes.append(f"supportsSequences() removed ({base} has sequence support in Hibernate 6)")
+            elif sm and sm.group(2) == "false" and "getSequenceSupport" not in new:
+                i1 = sm.group(1)
+                i2 = i1 + ("\t" if i1.startswith("\t") else "    ")
+                new = (new[:sm.start()] + f"{i1}@Override\n{i1}public SequenceSupport getSequenceSupport() {{\n"
+                       f"{i2}return NoSequenceSupport.INSTANCE;\n{i1}}}\n" + new[sm.end():])
+                new = add_import(add_import(new, "org.hibernate.dialect.sequence.NoSequenceSupport"),
+                                 "org.hibernate.dialect.sequence.SequenceSupport")
+                notes.append("supportsSequences() false -> getSequenceSupport() NoSequenceSupport")
+            for api in _REMOVED_DIALECT_API:
+                if re.search(rf"\b{api}\s*\(", new):
+                    todo.append(f"{rel(p, root)}: {api}(...) no longer exists in Hibernate 6 Dialect - port it "
+                                f"(see the Hibernate 6.0 migration guide, 'Dialect' section)")
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: Hibernate 6 dialect API ({'; '.join(notes) or 'updated'})")
+    return changes, todo
+
+
+def fix_hibernate_props(root: Path, db2_platform: str | None = None) -> list[str]:
     changes = []
     for p in config_files(root) + [x for x in walk(root) if x.name == "persistence.xml"]:
         t = read(p) or ""
-        new = t
-        for rx, generic in DIALECT_MAP:
-            if generic:
-                new = re.sub(r"org\.hibernate\.dialect\." + rx + r"\b", "org.hibernate.dialect." + generic, new)
+        new = re.sub(r"org\.hibernate\.dialect\.(\w+Dialect)\b",
+                     lambda m: "org.hibernate.dialect." + (h6_dialect(m.group(1), db2_platform) or m.group(1)), t)
         new = re.sub(r"(?m)^[ \t]*[\w.\-]*new[_-]generator[_-]mappings[\w.\-]*\s*[=:].*\r?\n?", "", new)
         new = re.sub(r'(?m)^[ \t]*<property\s+name="hibernate\.id\.new_generator_mappings"[^>]*/>[ \t]*\r?\n?', "", new)
         if write_if_changed(p, t, new):
@@ -5144,7 +5289,7 @@ def cmd_migrate(a) -> int:
             changes, todo = run_fixers(root, a.java, st.boot_line or "3.5", base_rev,
                                        trailing_slash=st.key.startswith("2-") and not a.no_trailing_slash_compat,
                                        stage_rev=stage_rev, boot_version=stage_boot_version(root, builder, env),
-                                       extra=builder.extra)
+                                       extra=builder.extra, db2_platform=a.db2_platform)
             todo_all += todo
             if builder.tool == "maven":
                 changes += fix_java_level(root, a.java, builder.exe, builder.extra, env)
@@ -5166,7 +5311,7 @@ def cmd_migrate(a) -> int:
         if not a.no_git and not (code != 0 or dl):
             write_state(root, target=a.target, java=a.java, boot_line=st.boot_line or "2.7", stage=st.key,
                         no_trailing_slash_compat=a.no_trailing_slash_compat or None, skip_frontend=a.skip_frontend or None,
-                        format_goal=a.format_goal, no_legacy=a.no_legacy or None)
+                        format_goal=a.format_goal, no_legacy=a.no_legacy or None, db2_platform=a.db2_platform)
         if not a.no_git and git(root, "status", "--porcelain").strip():
             git(root, "add", "-A")
             msg = f"chore(migration): {st.title}\n\nAutomated by spring-migrate {__version__} (OpenRewrite: {', '.join(st.recipes)})"
@@ -5291,7 +5436,7 @@ def cmd_scan(a) -> int:
 
 def cmd_fix(a) -> int:
     root = Path(a.path).resolve()
-    changes, todo = run_fixers(root, a.java)
+    changes, todo = run_fixers(root, a.java, db2_platform=a.db2_platform)
     for c in changes:
         say(c)
     for t in todo:
@@ -5386,8 +5531,9 @@ def cmd_update(a) -> int:
     if a.no_format:
         builder.format_goal = None
     stage_rev = git(root, "rev-parse", "HEAD").strip()
+    db2 = a.db2_platform or state.get("db2_platform")
     changes, todo = run_fixers(root, java, line, migration_base(root), trailing_slash=not state.get("no_trailing_slash_compat", False),
-                               stage_rev=stage_rev, boot_version=bv, extra=extra)
+                               stage_rev=stage_rev, boot_version=bv, extra=extra, db2_platform=db2)
     if info["tool"] == "maven":
         changes += fix_java_level(root, java, exe, extra, env)
     for c in changes:
@@ -5398,7 +5544,7 @@ def cmd_update(a) -> int:
                if f.endswith((".java", ".kt", ".groovy")) and (root / f).exists()]
     for n_ in builder.format("update", changed) or []:
         say(f"  format: {n_}")
-    write_state(root, java=java, boot_line=line, target=state.get("target"))
+    write_state(root, java=java, boot_line=line, target=state.get("target"), db2_platform=db2)
     git(root, "add", "-A")
     if git(root, "status", "--porcelain").strip():
         msg = (f"chore(migration): spring-migrate update {state.get('tool_version', 'pre-2.1.0')} -> {__version__}\n\n"
@@ -5456,6 +5602,7 @@ def build_parser() -> argparse.ArgumentParser:
     f = sub.add_parser("fix", help="run only the post-fixers")
     f.add_argument("path")
     f.add_argument("--java", type=int, choices=(17, 21), default=17)
+    f.add_argument("--db2-platform", choices=("luw", "zos", "ibmi"), help="DB2 platform for the Hibernate 6 dialect (DB2Dialect = LUW, DB2zDialect, DB2iDialect); default: each DB2 dialect keeps its platform (DB2390* = z/OS, DB2400* = IBM i)")
     f.set_defaults(fn=cmd_fix)
 
     o = sub.add_parser("openjpa", help="run only the OpenJPA -> Hibernate conversion (no build, no git)")
@@ -5479,6 +5626,7 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--java", type=int, choices=(17, 21), help="target Java (default: from .spring-migrate/state.json or the POM)")
     up.add_argument("--java-home")
     up.add_argument("--build-args", help='extra args for mvn/gradle, e.g. "-s /path/settings.xml"')
+    up.add_argument("--db2-platform", choices=("luw", "zos", "ibmi"), help="DB2 platform for the Hibernate 6 dialect (DB2Dialect = LUW, DB2zDialect, DB2iDialect); default: from .spring-migrate/state.json, else each DB2 dialect keeps its platform (DB2390* = z/OS, DB2400* = IBM i)")
     up.add_argument("--skip-tests", action="store_true", help="only apply and commit the fixes, no build")
     up.add_argument("--skip-frontend", action="store_true")
     up.add_argument("--format-goal")
@@ -5525,6 +5673,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "code that uses generated sources then gets less precise recipes")
     m.add_argument("--extra-recipe", action="append", help="additional OpenRewrite recipe name to run in the last stage (repeatable)")
     m.add_argument("--no-legacy", action="store_true", help="skip the legacy-library codemods (Netflix, legacy OAuth2, id pinning, ...)")
+    m.add_argument("--db2-platform", choices=("luw", "zos", "ibmi"), help="DB2 platform for the Hibernate 6 dialect (DB2Dialect = LUW, DB2zDialect, DB2iDialect); default: each DB2 dialect keeps its platform (DB2390* = z/OS, DB2400* = IBM i)")
     m.add_argument("--no-trailing-slash-compat", action="store_true", help="do not add the trailing-slash compatibility filter")
     m.add_argument("--no-properties-migrator", action="store_true", help="do not run tests with spring-boot-properties-migrator")
     m.add_argument("--dependency-plan", help=f"use this {DEP_PLAN_FILE} (from `deps` or a previous run) instead of detecting")
