@@ -212,6 +212,26 @@ Plan entries look like this (Gradle projects: write it by hand; it is applied to
 ```
 (`"2.7-hibernate"` is the key for the OpenJPA stage.)
 
+## Compile errors fixed from the build log
+
+Some API changes depend on types only the compiler knows. When a stage's (or `update`'s) build fails, the tool reads javac's
+errors (English or German) and applies the fixes that have exactly one safe form, then builds again (up to 4 rounds,
+one commit each):
+
+| Error | Fix |
+|---|---|
+| `LocalDateTime cannot be converted to Date` (Spring Batch 5 `JobExecution`/`StepExecution` times) | `Date.from(x.atZone(ZoneId.systemDefault()).toInstant())` |
+| `getTime()` not found on a `LocalDateTime` | `x.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()` |
+| `HttpStatusCode cannot be converted to HttpStatus` | `HttpStatus.valueOf(x.value())` |
+| `OperatorProcessor` constructor needs a `PDFStreamEngine` (PDFBox 3) | `new OperatorProcessor(Stripper.this)` |
+| `getUnicodeCmap(..)` not found (FontBox 3) | `getUnicodeCmapLookup(..)`, `CmapSubtable` variable -> `CmapLookup` |
+| a constructor now needs the `EntityManager` (e.g. a company Querydsl provider bean) | `@PersistenceContext EntityManager` field, passed in |
+| `case label is dominated` | the unreachable arm is removed |
+
+Fixed before the build, from the source: `DefaultResponseErrorHandler.handleError(response, HttpStatus)` overrides
+(-> `HttpStatusCode, URI, HttpMethod`), HttpClient 5 `setSSLContext`/`setSSLHostnameVerifier` (-> connection manager), and
+Spring Security's X-XSS-Protection `block(true)` (-> `headerValue(ENABLED_MODE_BLOCK)`).
+
 ## Hibernate dialects (own Dialect classes, DB2 platforms)
 
 Hibernate 6 removed the version-specific dialects (`DB2390Dialect`, `PostgreSQL95Dialect`, `Oracle12cDialect`, ...) and the

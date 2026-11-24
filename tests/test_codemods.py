@@ -641,6 +641,138 @@ class CustomDialectTest(unittest.TestCase):
         pr.close()
 
 
+class Boot3ApiFixTest(unittest.TestCase):
+    def test_source_codemods(self):
+        pr = Project({
+            "src/main/java/a/Ws.java": """
+                package a;
+                import org.apache.hc.client5.http.impl.classic.HttpClients;
+                import org.apache.hc.client5.http.ssl.NoopHostnameVerifier;
+                class Ws {
+                  Object c(javax.net.ssl.SSLContext ctx) {
+                    return HttpClients.custom()
+                        .setSSLContext(ctx)
+                        .setSSLHostnameVerifier(NoopHostnameVerifier.INSTANCE)
+                        .build();
+                  }
+                }
+                """,
+            "src/main/java/a/Sec.java": """
+                package a;
+                class Sec {
+                  void c(org.springframework.security.config.annotation.web.builders.HttpSecurity http) throws Exception {
+                    http.headers(h -> h.xssProtection(x -> x.xssProtectionEnabled(true).block(true)));
+                  }
+                }
+                """,
+            "src/main/java/a/Eh.java": """
+                package a;
+                import java.io.IOException;
+                import org.springframework.http.HttpStatus;
+                import org.springframework.http.client.ClientHttpResponse;
+                import org.springframework.web.client.DefaultResponseErrorHandler;
+                class Eh extends DefaultResponseErrorHandler {
+                  @Override
+                  public void handleError(ClientHttpResponse response) throws IOException {
+                    handleError(response, HttpStatus.BAD_REQUEST);
+                  }
+                  @Override
+                  protected void handleError(ClientHttpResponse response, HttpStatus statusCode) throws IOException {
+                    if (statusCode.series() == HttpStatus.Series.CLIENT_ERROR) {
+                      return;
+                    }
+                    super.handleError(response, statusCode);
+                  }
+                }
+                """})
+        sm.fix_httpclient5_ssl(pr.root)
+        ws = pr["src/main/java/a/Ws.java"]
+        self.assertIn(".setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create().setSSLSocketFactory("
+                      "SSLConnectionSocketFactoryBuilder.create().setSslContext(ctx).setHostnameVerifier(NoopHostnameVerifier.INSTANCE)"
+                      ".build()).build())\n        .build();", ws)
+        self.assertNotIn("setSSLContext", ws)
+        self.assertNotIn("setSSLHostnameVerifier", ws)
+        sm.fix_xss_block(pr.root)
+        self.assertIn("x -> x.headerValue(XXssProtectionHeaderWriter.HeaderValue.ENABLED_MODE_BLOCK))", pr["src/main/java/a/Sec.java"])
+        sm.fix_response_error_handler(pr.root)
+        eh = pr["src/main/java/a/Eh.java"]
+        self.assertIn("protected void handleError(ClientHttpResponse response, HttpStatusCode httpStatusCode, URI url, HttpMethod method)", eh)
+        self.assertIn("HttpStatus statusCode = HttpStatus.valueOf(httpStatusCode.value());", eh)   # series() needs HttpStatus
+        self.assertIn("super.handleError(response, statusCode, url, method);", eh)
+        self.assertIn("handleError(response, HttpStatus.BAD_REQUEST, null, null);", eh)
+        self.assertIn("import java.net.URI;", eh)
+        for f in (sm.fix_xss_block, sm.fix_response_error_handler):
+            self.assertEqual(f(pr.root), [])
+        self.assertEqual(sm.fix_httpclient5_ssl(pr.root), ([], []))
+        pr.close()
+
+    def test_autofix_from_german_maven_log(self):
+        pr = Project({
+            "src/main/java/a/T.java": """
+                package a;
+                import java.time.LocalDateTime;
+                import java.util.Date;
+                class T {
+                  Date end(org.springframework.batch.core.JobExecution e) {
+                    return e.getEndTime();
+                  }
+                  long d(LocalDateTime jobExecEndTime) {
+                    return jobExecEndTime.getTime();
+                  }
+                }
+                """,
+            "src/main/java/a/C.java": """
+                package a;
+                import org.springframework.context.annotation.Configuration;
+                @Configuration
+                public class C {
+
+                  Object p() {
+                    return new ProviderBean();
+                  }
+                }
+                """,
+            "src/main/java/a/S.java": """
+                package a;
+                class S extends org.apache.pdfbox.text.PDFTextStripper {
+                  S() throws java.io.IOException {
+                    addOperator(
+                      new OperatorProcessor() {
+                      });
+                  }
+                }
+                """})
+        f = lambda n: str(pr.root / "src/main/java/a" / n)
+        log = pr.root / "build.log"
+        log.write_text(f"""[ERROR] COMPILATION ERROR :
+[ERROR] {f("T.java")}:[6,24] Inkompatible Typen: java.time.LocalDateTime kann nicht in java.util.Date konvertiert werden
+[ERROR] {f("T.java")}:[9,26] Symbol nicht gefunden
+  Symbol: Methode getTime()
+  Ort: Variable jobExecEndTime von Typ java.time.LocalDateTime
+[ERROR] {f("C.java")}:[7,12] Konstruktor ProviderBean in Klasse a.ProviderBean kann nicht auf die angegebenen Typen angewendet werden.
+  Erforderlich: jakarta.persistence.EntityManager
+  Ermittelt:    keine Argumente
+  Grund: Liste der tats\u00e4chlichen Argumente hat eine andere L\u00e4nge als die der formalen Argumente
+[ERROR] {f("S.java")}:[5,7] Konstruktor OperatorProcessor in Klasse org.apache.pdfbox.contentstream.operator.OperatorProcessor kann nicht auf die angegebenen Typen angewendet werden.
+  Erforderlich: org.apache.pdfbox.contentstream.PDFStreamEngine
+  Ermittelt:    keine Argumente
+[ERROR] {f("T.java")}:[6,24] Inkompatible Typen: java.time.LocalDateTime kann nicht in java.util.Date konvertiert werden
+""", encoding="utf-8")
+        changes = sm.autofix_compile_errors(pr.root, log)
+        self.assertEqual(len(changes), 3)
+        self.assertIsNone(sm._expr_span("return e.getEndTime();", 12))         # mid-identifier column: no edit
+        t = pr["src/main/java/a/T.java"]
+        self.assertIn("return Date.from(e.getEndTime().atZone(ZoneId.systemDefault()).toInstant());", t)   # once, despite the repeat
+        self.assertIn("return jobExecEndTime.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();", t)
+        self.assertIn("import java.time.ZoneId;", t)
+        c = pr["src/main/java/a/C.java"]
+        self.assertIn("public class C {\n  @PersistenceContext\n  private EntityManager entityManager;\n\n  Object p()", c)
+        self.assertIn("return new ProviderBean(entityManager);", c)
+        self.assertIn("import jakarta.persistence.PersistenceContext;", c)
+        self.assertIn("new OperatorProcessor(S.this) {", pr["src/main/java/a/S.java"])
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>

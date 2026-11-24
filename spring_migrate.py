@@ -40,6 +40,14 @@ __version__ = "2.2.0"
 # What each version changes for an already migrated branch (`spring_migrate.py update` prints the entries newer than the
 # version recorded in .spring-migrate/state.json). Every post-fixer is idempotent, so `update` simply runs them again.
 CHANGELOG = [
+    ("2.2.0", "Spring Batch 5 LocalDateTime (getStartTime/getEndTime -> Date, .getTime()), HttpStatusCode -> HttpStatus: "
+              "converted where the build reports them"),
+    ("2.2.0", "DefaultResponseErrorHandler.handleError(response, HttpStatus) -> (response, HttpStatusCode, URI, HttpMethod)"),
+    ("2.2.0", "HttpClient 5: HttpClientBuilder.setSSLContext/setSSLHostnameVerifier -> connection manager SSL socket factory"),
+    ("2.2.0", "Spring Security 6: X-XSS-Protection block(true) -> headerValue(ENABLED_MODE_BLOCK)"),
+    ("2.2.0", "PDFBox/FontBox 3: OperatorProcessor(PDFStreamEngine), getUnicodeCmap -> getUnicodeCmapLookup"),
+    ("2.2.0", "constructors that now need the EntityManager (e.g. Querydsl provider beans) get the shared one (@PersistenceContext)"),
+    ("2.2.0", "compile autofix runs up to 4 rounds (javac reports further errors once the first ones are fixed)"),
     ("2.2.0", "own Hibernate dialects (e.g. extends DB2390Dialect): base -> Hibernate 6 class, registerHibernateType -> "
               "resolveSqlTypeDescriptor, supportsSequences -> getSequenceSupport"),
     ("2.2.0", "--db2-platform luw|zos|ibmi: DB2 dialects follow the platform (DB2390* = z/OS, DB2400* = IBM i by default)"),
@@ -56,6 +64,7 @@ CHANGELOG = [
     ("2.1.0", "ISO-8859-1 files (umlauts) keep their encoding when edited"),
 ]
 STATE_FILE = ".spring-migrate/state.json"
+AUTOFIX_ROUNDS = 4
 
 IGNORE_DIRS = {".git", "target", "build", "node_modules", ".gradle", ".idea", ".mvn", "out", ".settings"}
 MAX_FILE_BYTES = 2_000_000
@@ -513,6 +522,12 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
         todo_extra += dt
     changes += fix_httptrace(root)
     changes += fix_httpclient5_checked(root)
+    if not boot_line.startswith("2"):
+        hc, ht = fix_httpclient5_ssl(root)
+        changes += hc
+        todo_extra += ht
+        changes += fix_xss_block(root)
+        changes += fix_response_error_handler(root)
     changes += fix_hibernate_props(root, db2_platform)
     changes += fix_build_wrappers(root, boot_line)
     changes += fix_spring_cloud_train(root, boot_line)
@@ -2961,6 +2976,156 @@ def fix_springdoc_leftovers(root: Path) -> list[str]:
     return changes
 
 
+def _chain_call_span(text: str, name: str, start: int = 0):
+    """Next `.name(args)` at or after start: (dot index, index after the closing paren, args) or None."""
+    m = re.compile(r"\.\s*" + name + r"\s*\(").search(text, start)
+    if not m:
+        return None
+    e = balanced(text, m.end() - 1)
+    return (m.start(), e + 1, text[m.end():e]) if e != -1 else None
+
+
+def fix_httpclient5_ssl(root: Path) -> tuple[list[str], list[str]]:
+    """HttpClient 5's HttpClientBuilder has no setSSLContext/setSSLHostnameVerifier: TLS belongs to the connection manager.
+    SSLConnectionSocketFactoryBuilder works on every 5.x (deprecated from 5.4 on, in favour of TlsSocketStrategy)."""
+    changes, todo = [], []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "org.apache.hc.client5" not in t or not re.search(r"\.\s*setSSL(?:Context|HostnameVerifier)\s*\(", t):
+            continue
+        new, pos, n = t, 0, 0
+        while True:
+            ctx = _chain_call_span(new, "setSSLContext", pos)
+            if not ctx:
+                break
+            # the rest of this builder chain (up to the end of the statement)
+            stmt_end = new.find(";", ctx[1])
+            hv = _chain_call_span(new, "setSSLHostnameVerifier", ctx[1])
+            hv = hv if hv and hv[0] < stmt_end else None
+            prev = new.rfind(";", 0, ctx[0])
+            if ".setConnectionManager(" in new[prev + 1:stmt_end]:
+                todo.append(f"{rel(p, root)}: setSSLContext(...) next to setConnectionManager(...) - configure TLS on that connection manager")
+                pos = ctx[1]
+                continue
+            sf = f"SSLConnectionSocketFactoryBuilder.create().setSslContext({ctx[2].strip()})"
+            if hv:
+                sf += f".setHostnameVerifier({hv[2].strip()})"
+                ls, le = new.rfind("\n", 0, hv[0]) + 1, new.find("\n", hv[1])
+                if le != -1 and not new[ls:hv[0]].strip() and not new[hv[1]:le].strip():
+                    new = new[:ls] + new[le + 1:]                   # the call had its own line
+                else:
+                    new = new[:hv[0]] + new[hv[1]:]
+            repl = (f".setConnectionManager(PoolingHttpClientConnectionManagerBuilder.create()"
+                    f".setSSLSocketFactory({sf}.build()).build())")
+            new = new[:ctx[0]] + repl + new[ctx[1]:]
+            pos = ctx[0] + len(repl)
+            n += 1
+        if n:
+            for imp in ("org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder",
+                        "org.apache.hc.client5.http.ssl.SSLConnectionSocketFactoryBuilder"):
+                new = add_import(new, imp)
+        if re.search(r"\.\s*setSSLHostnameVerifier\s*\(", new):
+            todo.append(f"{rel(p, root)}: setSSLHostnameVerifier(...) without setSSLContext - move it to an "
+                        f"SSLConnectionSocketFactoryBuilder on the connection manager")
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: HttpClient 5 TLS: setSSLContext(...) -> connection manager with an SSL socket factory")
+    return changes, todo
+
+
+_XSS = "XXssProtectionHeaderWriter.HeaderValue."
+
+
+def fix_xss_block(root: Path) -> list[str]:
+    """Spring Security 6 removed XXssConfig.block(boolean)/xssProtectionEnabled(boolean): headerValue(HeaderValue.X)."""
+    changes = []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "xssProtection" not in t or not re.search(r"\.\s*(?:block|xssProtectionEnabled)\s*\(\s*(?:true|false)\s*\)", t):
+            continue
+        new = re.sub(r"\.(\s*)block\s*\(\s*true\s*\)", rf".\1headerValue({_XSS}ENABLED_MODE_BLOCK)", t)
+        new = re.sub(r"\.(\s*)block\s*\(\s*false\s*\)", rf".\1headerValue({_XSS}ENABLED)", new)
+        new = re.sub(r"\.(\s*)xssProtectionEnabled\s*\(\s*true\s*\)", rf".\1headerValue({_XSS}ENABLED)", new)
+        new = re.sub(r"\.(\s*)xssProtectionEnabled\s*\(\s*false\s*\)", rf".\1headerValue({_XSS}DISABLED)", new)
+        # enabled(x).block(y) became two headerValue calls: Spring Security 5 sent "0" when disabled, else block wins
+        rank = {"DISABLED": 2, "ENABLED_MODE_BLOCK": 1, "ENABLED": 0}
+        pair = re.compile(r"\.headerValue\(" + re.escape(_XSS) + r"(\w+)\)(\s*)\.headerValue\(" + re.escape(_XSS) + r"(\w+)\)")
+        while pair.search(new):
+            new = pair.sub(lambda m: f".headerValue({_XSS}{max(m.group(1), m.group(3), key=lambda v: rank.get(v, 0))})", new)
+        new = add_import(new, "org.springframework.security.web.header.writers.XXssProtectionHeaderWriter")
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: X-XSS-Protection block()/xssProtectionEnabled() -> headerValue(HeaderValue...)")
+    return changes
+
+
+_HANDLE_ERROR_RX = re.compile(r"(protected|public)(\s+)void\s+handleError\s*\(\s*((?:final\s+)?)ClientHttpResponse\s+(\w+)\s*,"
+                              r"\s*(?:final\s+)?HttpStatus\s+(\w+)\s*\)")
+
+
+def _extend_super_calls(text: str, extra: str) -> str:
+    """Two-argument handleError(a, b) calls (super., this. or unqualified) -> handleError(a, b, <extra>).
+    Declarations and other arities stay."""
+    out, i = [], 0
+    for mm in re.finditer(r"(?:\bsuper\s*\.\s*|\bthis\s*\.\s*|(?<![\w.$]))handleError\s*\(", text):
+        if mm.start() < i:
+            continue
+        before = text[:mm.start()].rstrip()
+        if not mm.group(0).startswith(("super", "this")) and re.search(r"[\w$>\]]$", before) and not before.endswith("return"):
+            continue                                           # a declaration: `void handleError(`
+        k = mm.end() - 1
+        e = balanced(text, k)
+        if e == -1:
+            break
+        if len(split_top_level(text[k + 1:e])) == 2:
+            out.append(text[i:e] + ", " + extra)
+            i = e
+    out.append(text[i:])
+    return "".join(out)
+
+
+def fix_response_error_handler(root: Path) -> list[str]:
+    """DefaultResponseErrorHandler.handleError(ClientHttpResponse, HttpStatus) is gone (Spring 6):
+    handleError(ClientHttpResponse, HttpStatusCode, URI, HttpMethod). Two-argument super calls get the new arguments."""
+    changes = []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if not re.search(r"extends\s+(?:[\w.]+\.)?DefaultResponseErrorHandler\b", t) or not _HANDLE_ERROR_RX.search(t):
+            continue
+        new, pos = t, 0
+        while True:
+            m = _HANDLE_ERROR_RX.search(new, pos)
+            if not m:
+                break
+            ob = new.find("{", m.end())
+            cb = balanced(new, ob, "{", "}") if ob != -1 else -1
+            if cb == -1:
+                break
+            body = new[ob + 1:cb]
+            resp, status = m.group(4), m.group(5)
+            url = "url" if not re.search(r"\burl\b", body) else "requestUrl"
+            meth = "method" if not re.search(r"\bmethod\b", body) else "requestMethod"
+            # HttpStatus-only API in the body (series(), getReasonPhrase(), constants): keep a local HttpStatus
+            rest = re.sub(r"handleError\s*\([^;]*\)", "", body)
+            rest = re.sub(rf"\b{status}\s*\.\s*(?:value|is\dxx\w*|isError|isSameCodeAs)\s*\(", "", rest)
+            needs_local = re.search(rf"\b{status}\b", rest) is not None
+            pname = next((n for n in ("httpStatusCode", "statusCodeValue", status + "Code") if not re.search(rf"\b{n}\b", body)),
+                         status + "Code") if needs_local else status
+            body = _extend_super_calls(body, f"{url}, {meth}")
+            ind = re.search(r"\n([ \t]+)\S", body)
+            local = (f"\n{ind.group(1) if ind else '        '}HttpStatus {status} = HttpStatus.valueOf({pname}.value());"
+                     if needs_local else "")
+            header = (f"{m.group(1)}{m.group(2)}void handleError({m.group(3)}ClientHttpResponse {resp}, HttpStatusCode {pname}, "
+                      f"URI {url}, HttpMethod {meth})")
+            new = new[:m.start()] + header + new[m.end():ob + 1] + local + body + new[cb:]
+            pos = m.start() + len(header)
+        new = _extend_super_calls(new, "null, null")      # calls in other methods: no request URL/method there
+        for imp in ("org.springframework.http.HttpStatusCode", "org.springframework.http.HttpMethod", "java.net.URI"):
+            new = add_import(new, imp)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: DefaultResponseErrorHandler.handleError(response, HttpStatus) -> "
+                           f"handleError(response, HttpStatusCode, URI, HttpMethod)")
+    return changes
+
+
 def fix_httpclient5_checked(root: Path) -> list[str]:
     """HttpClient 5's EntityUtils.toString throws the checked ParseException (unchecked in 4.x). Route calls through a
     helper that rethrows it as IOException, which callers of the 4.x API already handle."""
@@ -3449,13 +3614,216 @@ def _remove_switch_arm(text: str, line_no: int) -> str | None:
     return "\n".join(lines[:i] + lines[j:])
 
 
+_ERR_HEAD_RX = re.compile(r"^\[ERROR\] ((?:[A-Za-z]:)?[/\\].+?\.java):\[(\d+),(\d+)\] (.*)$")
+
+
+def compile_errors(log_text: str) -> list[tuple[str, int, int, str]]:
+    """javac errors from a Maven log: (file, line, column, message incl. the indented detail lines), deduplicated."""
+    out, seen = [], set()
+    lines = log_text.splitlines()
+    for i, l in enumerate(lines):
+        m = _ERR_HEAD_RX.match(l.strip())
+        if not m:
+            continue
+        detail = []
+        for d in lines[i + 1:i + 8]:
+            if d.startswith("[") or not d.strip():
+                break
+            detail.append(d.strip())
+        key = (m.group(1), int(m.group(2)), int(m.group(3)))
+        if key not in seen:
+            seen.add(key)
+            out.append((*key, m.group(4) + "\n" + "\n".join(detail)))
+    return out
+
+
+def _offset(text: str, line: int, col: int) -> int | None:
+    """Index of javac's (1-based line, 1-based column; tabs expand to multiples of 8) position."""
+    lines = text.split("\n")
+    if line < 1 or line > len(lines):
+        return None
+    start = sum(len(x) + 1 for x in lines[:line - 1])
+    vis = 0
+    for j, ch in enumerate(lines[line - 1]):
+        if vis + 1 >= col:
+            return start + j
+        vis = (vis // 8 + 1) * 8 if ch == "\t" else vis + 1
+    return None
+
+
+def _back_expr(text: str, j: int) -> int:
+    """Start of the receiver/call chain that ends right before index j."""
+    k = j
+    while k > 0:
+        c = text[k - 1]
+        if c.isalnum() or c in "_$.":
+            k -= 1
+        elif c in ")]":
+            open_ch = "(" if c == ")" else "["
+            depth, q = 0, k - 1
+            while q >= 0:
+                if text[q] == c:
+                    depth += 1
+                elif text[q] == open_ch:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                q -= 1
+            if q < 0:
+                break
+            k = q
+        else:
+            break
+    if re.search(r"\bnew\s+$", text[max(0, k - 10):k]):
+        k = text.rfind("new", 0, k)
+    return k
+
+
+def _expr_span(text: str, i: int) -> tuple[int, int] | None:
+    """The expression javac points at with an 'incompatible types' error: a method call's '(' or an identifier/field."""
+    if i >= len(text):
+        return None
+    if text[i] == "(":
+        e = balanced(text, i)
+        return (_back_expr(text, i), e + 1) if e != -1 else None
+    if text[i] != "." and i > 0 and (text[i - 1].isalnum() or text[i - 1] in "_$"):
+        return None                                   # not at the start of a token: the column does not fit this file
+    j = i + 1 if text[i] == "." else i
+    m = re.match(r"[A-Za-z_$][\w$]*", text[j:])
+    if not m:
+        return None
+    end = j + m.end()
+    while True:
+        if end < len(text) and text[end] == "(":
+            e = balanced(text, end)
+            if e == -1:
+                return None
+            end = e + 1
+        elif end < len(text) and text[end] == "[":
+            e = balanced(text, end, "[", "]")
+            if e == -1:
+                return None
+            end = e + 1
+        else:
+            mm = re.match(r"\.\s*[A-Za-z_$][\w$]*", text[end:])
+            if not mm:
+                break
+            end += mm.end()
+    return (_back_expr(text, i) if text[i] == "." else i, end)
+
+
+def _type_ref(text: str, fqcn: str, imports: set) -> str:
+    """Simple name when it is (or can be) imported without a clash, else the FQCN."""
+    simple, pkg = fqcn.rsplit(".", 1)[1], fqcn.rsplit(".", 1)[0]
+    imps = java_imports(text)
+    if fqcn in imps or f"{pkg}.*" in imps or pkg == "java.lang":
+        return simple
+    if any(x.rsplit(".", 1)[-1] == simple for x in imps) or re.search(rf"\b(?:class|interface|enum|record)\s+{simple}\b", text):
+        return fqcn
+    imports.add(fqcn)
+    return simple
+
+
+# (from, to) simple names -> wrapper; {e} is the expression; {Date}/{ZoneId}/... are type references
+_CONVERSIONS = {
+    ("LocalDateTime", "Date"): ("{Date}.from({e}.atZone({ZoneId}.systemDefault()).toInstant())", ("java.util.Date", "java.time.ZoneId")),
+    ("LocalDateTime", "Timestamp"): ("{Timestamp}.valueOf({e})", ("java.sql.Timestamp",)),
+    ("Date", "LocalDateTime"): ("{LocalDateTime}.ofInstant({e}.toInstant(), {ZoneId}.systemDefault())",
+                                ("java.time.LocalDateTime", "java.time.ZoneId")),
+    ("HttpStatusCode", "HttpStatus"): ("{HttpStatus}.valueOf({e}.value())", ("org.springframework.http.HttpStatus",)),
+}
+_INCOMPATIBLE_RX = re.compile(r"(?:incompatible types|Inkompatible Typen): ([\w.$]+) (?:cannot be converted to|kann nicht in) ([\w.$]+)")
+_SYMBOL_RX = re.compile(r"(?:symbol|Symbol):\s+(?:method|Methode) (\w+)\(([^)]*)\)")
+_LOCATION_RX = re.compile(r"(?:location|Ort):\s+(.*)")
+_CTOR_RX = re.compile(r"(?:constructor|Konstruktor) (\w+) in (?:class|Klasse) ([\w.$]+)")
+_REQUIRED_RX = re.compile(r"(?:required|Erforderlich):\s+([\w.$]+)\s*$", re.M)
+_NO_ARGS_RX = re.compile(r"(?:found|Ermittelt):\s+(?:no arguments|keine Argumente)")
+
+
+def _fix_at(text: str, i: int, msg: str, imports: set, fields: list) -> tuple[str, str] | None:
+    """One compile error with a mechanical fix: (new text, description) or None."""
+    m = _INCOMPATIBLE_RX.search(msg)
+    if m:
+        frm, to = m.group(1), m.group(2)
+        conv = _CONVERSIONS.get((frm.rsplit(".", 1)[-1], to.rsplit(".", 1)[-1]))
+        if not conv or frm == "java.sql.Date":
+            return None
+        span = _expr_span(text, i)
+        if not span:
+            return None
+        tmpl, types = conv
+        refs = {f.rsplit(".", 1)[1]: _type_ref(text, f, imports) for f in types}
+        e = text[span[0]:span[1]]
+        return text[:span[0]] + tmpl.format(e=e, **refs) + text[span[1]:], f"{frm.rsplit('.', 1)[-1]} -> {to.rsplit('.', 1)[-1]} converted"
+    sm, loc = _SYMBOL_RX.search(msg), _LOCATION_RX.search(msg)
+    if sm and sm.group(1) == "getTime" and loc and "LocalDateTime" in loc.group(1):
+        mm = re.match(r"\.\s*getTime\s*\(\s*\)", text[i:])
+        if mm:
+            z = _type_ref(text, "java.time.ZoneId", imports)
+            return (text[:i] + f".atZone({z}.systemDefault()).toInstant().toEpochMilli()" + text[i + mm.end():],
+                    "LocalDateTime.getTime() -> epoch millis")
+    if sm and sm.group(1) == "getUnicodeCmap":
+        mm = re.match(r"\.\s*getUnicodeCmap\s*\(", text[i:])
+        if mm:
+            new = text[:i] + ".getUnicodeCmapLookup(" + text[i + mm.end():]
+            ls = new.rfind("\n", 0, i) + 1
+            line_head = new[ls:i]
+            if re.search(r"\bCmapSubtable\s+\w+\s*=", line_head):
+                new = new[:ls] + re.sub(r"\bCmapSubtable(\s+\w+\s*=)", r"CmapLookup\1", line_head, 1) + new[i:]
+                imports.add("org.apache.fontbox.ttf.CmapLookup")
+                new = drop_unused_imports(new, ["org.apache.fontbox.ttf.CmapSubtable"])
+            return new, "FontBox 3: getUnicodeCmap -> getUnicodeCmapLookup"
+    cm = _CTOR_RX.search(msg)
+    if cm and _NO_ARGS_RX.search(msg) and _REQUIRED_RX.search(msg):
+        req = _REQUIRED_RX.search(msg).group(1)
+        mm = re.match(r"new\s+[\w.]+\s*(?:<[^>]*>)?\s*\(\s*\)", text[i:])
+        if not mm:
+            return None
+        if req.endswith(".PDFStreamEngine") or req == "PDFStreamEngine":
+            outer = re.search(r"\bclass\s+(\w+)\s+extends\s+\w+", text)
+            if not outer:
+                return None
+            arg, what = f"{outer.group(1)}.this", "PDFBox 3: OperatorProcessor gets its PDFStreamEngine"
+        elif req.rsplit(".", 1)[-1] == "EntityManager" and re.search(r"@(?:Configuration|Component|Service|Repository)\b", text):
+            fm = re.search(r"\bEntityManager\s+(\w+)\s*[;=]", text)
+            if fm:
+                arg = fm.group(1)
+            else:
+                arg = "entityManager"
+                if not fields:
+                    fields.append(req)
+            what = f"{cm.group(1)} gets the shared EntityManager (@PersistenceContext)"
+        else:
+            return None
+        close = i + mm.end() - 1
+        return text[:close] + arg + text[close:], what
+    return None
+
+
+def _add_field(text: str, fqcn: str) -> str:
+    """@PersistenceContext EntityManager field at the top of the first class body."""
+    cm = re.search(r"\bclass\s+\w+[^{]*\{[ \t]*\n", text)
+    if not cm:
+        return text
+    nxt = re.search(r"\n([ \t]+)\S", text[cm.end() - 1:])
+    ind = nxt.group(1) if nxt else "    "
+    pkg = fqcn.rsplit(".", 1)[0]
+    blank_next = re.match(r"[ \t]*\n", text[cm.end():]) is not None
+    field = f"{ind}@PersistenceContext\n{ind}private EntityManager entityManager;\n" + ("" if blank_next else "\n")
+    text = text[:cm.end()] + field + text[cm.end():]
+    return add_import(add_import(text, f"{pkg}.PersistenceContext"), fqcn)
+
+
 def autofix_compile_errors(root: Path, log: Path) -> list[str]:
-    """Fix compile errors that have exactly one safe fix. A pattern-switch arm 'dominated by a preceding case label' can
-    never match (OpenRewrite's if/else-instanceof -> switch conversion produces these when a later type is a subtype of an
-    earlier one; in the if/else chain the branch was merely dead code): remove it."""
+    """Fix compile errors that have exactly one safe fix:
+    - a pattern-switch arm 'dominated by a preceding case label' can never match (OpenRewrite's if/else-instanceof ->
+      switch conversion produces these when a later type is a subtype of an earlier one): remove it;
+    - type changes of the new APIs (Spring Batch 5 LocalDateTime, Spring 6 HttpStatusCode, FontBox 3 CmapLookup),
+      PDFBox 3 OperatorProcessor(PDFStreamEngine) and constructors that now need the EntityManager."""
     changes = []
+    text_log = read(log) or ""
     hits: dict[str, set] = {}
-    for m in _DOMINATED_RX.finditer(read(log) or ""):
+    for m in _DOMINATED_RX.finditer(text_log):
         hits.setdefault(m.group(1), set()).add(int(m.group(2)))
     for f, line_nos in hits.items():
         p = Path(f)
@@ -3470,6 +3838,27 @@ def autofix_compile_errors(root: Path, log: Path) -> list[str]:
         if write_if_changed(p, t, new):
             changes.append(f"{rel(p, root) if str(p).startswith(str(root)) else p}: removed {len(line_nos)} unreachable switch arm(s) "
                            f"(dominated by a preceding case)")
+    by_file: dict[str, list] = {}
+    for f, ln, col, msg in compile_errors(text_log):
+        by_file.setdefault(f, []).append((ln, col, msg))
+    for f, errs in by_file.items():
+        p = Path(f)
+        if not p.exists() or f in hits:
+            continue
+        t = read(p) or ""
+        new, imports, fields, what = t, set(), [], []
+        for ln, col, msg in sorted(errs, key=lambda x: (x[0], x[1]), reverse=True):   # bottom-up, right-to-left
+            i = _offset(new, ln, col)
+            r = _fix_at(new, i, msg, imports, fields) if i is not None else None
+            if r:
+                new = r[0]
+                what.append(r[1])
+        for fq in fields:
+            new = _add_field(new, fq)
+        for imp in sorted(imports):
+            new = add_import(new, imp)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root) if str(p).startswith(str(root)) else p}: {'; '.join(sorted(set(what)))}")
     return changes
 
 
@@ -5325,20 +5714,23 @@ def cmd_migrate(a) -> int:
             saved = add_properties_migrator(root) if st.boot_line and not a.no_properties_migrator else {}
             try:
                 ok = builder.verify(st.key) == 0
-                if not ok:
+                for rnd in range(1, AUTOFIX_ROUNDS + 1):      # javac reports the next errors once these are gone
+                    if ok:
+                        break
                     fixed = autofix_compile_errors(root, log_dir / f"{st.key}-build.log")
-                    if fixed:
-                        for c in fixed:
-                            say(f"  autofix: {c}")
-                        if not a.no_git:
-                            restore_files(saved)
-                            git(root, "add", "-A")
-                            git(root, "commit", "-q", "-m", f"chore(migration): fix compile errors with one safe fix ({st.key})")
-                            saved = add_properties_migrator(root) if saved else {}
-                        say(f"[stage {st.key}] build + tests again after the compile fixes")
-                        ok = builder.verify(st.key + "-autofix") == 0
-                        if not ok:
-                            (log_dir / f"{st.key}-build.log").write_bytes((log_dir / f"{st.key}-autofix-build.log").read_bytes())
+                    if not fixed:
+                        break
+                    for c in fixed:
+                        say(f"  autofix: {c}")
+                    if not a.no_git:
+                        restore_files(saved)
+                        git(root, "add", "-A")
+                        git(root, "commit", "-q", "-m", f"chore(migration): fix compile errors with one safe fix ({st.key}, round {rnd})")
+                        saved = add_properties_migrator(root) if saved else {}
+                    say(f"[stage {st.key}] build + tests again after the compile fixes (round {rnd})")
+                    ok = builder.verify(f"{st.key}-autofix{rnd}") == 0
+                    if not ok:
+                        (log_dir / f"{st.key}-build.log").write_bytes((log_dir / f"{st.key}-autofix{rnd}-build.log").read_bytes())
             finally:
                 restore_files(saved)
             if saved:
@@ -5559,16 +5951,20 @@ def cmd_update(a) -> int:
         return 0
     say("[update] build + tests")
     ok = builder.verify("update") == 0
-    if not ok:
+    for rnd in range(1, AUTOFIX_ROUNDS + 1):
+        if ok:
+            break
         fixed = autofix_compile_errors(root, log_dir / "update-build.log")
-        if fixed:
-            for c in fixed:
-                say(f"  autofix: {c}")
-            git(root, "add", "-A")
-            git(root, "commit", "-q", "-m", "chore(migration): fix compile errors with one safe fix (update)")
-            ok = builder.verify("update-autofix") == 0
-            if not ok:
-                (log_dir / "update-build.log").write_bytes((log_dir / "update-autofix-build.log").read_bytes())
+        if not fixed:
+            break
+        for c in fixed:
+            say(f"  autofix: {c}")
+        git(root, "add", "-A")
+        git(root, "commit", "-q", "-m", f"chore(migration): fix compile errors with one safe fix (update, round {rnd})")
+        say(f"[update] build + tests again after the compile fixes (round {rnd})")
+        ok = builder.verify(f"update-autofix{rnd}") == 0
+        if not ok:
+            (log_dir / "update-build.log").write_bytes((log_dir / f"update-autofix{rnd}-build.log").read_bytes())
     say(f"[update] {'build OK' if ok else 'BUILD/TESTS FAILED'}")
     if not ok:
         show_errors(log_dir / "update-build.log")
