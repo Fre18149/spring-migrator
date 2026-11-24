@@ -3623,6 +3623,8 @@ class MavenRepo:
         self._local = None
         self.timings: list[tuple] = []
         self.problems: dict[str, str] = {}
+        self.traffic: dict[str, dict] = {}
+        self.refresh = False
 
     def local(self) -> Path:
         """Local repository from -Dmaven.repo.local, the -s settings file, ~/.m2/settings.xml or $M2_HOME - without
@@ -3659,14 +3661,21 @@ class MavenRepo:
             f'<modules>{modules}</modules></project>', encoding="utf-8")
         # -T: the probes are independent, resolve them concurrently (network-latency bound).
         # -U only where new versions must be seen (metadata); exact versions need no update check.
-        cmd = [self.exe, "-B", "-ntp", "-fae", "-T", "4", "-f", str(work / "pom.xml"), f"{DEP_PLUGIN}:resolve"]
-        if update:
+        # No -U by default: Maven re-reads version lists older than the repositories' update policy (daily) anyway, and
+        # forcing it makes Artifactory recompute every list across all its remote repositories.
+        # Transfer progress stays on (no -ntp): it tells which repository the time goes to.
+        cmd = [self.exe, "-B", "-fae", "-T", str(max(1, min(8, len(items)))), "-f", str(work / "pom.xml"), f"{DEP_PLUGIN}:resolve"]
+        if update and self.refresh:
             cmd.insert(1, "-U")
         log = self.log_dir / f"resolve-{name}.log"
         t0 = time.time()
         run(cmd + self.extra, work, log, self.env)
         self.timings.append((name, len(items), time.time() - t0))
         self.problems.update(repository_problems(log))
+        for repo_id, st in repository_traffic(log).items():
+            agg = self.traffic.setdefault(repo_id, {"requests": 0, "seconds": 0.0, "bytes": 0})
+            for k in agg:
+                agg[k] += st[k]
 
     def versions(self, g: str, a: str) -> list[str]:
         d = self.local() / g.replace(".", "/") / a
@@ -3700,6 +3709,22 @@ def local_repository(extra: list[str], env: dict) -> Path:
             v = re.sub(r"\$\{env\.(\w+)\}", lambda x: env.get(x.group(1), ""), v)
             return Path(v).expanduser()
     return Path.home() / ".m2/repository"
+
+
+_SIZE = {"B": 1, "kB": 1e3, "KB": 1e3, "MB": 1e6, "GB": 1e9}
+
+
+def repository_traffic(log: Path) -> dict[str, dict]:
+    """Per repository: downloads and estimated transfer time, from Maven's 'Downloaded from <id>: url (1.2 kB at 3.4 kB/s)'."""
+    out: dict[str, dict] = {}
+    for m in re.finditer(r"Downloaded from ([\w.\-]+): \S+ \(([\d.,]+) (B|kB|KB|MB|GB) at ([\d.,]+) (B|kB|KB|MB|GB)/s\)", read(log) or ""):
+        size = float(m.group(2).replace(",", ".")) * _SIZE[m.group(3)]
+        speed = float(m.group(4).replace(",", ".")) * _SIZE[m.group(5)]
+        st = out.setdefault(m.group(1), {"requests": 0, "seconds": 0.0, "bytes": 0})
+        st["requests"] += 1
+        st["bytes"] += int(size)
+        st["seconds"] += size / speed if speed else 0.0
+    return out
 
 
 def repository_problems(log: Path) -> dict[str, str]:
@@ -3836,10 +3861,43 @@ def _accepts(line: str, cls: str, info: dict, target: str) -> int:
     return 0
 
 
+DEP_CACHE_HOURS = 24
+
+
+def _dep_cache_file(refs, target: str, openjpa_stage: bool, extra: list[str]) -> Path:
+    import hashlib
+    key = json.dumps([sorted((r.kind, r.group, r.artifact, r.version) for r in refs), target, openjpa_stage, extra], sort_keys=True)
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "spring-migrate" / "dependency-plans"
+    return base / (hashlib.sha256(key.encode()).hexdigest()[:24] + ".json")
+
+
 def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_groups: list[str], say_=None,
                            openjpa_stage: bool = False) -> dict:
+    """Cached for DEP_CACHE_HOURS per (references, target, Maven args): re-runs and resumes do not ask the repositories again."""
     say_ = say_ or say
     refs = collect_dependency_refs(root)
+    cache = _dep_cache_file(refs, target, openjpa_stage, repo.extra) if refs else None
+    if cache and cache.exists() and not repo.refresh and time.time() - cache.stat().st_mtime < DEP_CACHE_HOURS * 3600:
+        try:
+            plan = json.loads(cache.read_text(encoding="utf-8"))
+            plan["internalGroups"] = internal_groups
+            age = (time.time() - cache.stat().st_mtime) / 60
+            say_(f"[deps] {len(refs)} reference(s): using the check from {age:.0f} min ago (cached; --refresh-dependency-versions to ask the repositories again)")
+            return plan
+        except (ValueError, OSError):
+            pass
+    plan = _detect_dependency_plan(root, repo, target, internal_groups, say_, openjpa_stage, refs)
+    if cache and plan.get("dependencies") and not any(d.get("status", "").startswith("could not be resolved") for d in plan["dependencies"]):
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(plan), encoding="utf-8")
+        except OSError:
+            pass
+    return plan
+
+
+def _detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_groups: list[str], say_, openjpa_stage: bool,
+                            refs: list) -> dict:
     root_pom = re.sub(r"<parent>.*?</parent>", "", read(root / "pom.xml") or "", flags=re.S)
     root_group = _first_tag(root_pom, "groupId") or None
     lines = [l for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(target)]
@@ -3863,6 +3921,8 @@ def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_gr
     repo.resolve(sorted(set(to_fetch)), "candidates")
     for name, n, secs in repo.timings:
         say_(f"[deps]   {name}: {n} artifact(s) in {secs:.0f}s (log: {repo.log_dir / ('resolve-' + name + '.log')})")
+    for repo_id, st in sorted(repo.traffic.items(), key=lambda kv: -kv[1]["seconds"])[:5]:
+        say_(f"[deps]   repository {repo_id}: {st['requests']} download(s), ~{st['seconds']:.0f}s transferring")
     for r_, why in repo.problems.items():
         say_(f"[deps]   slow/unreachable repository {r_}: {why}")
     if repo.problems:
@@ -4395,8 +4455,9 @@ def cmd_migrate(a) -> int:
         dep_plan = json.loads(Path(a.dependency_plan).read_text(encoding="utf-8"))
         say(f"[deps] using {a.dependency_plan}")
     elif info["tool"] == "maven" and not a.no_dependency_detection:
-        dep_plan = detect_dependency_plan(root, MavenRepo(root, builder.exe, builder.extra, env, log_dir), a.target, a.internal_group or [],
-                                          openjpa_stage=use_openjpa)
+        dep_repo = MavenRepo(root, builder.exe, builder.extra, env, log_dir)
+        dep_repo.refresh = a.refresh_dependency_versions
+        dep_plan = detect_dependency_plan(root, dep_repo, a.target, a.internal_group or [], openjpa_stage=use_openjpa)
         if a.interactive:
             dep_plan = interactive_plan(dep_plan)
     if dep_plan:
@@ -4659,6 +4720,7 @@ def cmd_deps(a) -> int:
     exe = str(root / "mvnw") if (root / "mvnw").exists() else "mvn"
     log_dir = Path(tempfile.mkdtemp(prefix="spring-migrate-deps-"))
     repo = MavenRepo(root, exe, shlex.split(a.build_args or ""), env, log_dir)
+    repo.refresh = a.refresh_dependency_versions
     plan = detect_dependency_plan(root, repo, a.target, a.internal_group or [])
     if a.interactive:
         plan = interactive_plan(plan)
@@ -4708,6 +4770,8 @@ def build_parser() -> argparse.ArgumentParser:
     dp.add_argument("--build-args", help='extra args for mvn, e.g. "-s /path/settings.xml" for your Artifactory')
     dp.add_argument("--java-home")
     dp.add_argument("--interactive", action="store_true", help="choose the version per Boot line for each dependency")
+    dp.add_argument("--refresh-dependency-versions", action="store_true",
+                    help="ask the repositories again (default: reuse a check from the last 24 h and Maven's cached version lists)")
     dp.add_argument("--out", help=f"plan file (default: next to the project, <name>-{DEP_PLAN_FILE})")
     dp.set_defaults(fn=cmd_deps)
 
@@ -4754,6 +4818,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--internal-group", action="append", help="groupId prefix of your company artifacts (repeatable; also guessed)")
     m.add_argument("--interactive", action="store_true", help="choose company dependency versions per Boot line interactively")
     m.add_argument("--no-dependency-detection", action="store_true", help="do not look for company parent/BOM/library upgrades")
+    m.add_argument("--refresh-dependency-versions", action="store_true",
+                   help="ask the repositories again (default: reuse a check from the last 24 h and Maven's cached version lists)")
     m.add_argument("--offline", action="store_true", help="do not query Maven Central / SDKMAN for latest versions (use built-in ones)")
     m.set_defaults(fn=cmd_migrate)
 
