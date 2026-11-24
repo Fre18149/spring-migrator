@@ -408,6 +408,37 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class ManagementGapTest(unittest.TestCase):
+    POM = """<project>
+  <dependencies>
+    <dependency>
+      <groupId>org.jvnet.jaxb2_commons</groupId>
+      <artifactId>jaxb2-basics-runtime</artifactId>
+    </dependency>
+  </dependencies>
+  <build><plugins><plugin>
+    <groupId>com.sun.xml.ws</groupId><artifactId>jaxws-maven-plugin</artifactId>
+    <dependencies>
+      <dependency><groupId>org.jvnet.jaxb2_commons</groupId><artifactId>jaxb2-basics</artifactId></dependency>
+    </dependencies>
+  </plugin></plugins></build>
+</project>
+"""
+
+    def test_missing_version_messages_are_parsed(self):
+        m = sm._MISSING_RX.search("[ERROR]     'build.plugins.plugin[com.sun.xml.ws:jaxws-maven-plugin].dependencies.dependency.version' "
+                                  "for org.jvnet.jaxb2_commons:jaxb2-basics:jar is missing. @ line 241, column 21")
+        self.assertEqual(m.groups(), ("com.sun.xml.ws", "jaxws-maven-plugin", "org.jvnet.jaxb2_commons", "jaxb2-basics", "241"))
+        m = sm._MISSING_RX.search("'dependencies.dependency.version' for net.sourceforge.plantuml:plantuml-mit:jar is missing. @ line 251, column 21")
+        self.assertEqual(m.group(3, 4), ("net.sourceforge.plantuml", "plantuml-mit"))
+
+    def test_pins_dependency_and_plugin_dependency(self):
+        out = sm._pin_version(self.POM, "org.jvnet.jaxb2_commons", "jaxb2-basics-runtime", "1.11.1", None, 3)
+        out = sm._pin_version(out, "org.jvnet.jaxb2_commons", "jaxb2-basics", "1.11.1", "jaxws-maven-plugin", None)
+        self.assertIn("<artifactId>jaxb2-basics-runtime</artifactId>\n      <version>1.11.1</version>", out)
+        self.assertIn("<artifactId>jaxb2-basics</artifactId><version>1.11.1</version>", out)
+
+
 class EncodingTest(unittest.TestCase):
     def test_latin1_properties_keep_their_encoding(self):
         with tempfile.TemporaryDirectory() as t:

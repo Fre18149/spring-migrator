@@ -14,4 +14,10 @@
   <properties>
     <java.version>11</java.version>
   </properties>
+  <!-- managed by the Boot 2.7 company parent only; the newer parents dropped these javax-era tools -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency><groupId>org.jvnet.jaxb2_commons</groupId><artifactId>jaxb2-basics-runtime</artifactId><version>1.11.1</version></dependency>
+    </dependencies>
+  </dependencyManagement>
 </project>

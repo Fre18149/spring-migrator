@@ -473,6 +473,9 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
     changes += fix_quoted_properties(root, base_rev)
     changes += fix_springdoc_leftovers(root)
     changes += fix_springdoc(root, boot_line)
+    jc, jt = fix_jaxb_tooling(root)
+    changes += jc
+    todo_extra = jt
     changes += fix_httptrace(root)
     changes += fix_httpclient5_checked(root)
     changes += fix_hibernate_props(root)
@@ -485,7 +488,7 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
         changes += fix_sas_configurer_package(root)
     if trailing_slash:
         changes += fix_trailing_slash(root)
-    return changes, todo + todo2
+    return changes, todo + todo2 + todo_extra
 
 
 def run_legacy_codemods(root: Path, phase: str = "pre") -> tuple[list[str], list[str]]:
@@ -3141,6 +3144,87 @@ def fix_springdoc(root: Path, boot_line: str) -> list[str]:
     return changes
 
 
+# ---- javax-era JAXB / JAX-WS tooling -> Jakarta successors (Boot 3+) -------------------------------------------
+JAXB_ARTIFACTS = {  # (old group, old artifact) -> (new group, new artifact, version line, fallback)
+    ("org.jvnet.jaxb2_commons", "jaxb2-basics-runtime"): ("org.jvnet.jaxb", "jaxb-plugins-runtime", "4.0", "4.0.16"),
+    ("org.jvnet.jaxb2_commons", "jaxb2-basics"): ("org.jvnet.jaxb", "jaxb-plugins", "4.0", "4.0.16"),
+    ("org.jvnet.jaxb2_commons", "jaxb2-value-constructor"): ("org.jvnet.jaxb", "jaxb-plugins", "4.0", "4.0.16"),
+    ("org.jvnet.jaxb2_commons", "jaxb2-basics-tools"): ("org.jvnet.jaxb", "jaxb-plugins-tools", "4.0", "4.0.16"),
+    ("org.jvnet.jaxb2.maven2", "maven-jaxb2-plugin"): ("org.jvnet.jaxb", "jaxb-maven-plugin", "4.0", "4.0.16"),
+    ("org.jvnet.jaxb2.maven2", "maven-jaxb22-plugin"): ("org.jvnet.jaxb", "jaxb-maven-plugin", "4.0", "4.0.16"),
+    ("org.jvnet.jaxb2.maven2", "maven-jaxb23-plugin"): ("org.jvnet.jaxb", "jaxb-maven-plugin", "4.0", "4.0.16"),
+    ("org.codehaus.mojo", "jaxws-maven-plugin"): ("com.sun.xml.ws", "jaxws-maven-plugin", "4.0", "4.0.5"),
+    ("com.sun.xml.ws", "jaxws-maven-plugin"): ("com.sun.xml.ws", "jaxws-maven-plugin", "4.0", "4.0.5"),
+}
+# jaxb2-basics 1.x/2.x "...2" interfaces became the plain names in org.jvnet.jaxb 4.x
+JAXB_RUNTIME_RENAMES = {n + "2": n for n in ("ToString", "Equals", "HashCode", "CopyTo", "MergeFrom", "ToStringStrategy",
+                                              "EqualsStrategy", "HashCodeStrategy", "CopyStrategy", "MergeStrategy")}
+
+
+def fix_jaxb_tooling(root: Path) -> tuple[list[str], list[str]]:
+    """jaxb2-basics, maven-jaxb2-plugin and jaxws-maven-plugin < 4 generate/expect javax.xml.bind - Boot 3 is Jakarta."""
+    changes, todo = [], []
+    for bf in build_files(root):
+        if bf.name != "pom.xml":
+            continue
+        t = read(bf) or ""
+        if not re.search(r"jaxb2|jaxws-maven-plugin", t):
+            continue
+        new = t
+        seen_in_block: set = set()
+        def swap(m):
+            blk = m.group(0)
+            body = re.sub(r"<(dependencies|executions|configuration|exclusions)>.*?</\1>", "", blk, flags=re.S)
+            g, a, v = _first_tag(body, "groupId"), _first_tag(body, "artifactId"), _first_tag(body, "version")
+            target = JAXB_ARTIFACTS.get((g, a))
+            if not target:
+                return blk
+            ng, na, line, fb = target
+            if (ng, na) == (g, a) and v and not v.startswith("${") and vtuple(v)[0] >= 4:
+                return blk
+            want = latest_patch(ng, na, line, fb)
+            out = blk.replace(f"<groupId>{g}</groupId>", f"<groupId>{ng}</groupId>", 1).replace(f"<artifactId>{a}</artifactId>", f"<artifactId>{na}</artifactId>", 1)
+            if v:
+                out = out.replace(f"<version>{v}</version>", f"<version>{want}</version>", 1)
+            else:  # managed elsewhere until now; the renamed artifact needs its own version
+                out = out.replace(f"<artifactId>{na}</artifactId>", f"<artifactId>{na}</artifactId><version>{want}</version>", 1)
+            return out
+        for tag in ("plugin", "dependency"):
+            new = re.sub(r"<(" + tag + r")>(?:(?!<" + tag + r">).)*?</" + tag + r">", swap, new, flags=re.S)
+        # jaxb2-basics + jaxb2-value-constructor both became jaxb-plugins: keep one per <dependencies> block
+        def dedupe(m):
+            blk, kept, seen = m.group(0), [], set()
+            def one(d):
+                key = (_first_tag(d.group(0), "groupId"), _first_tag(d.group(0), "artifactId"))
+                if key[0] == "org.jvnet.jaxb" and key in seen:
+                    return ""
+                seen.add(key)
+                return d.group(0)
+            return re.sub(r"[ \t]*<dependency>(?:(?!<dependency>).)*?</dependency>[ \t]*\r?\n?", one, blk, flags=re.S)
+        new = re.sub(r"<dependencies>.*?</dependencies>", dedupe, new, flags=re.S)
+        if write_if_changed(bf, t, new):
+            changes.append(f"{rel(bf, root)}: javax-era JAXB/JAX-WS tooling -> Jakarta successors (org.jvnet.jaxb 4.x, jaxws-maven-plugin 4.x)")
+    for p in walk(root):
+        t = read(p)
+        if not t:
+            continue
+        new = t
+        if p.suffix in (".java", ".kt") and "org.jvnet.jaxb2_commons" in t:
+            new = re.sub(r"\borg\.jvnet\.jaxb2_commons\.", "org.jvnet.jaxb.", new)
+            for a, b in JAXB_RUNTIME_RENAMES.items():
+                new = re.sub(r"\b" + a + r"\b", b, new)
+        elif p.suffix in (".xjb", ".xml") and "http://java.sun.com/xml/ns/jaxb" in t and p.name != "pom.xml":
+            new = new.replace("http://java.sun.com/xml/ns/jaxb/xjc", "https://jakarta.ee/xml/ns/jaxb/xjc")
+            new = new.replace("http://java.sun.com/xml/ns/jaxb", "https://jakarta.ee/xml/ns/jaxb")
+            new = re.sub(r'(<(?:\w+:)?bindings\b[^>]*\bversion=")2\.\d(")', r"\g<1>3.0\g<2>", new)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: JAXB {'runtime classes' if p.suffix in ('.java', '.kt') else 'binding namespace'} -> Jakarta")
+    if changes:
+        todo.append("JAXB/JAX-WS code generation now uses the Jakarta tool chain (org.jvnet.jaxb 4.x / jaxws-maven-plugin 4.x): "
+                    "compare the generated classes once (plugin options like -Xequals/-XtoString/-Xvalue-constructor keep their names)")
+    return changes, todo
+
+
 HTTPTRACE_JAVA = [
     ("org.springframework.boot.actuate.trace.http.InMemoryHttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.InMemoryHttpExchangeRepository"),
     ("org.springframework.boot.actuate.trace.http.HttpTraceRepository", "org.springframework.boot.actuate.web.exchanges.HttpExchangeRepository"),
@@ -4086,6 +4170,120 @@ def apply_dependency_plan(root: Path, plan: dict, line: str) -> list[str]:
     return changes
 
 
+HELP_PLUGIN = "org.apache.maven.plugins:maven-help-plugin:3.5.1"
+
+
+def _effective_pom(root: Path, exe: str, extra: list[str], env: dict, out: Path) -> tuple[int, str]:
+    r = subprocess.run([exe, "-B", "-ntp", "-fae", f"{HELP_PLUGIN}:effective-pom", f"-Doutput={out}"] + extra,
+                       cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r.returncode, r.stdout + r.stderr
+
+
+def managed_versions(root: Path, exe: str, extra: list[str], env: dict) -> dict | None:
+    """Versions the build resolves today, from the effective POM: {(g, a): v} and {(plugin_a, g, a): v} for plugin deps."""
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "effective.xml"
+        code, _ = _effective_pom(root, exe, extra, env, out)
+        text = read(out) if out.exists() else None
+    if code != 0 or not text:
+        return None
+    deps, plugin_deps = {}, {}
+    plugin_spans = []
+    for pm in re.finditer(r"<plugin>(.*?)</plugin>", text, re.S):
+        body = pm.group(1)
+        pa = _first_tag(re.sub(r"<(dependencies|executions|configuration)>.*?</\1>", "", body, flags=re.S), "artifactId")
+        plugin_spans.append(pm.span())
+        for d in re.finditer(r"<dependency>(.*?)</dependency>", body, re.S):
+            g, a, v = (_first_tag(d.group(1), t) for t in ("groupId", "artifactId", "version"))
+            if g and a and v:
+                plugin_deps.setdefault((pa, g, a), v)
+    for d in re.finditer(r"<dependency>(.*?)</dependency>", text, re.S):
+        if any(x <= d.start() < y for x, y in plugin_spans):
+            continue
+        g, a, v = (_first_tag(d.group(1), t) for t in ("groupId", "artifactId", "version"))
+        if g and a and v:
+            deps.setdefault((g, a), v)
+    return {"deps": deps, "plugin_deps": plugin_deps}
+
+
+_MISSING_RX = re.compile(r"'(?:build\.plugins\.plugin\[([\w.\-]+):([\w.\-]+)\]\.)?(?:dependencyManagement\.)?dependencies\.dependency\.version' "
+                         r"for ([\w.\-]+):([\w.\-]+):\w+ is missing\.(?: @ line (\d+))?")
+
+
+def fill_management_gaps(root: Path, before: dict, exe: str, extra: list[str], env: dict) -> tuple[list[str], list[str]]:
+    """After a company parent/BOM upgrade: versions the old one managed but the new one does not are pinned (previous
+    version) where they are used, so Maven can read the build again. Each pin is reported."""
+    changes, todo = [], []
+    for _ in range(3):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = _effective_pom(root, exe, extra, env, Path(tmp) / "e.xml")
+        if code == 0:
+            break
+        fixed = 0
+        project_file = None
+        for line in out.splitlines():
+            pm = re.search(r"The project \S+ \((.+?pom\.xml)\) has \d+ error", line)
+            if pm:
+                project_file = Path(pm.group(1))
+                continue
+            m = _MISSING_RX.search(line)
+            if not m or not project_file or not project_file.exists():
+                continue
+            plugin_a, g, a, lineno = m.group(2), m.group(3), m.group(4), m.group(5)
+            v = (before["plugin_deps"].get((plugin_a, g, a)) if plugin_a else None) or before["deps"].get((g, a))
+            if not v and plugin_a:
+                v = next((ver for (pa, gg, aa), ver in before["plugin_deps"].items() if (gg, aa) == (g, a)), None)
+            if not v:
+                todo.append(f"{rel(project_file, root)}: {g}:{a} lost its managed version with the new parent/BOM and no previous version is known - set one")
+                continue
+            t = read(project_file) or ""
+            new = _pin_version(t, g, a, v, plugin_a, int(lineno) if lineno else None)
+            if write_if_changed(project_file, t, new):
+                fixed += 1
+                where = f" (dependency of plugin {plugin_a})" if plugin_a else ""
+                changes.append(f"{rel(project_file, root)}: pinned {g}:{a}:{v}{where} - the new parent/BOM no longer manages it")
+                todo.append(f"`{g}:{a}` was managed by the old company parent/BOM but not by the new one; pinned the previous version {v} "
+                            f"in {rel(project_file, root)}. Check that this version works with Boot 3 / Jakarta (or move to its successor).")
+        if not fixed:
+            break
+    return changes, todo
+
+
+def _pin_version(text: str, g: str, a: str, v: str, plugin_a: str | None, lineno: int | None) -> str:
+    def add(block: str) -> str:
+        m = re.search(r"([ \t]*)<artifactId>" + re.escape(a) + r"</artifactId>", block)
+        ind = m.group(1) if m else ""
+        sep = "\n" + ind if "\n" in block[:m.start() if m else 0] else ""
+        return re.sub(r"(<artifactId>" + re.escape(a) + r"</artifactId>)", lambda x: x.group(1) + (sep or "") + f"<version>{v}</version>", block, count=1)
+    candidates = []
+    for m in re.finditer(r"<dependency>((?:(?!<dependency>).)*?)</dependency>", text, re.S):
+        b = m.group(1)
+        if _first_tag(b, "groupId") == g and _first_tag(b, "artifactId") == a and not _first_tag(b.split("<exclusions>")[0], "version"):
+            in_plugin = any(pm.start() < m.start() < pm.end() for pm in re.finditer(r"<plugin>.*?</plugin>", text, re.S))
+            if bool(plugin_a) == in_plugin:
+                candidates.append(m)
+    if not candidates:
+        return text
+    if lineno:
+        offs = sum(len(l) + 1 for l in text.split("\n")[:lineno - 1])
+        candidates.sort(key=lambda m: abs(m.start() - offs))
+    m = candidates[0]
+    return text[:m.start()] + add(m.group(0)) + text[m.end():]
+
+
+def apply_plan_safely(root: Path, plan: dict, line: str, exe: str, extra: list[str], env: dict) -> tuple[list[str], list[str]]:
+    """apply_dependency_plan, plus: versions the old parent/BOM managed but the new one does not are pinned."""
+    moves = [d for d in plan.get("dependencies", []) if d.get("kind") in ("parent", "bom") and d.get("upgrades", {}).get(line)]
+    before = managed_versions(root, exe, extra, env) if moves and (root / "pom.xml").exists() else None
+    changes = apply_dependency_plan(root, plan, line)
+    todo = []
+    if before is not None and changes:
+        c, t = fill_management_gaps(root, before, exe, extra, env)
+        changes += c
+        todo += t
+    return changes, todo
+
+
 def effective_boot_version(root: Path, exe: str, extra: list[str], env: dict) -> str | None:
     """Boot version when it comes through a company parent/BOM: the resolved org.springframework.boot:spring-boot."""
     # relative outputFile = one file per module (a single absolute file would be overwritten by every module);
@@ -4510,7 +4708,9 @@ def cmd_migrate(a) -> int:
             stage_rev = git(root, "rev-parse", "HEAD").strip() if not a.no_git else None
             changes, todo = migrate_openjpa(root)
             if dep_plan:
-                changes += apply_dependency_plan(root, dep_plan, HIBERNATE_LINE)
+                c_, t_ = apply_plan_safely(root, dep_plan, HIBERNATE_LINE, builder.exe, builder.extra, env)
+                changes += c_
+                todo_all += t_
             todo_all += todo
             for c in changes:
                 say(f"  openjpa: {c}")
@@ -4569,13 +4769,17 @@ def cmd_migrate(a) -> int:
                     show_errors(log_dir / f"{st.key}-rewrite.log")
                 break
         if st.boot_line and dep_plan and not (code != 0 or dl) and not (st.legacy and not a.no_legacy):
-            for c in apply_dependency_plan(root, dep_plan, st.boot_line):
+            c_, t_ = apply_plan_safely(root, dep_plan, st.boot_line, builder.exe, builder.extra, env)
+            todo_all += t_
+            for c in c_:
                 pre_changes.append(c)
                 say(f"  deps: {c}")
         if st.legacy and not a.no_legacy and not (code != 0 or dl):
             post_c, post_t = run_legacy_codemods(root, "post")
             if dep_plan and st.boot_line:
-                post_c += apply_dependency_plan(root, dep_plan, st.boot_line)
+                c_, t_ = apply_plan_safely(root, dep_plan, st.boot_line, builder.exe, builder.extra, env)
+                post_c += c_
+                post_t += t_
             todo_all += post_t
             pre_changes += post_c
             for c in post_c:

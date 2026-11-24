@@ -15,6 +15,11 @@ import org.springframework.test.web.servlet.MockMvc;
 class ShopApplicationTests {
     @Autowired MockMvc mvc;
 
+    @Test
+    void jaxbRuntimeIsAvailable() {
+        org.junit.jupiter.api.Assertions.assertEquals("JAXBToStringStrategy", Describer.strategy());
+    }
+
     /** The company audit starter must still be auto-configured after the migration. */
     @Test
     void companyAuditFilterIsActive() throws Exception {

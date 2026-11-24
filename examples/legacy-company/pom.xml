@@ -28,6 +28,20 @@
       <artifactId>acme-persistence</artifactId>
       <version>1.0.0</version>
     </dependency>
+    <!-- version comes from the company parent (only acme-parent 1.4.0 manages it) -->
+    <dependency><groupId>org.jvnet.jaxb2_commons</groupId><artifactId>jaxb2-basics-runtime</artifactId></dependency>
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
   </dependencies>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-antrun-plugin</artifactId>
+        <dependencies>
+          <!-- javax-era XJC plugin -->
+          <dependency><groupId>org.jvnet.jaxb2_commons</groupId><artifactId>jaxb2-basics</artifactId><version>1.11.1</version></dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
 </project>

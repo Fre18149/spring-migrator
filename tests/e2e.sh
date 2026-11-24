@@ -51,6 +51,11 @@ company() {
   git log --format=%s | grep -q "OpenJPA -> Hibernate"
   git show "$(git log -1 --format=%H --grep='OpenJPA -> Hibernate'):pom.xml" | grep -A1 "<artifactId>acme-persistence</artifactId>" | grep -q "<version>1.1.0</version>"
   grep -A1 "<artifactId>acme-persistence</artifactId>" pom.xml | grep -q "<version>3.0.0</version>"
+  # jaxb2-basics-runtime lost its managed version with the new parent: pinned, then moved to the Jakarta successor
+  grep -q "<artifactId>jaxb-plugins-runtime</artifactId><version>4\." pom.xml || grep -A2 "<artifactId>jaxb-plugins-runtime</artifactId>" pom.xml | grep -q "<version>4\."
+  grep -q "<artifactId>jaxb-plugins</artifactId>" pom.xml
+  ! grep -q "jaxb2_commons" pom.xml src/main/java/com/acme/shop/Describer.java
+  grep -q "import org.jvnet.jaxb.lang.JAXBToStringStrategy;" src/main/java/com/acme/shop/Describer.java
 }
 multimodule() {
   # root pom + library + web app + worker app; Hystrix version managed in the root's <dependencyManagement>

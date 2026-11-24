@@ -170,6 +170,17 @@ removes OpenJPA, Boot manages Hibernate), but libraries that use them are:
 * the Hibernate version a library was built for is shown; a library built for Hibernate 5/6 that calls Hibernate APIs
   is flagged on the Boot 4 lines (Boot 4 ships Hibernate 7).
 
+**When the new parent/BOM manages less.** A newer company parent often drops versions the old one managed (typically
+javax-era tools). Before a parent/BOM is moved, the tool records the build's effective versions; afterwards it asks
+Maven which versions are now missing and pins the previous one where it is used (in the dependency, or inside the
+plugin's `<dependencies>`), listed as a TODO in the report.
+
+**JAXB / JAX-WS code generation** moves to the Jakarta tool chain on Boot 3+: `org.jvnet.jaxb2_commons:jaxb2-basics*`
+-> `org.jvnet.jaxb:jaxb-plugins(-runtime)` 4.x (`jaxb2-value-constructor` is part of it), `maven-jaxb2-plugin` ->
+`org.jvnet.jaxb:jaxb-maven-plugin` 4.x, `jaxws-maven-plugin` -> `com.sun.xml.ws:jaxws-maven-plugin` 4.x; Java code
+`org.jvnet.jaxb2_commons.*` -> `org.jvnet.jaxb.*` (`ToString2` -> `ToString`, ...); `.xjb` bindings to the Jakarta
+namespace (version 3.0).
+
 To choose yourself:
 ```bash
 # detect and review (or answer per dependency with --interactive), then edit the "upgrades" per Boot line
