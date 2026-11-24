@@ -69,11 +69,37 @@ def walk(root: Path):
                 continue
 
 
+_ENCODING: dict[str, str] = {}
+
+
+def decode_text(data: bytes) -> tuple[str, str]:
+    """UTF-8 when valid, else ISO-8859-1 (the classic encoding of .properties files; lossless for every byte)."""
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        return data.decode("latin-1"), "latin-1"
+
+
 def read(p: Path) -> str | None:
     try:
-        return p.read_bytes().decode("utf-8", errors="replace")
+        text, enc = decode_text(p.read_bytes())
     except OSError:
         return None
+    _ENCODING[str(p)] = enc
+    return text
+
+
+def write_file(p: Path, text: str):
+    """Write in the encoding the file was read with, so umlauts in ISO-8859-1 files survive an edit."""
+    enc = _ENCODING.get(str(p), "utf-8")
+    try:
+        data = text.encode(enc)
+    except UnicodeEncodeError:
+        if p.suffix == ".properties":   # keep the file's encoding; escape what it cannot hold, as .properties allows
+            data = "".join(c if ord(c) < 256 else f"\\u{ord(c):04x}" for c in text).encode(enc)
+        else:
+            data = text.encode("utf-8")
+    p.write_bytes(data)
 
 
 def rel(p: Path, root: Path) -> str:
@@ -365,7 +391,7 @@ def fix_javax_residuals(root: Path) -> list[str]:
             continue
         new, n = JAVAX_RX.subn(lambda m: "jakarta." + m.group("pkg"), text)
         if n:
-            p.write_text(new, encoding="utf-8")
+            write_file(p, new)
             changes.append(f"{rel(p, root)}: {n} javax->jakarta replacement(s)")
     return changes
 
@@ -394,10 +420,10 @@ def fix_spring_factories(root: Path) -> list[str]:
         imports.parent.mkdir(parents=True, exist_ok=True)
         existing = [l.strip() for l in (read(imports) or "").splitlines() if l.strip()]
         merged = existing + [c for c in classes if c not in existing]
-        imports.write_text("\n".join(merged) + "\n", encoding="utf-8")
+        write_file(imports, "\n".join(merged) + "\n")
         remaining = [l for l in kept if l.strip() and not l.strip().startswith("#")]
         if remaining:
-            f.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
+            write_file(f, "\n".join(kept).rstrip() + "\n")
         else:
             f.unlink()
         changes.append(f"{rel(f, root)}: moved {len(classes)} auto-configuration(s) to {rel(imports, root)}")
@@ -432,7 +458,7 @@ def fix_ci_java(root: Path, java: int) -> tuple[list[str], list[str]]:
             if re.search(r"(?i)(java|jdk|openjdk)\W{0,12}(8|11)\b|temurin-(8|11)", text):
                 todo.append(f"{rel(p, root)}: pins an old JDK - update to {java} by hand")
         if new != text:
-            p.write_text(new, encoding="utf-8")
+            write_file(p, new)
             changes.append(f"{rel(p, root)}: Java version -> {java}")
     return changes, todo
 
@@ -619,7 +645,7 @@ def openjpa_persistence_xml(root: Path) -> tuple[list[str], list[str]]:
             return "\n".join(out)
         new = _PROP_RX.sub(sub, new)
         if new != text:
-            f.write_text(new, encoding="utf-8")
+            write_file(f, new)
             changes.append(f"{rel(f, root)}: provider -> Hibernate, {mapped} openjpa.* propert(ies) translated/commented")
         if re.search(r'name\s*=\s*"openjpa\.', new):
             todo.append(f"{rel(f, root)}: contains openjpa.* properties in a non-standard layout - translate by hand")
@@ -644,7 +670,7 @@ def openjpa_build_files(root: Path) -> tuple[list[str], list[str]]:
             if not re.search(r"spring-boot-starter-data-jpa|<artifactId>hibernate-core</artifactId>", new):
                 new = _insert_dependency(new, STARTER_JPA)
                 changes.append(f"{rel(f, root)}: added spring-boot-starter-data-jpa (Hibernate)")
-            f.write_text(new, encoding="utf-8")
+            write_file(f, new)
             changes.append(f"{rel(f, root)}: removed {nd} OpenJPA dependenc(ies), {npl} plugin(s)")
         elif f.name in ("build.gradle", "build.gradle.kts") or f.suffix in (".gradle", ".kts"):
             lines = text.splitlines()
@@ -656,7 +682,7 @@ def openjpa_build_files(root: Path) -> tuple[list[str], list[str]]:
                     body = re.sub(r"(dependencies\s*\{[ \t]*\n)", rf"\1    implementation({q}org.springframework.boot:spring-boot-starter-data-jpa{q})\n"
                                   if f.suffix == ".kts" else rf"\1    implementation {q}org.springframework.boot:spring-boot-starter-data-jpa{q}\n", body, count=1)
                     changes.append(f"{rel(f, root)}: added spring-boot-starter-data-jpa")
-                f.write_text(body, encoding="utf-8")
+                write_file(f, body)
                 changes.append(f"{rel(f, root)}: removed {len(lines) - len(kept)} OpenJPA line(s)")
     # hibernate exclusions on the JPA starter
     for f in walk(root):
@@ -676,7 +702,7 @@ def openjpa_build_files(root: Path) -> tuple[list[str], list[str]]:
             return b2
         new = re.sub(r"<dependency>(?:(?!<dependency>).)*?</dependency>", clean, text, flags=re.S)
         if new != text:
-            f.write_text(new, encoding="utf-8")
+            write_file(f, new)
             changes.append(f"{rel(f, root)}: removed Hibernate exclusions from the JPA starter")
     return changes, todo
 
@@ -696,7 +722,7 @@ def openjpa_spring_adapters(root: Path) -> list[str]:
             # simple name left over after the import was rewritten above
             new = re.sub(r"\bPersistenceProviderImpl\b", "HibernatePersistenceProvider", new)
         if new != text:
-            f.write_text(new, encoding="utf-8")
+            write_file(f, new)
             changes.append(f"{rel(f, root)}: OpenJPA provider/adapter -> Hibernate equivalent")
     return changes
 
@@ -713,7 +739,7 @@ def openjpa_naming_defaults(root: Path) -> list[str]:
                    "# Only affects Spring Boot's JPA auto-configuration. Remove if you want Boot's snake_case defaults.\n"
                    "spring.jpa.hibernate.naming.physical-strategy=org.hibernate.boot.model.naming.PhysicalNamingStrategyStandardImpl\n"
                    "spring.jpa.hibernate.naming.implicit-strategy=org.hibernate.boot.model.naming.ImplicitNamingStrategyJpaCompliantImpl\n")
-            f.write_text(text.rstrip("\n") + "\n" + add, encoding="utf-8")
+            write_file(f, text.rstrip("\n") + "\n" + add)
             changes.append(f"{rel(f, root)}: added identifier-naming defaults")
     return changes
 
@@ -797,7 +823,7 @@ def openjpa_section(root: Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 def write_if_changed(p: Path, old: str, new: str) -> bool:
     if new != old:
-        p.write_text(new, encoding="utf-8")
+        write_file(p, new)
         return True
     return False
 
@@ -1338,7 +1364,7 @@ class ConfigFile:
         new = self.text()
         if new != (self.original if self.original.endswith("\n") or not self.original else self.original + "\n"):
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(new, encoding="utf-8")
+            write_file(self.path, new)
             return True
         return False
 
@@ -2001,7 +2027,7 @@ def _legacy_rs_mode(root: Path) -> tuple[str, list[str]]:
             c.put(f"{rs}.jwt.jwk-set-uri", jwk, doc=doc)
         elif keyval and "BEGIN PUBLIC KEY" in keyval:
             pem = f.parent / "legacy-oauth2-public.pem"
-            pem.write_text(keyval.replace("\\n", "\n").strip() + "\n", encoding="utf-8")
+            write_file(pem, keyval.replace("\\n", "\n").strip() + "\n")
             c.put(f"{rs}.jwt.public-key-location", f"classpath:{pem.name}", doc=doc)
         elif keyval:
             mode = "hmac"
@@ -2434,7 +2460,7 @@ def cm_authorization_server(root: Path) -> tuple[list[str], list[str]]:
         if re.search(r"TokenEnhancer", t):
             todo.append(f"{where}: TokenEnhancer - move the extra claims into the generated legacyTokenCustomizer bean")
         client_src = [_sas_client(c, encoder, todo, where, opaque) for c in clients]
-        p.write_text(_sas_class(pkg, cls, fields, client_src, key, encoder, default_chain=not others), encoding="utf-8")
+        write_file(p, _sas_class(pkg, cls, fields, client_src, key, encoder, default_chain=not others))
         changes.append(f"{where}: @EnableAuthorizationServer -> Spring Authorization Server ({len(clients)} client(s), "
                        f"{'HMAC key kept' if key['kind'] == 'hmac' else 'keystore key kept' if key['kind'] == 'keystore' else 'generated RSA key'}, "
                        f"legacy /oauth/* endpoint paths kept)")
@@ -2859,8 +2885,8 @@ def fix_quoted_properties(root: Path, base_rev: str | None) -> list[str]:
         t = read(f) or ""
         before = ""
         if base_rev:
-            r = subprocess.run(["git", "show", f"{base_rev}:{rel(f, root)}"], cwd=root, capture_output=True, text=True)
-            before = r.stdout if r.returncode == 0 else ""
+            r = subprocess.run(["git", "show", f"{base_rev}:{rel(f, root)}"], cwd=root, capture_output=True)
+            before = decode_text(r.stdout)[0] if r.returncode == 0 else ""
         old_lines = set(before.splitlines())
         out, n = [], 0
         for line in t.splitlines():
@@ -2870,7 +2896,7 @@ def fix_quoted_properties(root: Path, base_rev: str | None) -> list[str]:
                 n += 1
             out.append(line)
         if n:
-            f.write_text("\n".join(out) + ("\n" if t.endswith("\n") else ""), encoding="utf-8")
+            write_file(f, "\n".join(out) + ("\n" if t.endswith("\n") else ""))
             changes.append(f"{rel(f, root)}: unquoted {n} value(s) that OpenRewrite wrote with literal quotes")
     return changes
 
@@ -2942,7 +2968,7 @@ def fix_boot4_aspectj(root: Path, stage_rev: str | None) -> list[str]:
             re.search(aop_rx, read(p) or "") for p in java_sources(mod, main_only=True) if module_of(p, root) == mod)
         had = "spring-boot-starter-aop" in t
         if stage_rev and not had:
-            r = subprocess.run(["git", "show", f"{stage_rev}:{rel(bf, root)}"], cwd=root, capture_output=True, text=True)
+            r = subprocess.run(["git", "show", f"{stage_rev}:{rel(bf, root)}"], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
             had = r.returncode == 0 and "spring-boot-starter-aop" in r.stdout
         if not (had or (needs_aop and "spring-boot-starter" in t)):
             continue
@@ -3223,7 +3249,7 @@ def fix_trailing_slash(root: Path) -> list[str]:
         target = app.parent / "TrailingSlashCompatibilityConfig.java"
         if target.exists():
             continue
-        target.write_text((TRAILING_SLASH_SERVLET if servlet else TRAILING_SLASH_REACTIVE).format(pkg=pm.group(1)), encoding="utf-8")
+        write_file(target, (TRAILING_SLASH_SERVLET if servlet else TRAILING_SLASH_REACTIVE).format(pkg=pm.group(1)))
         changes.append(f"{rel(target, root)}: keeps Spring 5 trailing-slash matching (UrlHandlerFilter, runs before Spring Security)")
     return changes
 
@@ -3421,13 +3447,13 @@ def add_properties_migrator(root: Path) -> dict[Path, str]:
         if "spring-boot-starter" not in t or "spring-boot-properties-migrator" in t:
             continue
         saved[bf] = t
-        bf.write_text(build_add_dep(bf, t, *PROPS_MIGRATOR, scope="runtime"), encoding="utf-8")
+        write_file(bf, build_add_dep(bf, t, *PROPS_MIGRATOR, scope="runtime"))
     return saved
 
 
 def restore_files(saved: dict[Path, str]):
     for p, t in saved.items():
-        p.write_text(t, encoding="utf-8")
+        write_file(p, t)
 
 
 def parse_properties_migrator(text: str) -> tuple[dict[str, str], dict[str, str]]:
@@ -3984,7 +4010,7 @@ def effective_boot_version(root: Path, exe: str, extra: list[str], env: dict) ->
     name = "target/spring-migrate-boot.txt"
     subprocess.run([exe, "-B", "-ntp", "-q", "-fae", f"{DEP_PLUGIN}:list", "-DincludeGroupIds=org.springframework.boot",
                     "-DincludeArtifactIds=spring-boot", f"-DoutputFile={name}", "-DexcludeTransitive=false"] + extra,
-                   cwd=root, env=env, capture_output=True, text=True)
+                   cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     found = []
     for f in root.rglob("spring-migrate-boot.txt"):
         m = re.search(r"org\.springframework\.boot:spring-boot:jar:([\w.\-]+)", read(f) or "")
@@ -4082,7 +4108,7 @@ def rewrite_had_download_failures(log: Path) -> list[str]:
 
 
 def git(root: Path, *args: str, check=True) -> str:
-    r = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    r = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if check and r.returncode != 0:
         raise MigrationError(f"git {' '.join(args)} failed: {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout
@@ -4100,7 +4126,7 @@ def migration_base(root: Path) -> str | None:
 
 def java_major(env: dict) -> int | None:
     try:
-        r = subprocess.run(["java", "-version"], capture_output=True, text=True, env=env)
+        r = subprocess.run(["java", "-version"], capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     except FileNotFoundError:
         return None
     m = re.search(r'version "(\d+)(?:\.(\d+))?', r.stderr)
@@ -4497,7 +4523,7 @@ def cmd_migrate(a) -> int:
         if not a.no_git and git(root, "status", "--porcelain").strip():
             git(root, "add", "-A")
             msg = f"chore(migration): {st.title}\n\nAutomated by spring-migrate {__version__} (OpenRewrite: {', '.join(st.recipes)})"
-            r = subprocess.run(["git", "commit", "-q", "-m", msg], cwd=root, capture_output=True, text=True)
+            r = subprocess.run(["git", "commit", "-q", "-m", msg], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0:
                 raise MigrationError(f"git commit failed (is user.name/user.email set?): {r.stderr.strip()}")
             say(f"[git] committed stage {st.key}")
@@ -4637,7 +4663,7 @@ def cmd_deps(a) -> int:
     if a.interactive:
         plan = interactive_plan(plan)
     out = Path(a.out or root.parent / f"{root.name}-{DEP_PLAN_FILE}")
-    out.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    write_file(out, json.dumps(plan, indent=2) + "\n")
     print(render_dependency_plan(plan))
     say(f"written {out} (logs: {log_dir}). Use it with: migrate {a.path} --dependency-plan {out}")
     return 0

@@ -315,7 +315,7 @@ class JobStore:
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
             job.proc = subprocess.Popen(argv, cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                                        text=True, bufsize=1, env=env, start_new_session=True)
+                                        text=True, encoding="utf-8", errors="replace", bufsize=1, env=env, start_new_session=True)
             job.set_status("running", started=time.time(), workdir=str(work))
             with (job.dir / "output.log").open("a", encoding="utf-8") as log:
                 for line in job.proc.stdout:
@@ -346,7 +346,7 @@ class JobStore:
         with local edits is dirty: give the copy its own repo / a snapshot commit (only the copy is touched)."""
         ident = ["-c", "user.name=spring-migrate", "-c", "user.email=spring-migrate@localhost"]
         def g(*args):
-            return subprocess.run(["git", *ident, *args], cwd=work, capture_output=True, text=True)
+            return subprocess.run(["git", *ident, *args], cwd=work, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if not (work / ".git").exists():
             g("init", "-q", "-b", "main")
             g("add", "-A")

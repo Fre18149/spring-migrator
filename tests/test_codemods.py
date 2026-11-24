@@ -408,6 +408,36 @@ class FixersTest(unittest.TestCase):
         pr.close()
 
 
+class EncodingTest(unittest.TestCase):
+    def test_latin1_properties_keep_their_encoding(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            props = root / "src/main/resources/application.properties"
+            props.parent.mkdir(parents=True)
+            original = "app.greeting=Grüß Gott, Österreich\nmanagement.trace.http.enabled=true\n"
+            props.write_bytes(original.encode("latin-1"))
+            import subprocess
+            g = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=root, capture_output=True)
+            g("init", "-q"); g("add", "-A"); g("commit", "-qm", "base")
+            base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+            props.write_bytes((original + 'springdoc.api-docs.path="/v3/api-docs"\n').encode("latin-1"))
+            sm.fix_quoted_properties(root, base)          # used to crash: git show output decoded as UTF-8
+            sm.fix_httptrace(root)                        # edits the file
+            data = props.read_bytes()
+            text = data.decode("latin-1")
+            self.assertIn("Grüß Gott, Österreich", text)   # umlauts intact, still ISO-8859-1
+            self.assertRaises(UnicodeDecodeError, data.decode, "utf-8")
+            self.assertIn("springdoc.api-docs.path=/v3/api-docs", text)
+            self.assertIn("management.httpexchanges.recording.enabled=true", text)
+
+    def test_utf8_files_stay_utf8(self):
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / "A.java"
+            p.write_text("// Größe\nclass A {}\n", encoding="utf-8")
+            sm.write_file(p, sm.read(p).replace("class A", "class B"))
+            self.assertEqual(p.read_text(encoding="utf-8"), "// Größe\nclass B {}\n")
+
+
 class ImportOrderTest(unittest.TestCase):
     def test_inserted_in_sorted_position_and_group(self):
         src = ("package a;\n\nimport java.util.List;\nimport java.util.Map;\n\n"
