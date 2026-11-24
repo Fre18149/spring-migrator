@@ -426,7 +426,7 @@ class CompanyDependenciesTest(unittest.TestCase):
                 p.write_text(content, encoding="utf-8")
         r = sm.MavenRepo(Path("."), "mvn", [], {}, local)
         r._local = local
-        r.resolve = lambda items, name: None
+        r.resolve = lambda items, name, update=False: None
         return r
 
     @staticmethod
@@ -556,6 +556,18 @@ class CompanyDependenciesTest(unittest.TestCase):
         self.assertIn("built for Hibernate 6", d["status"])
         pr.close()
         self.tmp.cleanup()
+
+    def test_local_repository_and_slow_repositories(self):
+        pr = Project({"settings.xml": "<settings><localRepository>${user.home}/corp-m2</localRepository></settings>",
+                      "build.log": "[WARNING] Could not transfer metadata com.acme:x/maven-metadata.xml from/to central "
+                                   "(https://repo.maven.apache.org/maven2): Connect timed out\n"
+                                   "[INFO] Downloaded from company: ...\n"})
+        self.assertEqual(sm.local_repository(["-s", str(pr.root / "settings.xml")], {}), Path.home() / "corp-m2")
+        self.assertEqual(sm.local_repository(["-Dmaven.repo.local=/x/repo"], {}), Path("/x/repo"))
+        probs = sm.repository_problems(pr.root / "build.log")
+        self.assertEqual(list(probs), ["central (https://repo.maven.apache.org/maven2)"])
+        self.assertIn("timed out", probs["central (https://repo.maven.apache.org/maven2)"])
+        pr.close()
 
     def test_interactive_choice_and_gradle(self):
         plan = {"target": "3.5", "dependencies": [

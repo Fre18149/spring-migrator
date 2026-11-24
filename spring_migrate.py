@@ -3235,6 +3235,9 @@ def javax_jars(classpath: list[str], direct: set[str] | None = None) -> list[str
 # version that matches. The result is a plan file you can review/edit (or answer interactively).
 # --------------------------------------------------------------------------- #
 DEP_PLAN_FILE = "dependency-plan.json"
+# Fully qualified goals: an unqualified `dependency:resolve` makes Maven look up the plugin's latest version in every
+# repository first (slow behind a corporate Artifactory).
+DEP_PLUGIN = "org.apache.maven.plugins:maven-dependency-plugin:3.8.1"
 HIBERNATE_LINE = "2.7-hibernate"   # plan key applied in the OpenJPA -> Hibernate stage (Boot 2.7, javax)
 PLAN_LINES = (HIBERNATE_LINE, "3.5", "4.0", "4.1")
 # handled by OpenRewrite / the codemods / Boot's own dependency management
@@ -3318,13 +3321,14 @@ class MavenRepo:
     def __init__(self, root: Path, exe: str, extra: list[str], env: dict, log_dir: Path):
         self.root, self.exe, self.extra, self.env, self.log_dir = root, exe, extra, env, log_dir
         self._local = None
+        self.timings: list[tuple] = []
+        self.problems: dict[str, str] = {}
 
     def local(self) -> Path:
+        """Local repository from -Dmaven.repo.local, the -s settings file, ~/.m2/settings.xml or $M2_HOME - without
+        starting Maven (help:evaluate costs a JVM start plus plugin resolution)."""
         if self._local is None:
-            r = subprocess.run([self.exe, "-B", "-q", "help:evaluate", "-Dexpression=settings.localRepository", "-DforceStdout"] + self.extra,
-                               cwd=self.root, env=self.env, capture_output=True, text=True)
-            out = [l for l in r.stdout.strip().splitlines() if l.strip() and "Picked up" not in l]
-            self._local = Path(out[-1].strip()) if r.returncode == 0 and out else Path.home() / ".m2/repository"
+            self._local = local_repository(self.extra, self.env)
         return self._local
 
     def _repositories_block(self) -> str:
@@ -3332,7 +3336,7 @@ class MavenRepo:
         m = re.search(r"<repositories>.*?</repositories>", t, re.S)
         return m.group(0) if m else ""
 
-    def resolve(self, items: list[tuple], name: str):
+    def resolve(self, items: list[tuple], name: str, update: bool = False):
         """items: (group, artifact, version-or-range, type). Failures of single items are tolerated."""
         if not items:
             return
@@ -3353,8 +3357,16 @@ class MavenRepo:
             '<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>'
             '<groupId>spring-migrate</groupId><artifactId>probe</artifactId><version>1</version><packaging>pom</packaging>'
             f'<modules>{modules}</modules></project>', encoding="utf-8")
-        run([self.exe, "-B", "-ntp", "-U", "-fae", "-f", str(work / "pom.xml"), "dependency:resolve"] + self.extra,
-            work, self.log_dir / f"resolve-{name}.log", self.env)
+        # -T: the probes are independent, resolve them concurrently (network-latency bound).
+        # -U only where new versions must be seen (metadata); exact versions need no update check.
+        cmd = [self.exe, "-B", "-ntp", "-fae", "-T", "4", "-f", str(work / "pom.xml"), f"{DEP_PLUGIN}:resolve"]
+        if update:
+            cmd.insert(1, "-U")
+        log = self.log_dir / f"resolve-{name}.log"
+        t0 = time.time()
+        run(cmd + self.extra, work, log, self.env)
+        self.timings.append((name, len(items), time.time() - t0))
+        self.problems.update(repository_problems(log))
 
     def versions(self, g: str, a: str) -> list[str]:
         d = self.local() / g.replace(".", "/") / a
@@ -3365,6 +3377,40 @@ class MavenRepo:
 
     def path(self, g, a, v, ext) -> Path:
         return self.local() / g.replace(".", "/") / a / v / f"{a}-{v}.{ext}"
+
+
+def local_repository(extra: list[str], env: dict) -> Path:
+    for i, a in enumerate(extra):
+        if a.startswith("-Dmaven.repo.local="):
+            return Path(a.split("=", 1)[1]).expanduser()
+    settings = []
+    for i, a in enumerate(extra):
+        if a in ("-s", "--settings") and i + 1 < len(extra):
+            settings.append(Path(extra[i + 1]).expanduser())
+        elif a.startswith("--settings="):
+            settings.append(Path(a.split("=", 1)[1]).expanduser())
+    settings.append(Path.home() / ".m2/settings.xml")
+    for home in (env.get("MAVEN_HOME"), env.get("M2_HOME")):
+        if home:
+            settings.append(Path(home) / "conf/settings.xml")
+    for f in settings:
+        m = re.search(r"<localRepository>\s*([^<]+?)\s*</localRepository>", read(f) or "") if f.exists() else None
+        if m:
+            v = re.sub(r"\$\{user\.home\}", str(Path.home()), m.group(1))
+            v = re.sub(r"\$\{env\.(\w+)\}", lambda x: env.get(x.group(1), ""), v)
+            return Path(v).expanduser()
+    return Path.home() / ".m2/repository"
+
+
+def repository_problems(log: Path) -> dict[str, str]:
+    """Repositories that failed or timed out during resolution -> reason (these are what make resolution slow)."""
+    out = {}
+    text = read(log) or ""
+    for m in re.finditer(r"(?:Could not transfer|Failed to transfer|Could not (?:resolve|retrieve)).*?(?:from/to|from) ([\w.\-]+) \(([^)]+)\)[:\s]*([^\n]*)", text):
+        reason = m.group(3).strip()
+        if not re.search(r"\b404\b|not found|was cached in the local repository", reason, re.I):   # missing artifacts are normal
+            out[f"{m.group(1)} ({m.group(2)})"] = reason[:160]
+    return out
 
 
 def _resolve_prop(v: str, props: dict) -> str:
@@ -3497,8 +3543,12 @@ def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_gr
     root_pom = re.sub(r"<parent>.*?</parent>", "", read(root / "pom.xml") or "", flags=re.S)
     root_group = _first_tag(root_pom, "groupId") or None
     lines = [l for l in ("3.5", "4.0", "4.1") if vtuple(l) <= vtuple(target)]
+    if not refs:
+        say_("[deps] no company parent, BOM or explicitly versioned library outside Spring found")
+        return {"target": target, "internalGroups": internal_groups, "lines": [], "dependencies": []}
     say_(f"[deps] checking {len(refs)} parent/BOM/dependency reference(s) through your Maven settings")
-    repo.resolve([(r.group, r.artifact, "[0,)", "pom") for r in refs], "metadata")
+    say_(f"[deps]   1/2 reading available versions ({', '.join(r.artifact for r in refs[:6])}{' ...' if len(refs) > 6 else ''})")
+    repo.resolve([(r.group, r.artifact, "[0,)", "pom") for r in refs], "metadata", update=True)
     candidates = {}
     to_fetch = []
     for r in refs:
@@ -3509,7 +3559,15 @@ def detect_dependency_plan(root: Path, repo: MavenRepo, target: str, internal_gr
         cands = [r.version] + list(by_major.values())
         candidates[(r.kind, r.group, r.artifact)] = cands
         to_fetch += [(r.group, r.artifact, v, "pom" if r.kind != "dependency" else "jar") for v in cands]
+    say_(f"[deps]   2/2 downloading {len(set(to_fetch))} candidate version(s) to see what they were built against")
     repo.resolve(sorted(set(to_fetch)), "candidates")
+    for name, n, secs in repo.timings:
+        say_(f"[deps]   {name}: {n} artifact(s) in {secs:.0f}s (log: {repo.log_dir / ('resolve-' + name + '.log')})")
+    for r_, why in repo.problems.items():
+        say_(f"[deps]   slow/unreachable repository {r_}: {why}")
+    if repo.problems:
+        say_("[deps]   -> every lookup waits for these. Add a <mirror> for them in your settings.xml (as your normal build does), "
+             "or pass the same settings with --build-args \"-s settings.xml\"")
     all_infos = {(r.kind, r.group, r.artifact): {v: built_against(repo, r.group, r.artifact, v) for v in candidates[(r.kind, r.group, r.artifact)]}
                  for r in refs}
     via_libs = any(i[r.version]["openjpa"] for r, i in ((r, all_infos[(r.kind, r.group, r.artifact)]) for r in refs))
@@ -3649,7 +3707,7 @@ def effective_boot_version(root: Path, exe: str, extra: list[str], env: dict) ->
     """Boot version when it comes through a company parent/BOM: the resolved org.springframework.boot:spring-boot."""
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "deps.txt"
-        r = subprocess.run([exe, "-B", "-ntp", "-q", "dependency:list", "-DincludeGroupIds=org.springframework.boot",
+        r = subprocess.run([exe, "-B", "-ntp", "-q", f"{DEP_PLUGIN}:list", "-DincludeGroupIds=org.springframework.boot",
                             "-DincludeArtifactIds=spring-boot", f"-DoutputFile={out}", "-DexcludeTransitive=false"] + extra,
                            cwd=root, env=env, capture_output=True, text=True)
         m = re.search(r"org\.springframework\.boot:spring-boot:jar:([\w.\-]+)", read(out) or "") if out.exists() else None
@@ -3790,7 +3848,7 @@ rootProject {{
         if self.tool != "maven":
             return []
         out = self.log_dir / "classpath.txt"
-        code = run([self.exe, "-B", "-ntp", "-q", "dependency:build-classpath", f"-Dmdep.outputFile={out}", "-Dmdep.includeScope=runtime"] + self.extra,
+        code = run([self.exe, "-B", "-ntp", "-q", f"{DEP_PLUGIN}:build-classpath", f"-Dmdep.outputFile={out}", "-Dmdep.includeScope=runtime"] + self.extra,
                    self.root, self.log_dir / "classpath.log", self.env)
         if code != 0 or not out.exists():
             return []
