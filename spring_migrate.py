@@ -3810,6 +3810,306 @@ def run_strict_gate(root: Path, builder, key: str, profiles: list[str], no_git: 
     return False, log, changes_all, todo_all
 
 
+# ---- runtime checks: placeholders, beans and profiles only fail at context refresh, never at compile -------------------
+SMOKE_CLASS = "SpringMigrateContextSmokeTest"
+_ENV_PROBLEM_RX = re.compile(r"Connection refused|Communications link failure|UnknownHostException|SQLNonTransientConnectionException|"
+                             r"Failed to obtain JDBC Connection|Unable to (?:obtain|open) (?:JDBC )?[Cc]onnection|ERRORCODE=-4499|"
+                             r"SQLCODE=-30081|password authentication failed|Access denied for user|No route to host|"
+                             r"Connection timed out|ORA-12541|ORA-01017|Login failed for user")
+_PLACEHOLDER_RX = re.compile(r"Could not resolve placeholder '([^'$]+)' in (?:value|string value)")
+_MISSING_BEAN_RX = re.compile(r"required a bean of type '([\w.$]+)' that could not be found|No qualifying bean of type '([\w.$]+)' available")
+
+
+def boot_apps(root: Path) -> list[tuple[Path, str, Path]]:
+    """(module dir, package, application class) of every @SpringBootApplication in main sources."""
+    out = []
+    for p in java_sources(root, main_only=True):
+        t = read(p) or ""
+        if re.search(r"@(?:[\w.]+\.)?SpringBootApplication\b", t):
+            pm = re.search(r"^\s*package\s+([\w.]+)\s*;", t, re.M)
+            out.append((module_of(p, root), pm.group(1) if pm else "", p))
+    return out
+
+
+def boot_metadata_defaults(classpath: list[str]) -> dict:
+    """Property name -> default value from the configuration metadata of the jars (Boot and libraries)."""
+    import zipfile
+    out = {}
+    for e in classpath:
+        if not e.endswith(".jar") or not os.path.exists(e):
+            continue
+        try:
+            with zipfile.ZipFile(e) as z:
+                for n in ("META-INF/spring-configuration-metadata.json", "META-INF/additional-spring-configuration-metadata.json"):
+                    if n in z.namelist():
+                        try:
+                            data = json.loads(z.read(n).decode("utf-8"))
+                        except ValueError:
+                            continue
+                        for prop in data.get("properties", []):
+                            if "defaultValue" in prop and prop.get("name"):
+                                dv = prop["defaultValue"]
+                                dv = ",".join(map(str, dv)) if isinstance(dv, list) else (str(dv).lower() if isinstance(dv, bool) else str(dv))
+                                out.setdefault(prop["name"], dv)
+        except (OSError, zipfile.BadZipFile):
+            continue
+    return out
+
+
+def _relaxed(key: str) -> str:
+    return re.sub(r"[-_]", "", key.lower())
+
+
+def project_config_keys(root: Path) -> dict:
+    """relaxed key -> (key, value) over every main config file (all profiles)."""
+    out = {}
+    for f in config_files(root, include_test=False):
+        for e in ConfigFile(f).entries():
+            out.setdefault(_relaxed(e["key"]), (e["key"], e.get("value")))
+    return out
+
+
+# framework defaults applied in code (no metadata defaultValue): a @Value without default fails although Boot would bind these
+KNOWN_DEFAULTS = {"spring.batch.jdbc.table-prefix": "BATCH_", "spring.batch.table-prefix": "BATCH_",
+                  "spring.jpa.properties.hibernate.default_schema": None, "server.servlet.context-path": "",
+                  "spring.application.name": "application"}
+
+
+def _derive_value(key: str, configured: dict, defaults: dict) -> tuple[str | None, str]:
+    """Value for a required placeholder: the project's own setting under another key first (a custom table prefix or
+    schema must win over a framework default), then the configuration metadata default, then known framework defaults."""
+    last = _relaxed(key.rsplit(".", 1)[-1])
+    same = {kv[0]: kv[1] for k, kv in configured.items() if k.rsplit(".", 1)[-1] == last and kv[1] not in (None, "")}
+    if len(set(same.values())) == 1:
+        k, v = next(iter(same.items()))
+        return v, f"derived from the existing {k} (same setting under another key)"
+    for name, dv in defaults.items():
+        if _relaxed(name) == _relaxed(key):
+            return dv, f"the default of {name} (a binding default, never an Environment value before)"
+    kd = KNOWN_DEFAULTS.get(key)
+    if kd is not None:
+        return kd, "the framework's built-in default (applied in code, so the placeholder never resolved to it)"
+    return None, ""
+
+
+def jar_placeholders(jar: Path) -> set:
+    """${...} placeholders without a default that the jar's classes and resources read."""
+    import zipfile
+    out = set()
+    try:
+        with zipfile.ZipFile(jar) as z:
+            for n in z.namelist():
+                if n.endswith((".class", ".xml", ".properties")):
+                    for m in re.finditer(rb"\$\{([A-Za-z][\w.\-\[\]]*)\}", z.read(n)):
+                        out.add(m.group(1).decode("ascii", "replace"))
+    except (OSError, zipfile.BadZipFile):
+        pass
+    return out
+
+
+def new_required_placeholders(root: Path, dep_plan: dict, line: str, local_repo: Path, classpath: list[str]) -> tuple[list[str], list[str]]:
+    """Placeholders (without default) that an upgraded company library reads and its previous version did not, which the
+    project does not set: added with Boot's default / a value derived from existing config, else reported as blocking."""
+    changes, todo = [], []
+    if not dep_plan:
+        return changes, todo
+    configured = project_config_keys(root)
+    defaults = None
+    apps = boot_apps(root)
+    for d in dep_plan.get("dependencies", []):
+        new_v, old_v = d.get("upgrades", {}).get(line), d.get("current")
+        if not new_v or new_v == old_v or ":" not in d.get("coordinate", ""):
+            continue
+        g, a = d["coordinate"].split(":")[:2]
+        jar = lambda v: local_repo / Path(*g.split(".")) / a / v / f"{a}-{v}.jar"
+        if not (jar(new_v).exists() and jar(old_v).exists()):
+            continue
+        added = jar_placeholders(jar(new_v)) - jar_placeholders(jar(old_v))
+        for key in sorted(k for k in added if _relaxed(k) not in configured):
+            defaults = defaults if defaults is not None else boot_metadata_defaults(classpath)
+            value, why = _derive_value(key, configured, defaults)
+            if value is None or not apps:
+                todo.append(f"BLOCKING: {g}:{a} {new_v} reads ${{{key}}} without a default ({old_v} did not) and the project does "
+                            f"not set it - the context will fail with 'Could not resolve placeholder'. Set {key} in application.properties")
+                continue
+            for mod, _, _ in apps:
+                cf = main_config(root, mod) or ConfigFile(mod / "src/main/resources/application.properties")
+                cf.put(key, value, comment=f"spring-migrate: {g}:{a} {new_v} reads ${{{key}}} without a default; {why}")
+                if cf.save():
+                    changes.append(f"{rel(cf.path, root)}: {key}={value} ({a} {new_v} requires it; {why})")
+            configured[_relaxed(key)] = (key, value)
+    return changes, todo
+
+
+def _active_profiles(root: Path, extra: list[str]) -> list[str]:
+    prof = list(extra)
+    for f in config_files(root, include_test=False):
+        if re.match(r"(application|bootstrap)\.(properties|ya?ml)$", f.name):
+            cf = ConfigFile(f)
+            for k in ("spring.profiles.active", "spring.profiles.include", "spring.profiles.default"):
+                v = cf.get(k)
+                for p_ in re.split(r"[,\s]+", str(v or "")):
+                    if p_ and p_ not in prof:
+                        prof.append(p_)
+    return prof
+
+
+def find_bean_definitions(root: Path, bean_type: str, classpath: list[str]) -> list[tuple[str, list[str]]]:
+    """Where a bean of this type is declared (source @Bean methods/components and library classes), with the
+    @Profile values that gate each declaration."""
+    import zipfile
+    simple = bean_type.rsplit(".", 1)[-1].split("$")[-1]
+    out = []
+    for p in java_sources(root, main_only=True):
+        t = read(p) or ""
+        if simple not in t:
+            continue
+        cls_prof = re.findall(r"@Profile\s*\(\s*(?:value\s*=\s*)?\{?([^)}]*)\}?\s*\)(?=(?:\s*@[\w.]+(?:\([^)]*\))?)*\s*(?:public\s+|final\s+|abstract\s+)*class\b)", t)
+        hits = list(re.finditer(rf"((?:@[\w.]+(?:\s*\([^)]*\))?\s*)*)(?:public\s+|protected\s+)?(?:static\s+)?{simple}(?:<[^>]*>)?\s+\w+\s*\(", t))
+        hits = [h for h in hits if "@Bean" in h.group(1)]
+        decl = re.search(rf"\bclass\s+\w+[^{{]*\b(?:implements|extends)\b[^{{]*\b{simple}\b", t)
+        if hits or (decl and re.search(r"@(?:Component|Service|Repository|Configuration)\b", t)):
+            profs = []
+            for h in hits:
+                profs += re.findall(r"@Profile\s*\(\s*(?:value\s*=\s*)?\{?([^)}]*)\}?", h.group(1))
+            profs += cls_prof
+            names = sorted({x.strip().strip('"') for pr in profs for x in pr.split(",") if x.strip()})
+            out.append((rel(p, root), names))
+    internal = bean_type.replace(".", "/").encode()
+    profile_desc = b"Lorg/springframework/context/annotation/Profile;"
+    candidates = []
+    for e in classpath:
+        if not e.endswith(".jar") or not os.path.exists(e):
+            continue
+        try:
+            with zipfile.ZipFile(e) as z:
+                for n in z.namelist():
+                    if n.endswith(".class"):
+                        data = z.read(n)
+                        if internal in data and (b")L" + internal + b";") in data:
+                            candidates.append((e, n[:-6].replace("/", "."), profile_desc in data))
+        except (OSError, zipfile.BadZipFile):
+            continue
+    for jar, cls, gated in candidates[:25]:
+        names = []
+        if gated:
+            r = subprocess.run(["javap", "-v", "-cp", jar, cls], capture_output=True, text=True, errors="replace")
+            for pm in re.finditer(r"annotation\.Profile\(\s*value=\[([^\]]*)\]", r.stdout):
+                names += [x.strip().strip('"') for x in pm.group(1).split(",") if x.strip()]
+        out.append((f"{Path(jar).name}: {cls}", sorted(set(names))))
+    return out
+
+
+def diagnose_context_failure(root: Path, text: str, classpath: list[str], profiles: list[str]) -> tuple[list[str], list[str], bool]:
+    """(fixes, blocking items, environment problem). Fixes: required placeholders with a known value."""
+    changes, todo = [], []
+    configured = project_config_keys(root)
+    defaults = None
+    for key in sorted(set(_PLACEHOLDER_RX.findall(text))):
+        if _relaxed(key) in configured:
+            continue                 # set by now (an earlier fix): this failure text is from before it
+        defaults = defaults if defaults is not None else boot_metadata_defaults(classpath)
+        value, why = _derive_value(key, configured, defaults)
+        if value is None:
+            todo.append(f"BLOCKING: the context needs property {key} (read with ${{{key}}} and no default, typically by an "
+                        f"upgraded library's @Value) - set it in application.properties")
+            continue
+        for mod, _, _ in boot_apps(root):
+            cf = main_config(root, mod) or ConfigFile(mod / "src/main/resources/application.properties")
+            cf.put(key, value, comment=f"spring-migrate: required at startup (${{{key}}} has no default); {why}")
+            if cf.save():
+                changes.append(f"{rel(cf.path, root)}: {key}={value} ({why})")
+    for m in _MISSING_BEAN_RX.finditer(text):
+        bean = m.group(1) or m.group(2)
+        if any(bean in t for t in todo):
+            continue
+        defs = find_bean_definitions(root, bean, classpath)
+        active = _active_profiles(root, profiles)
+        gated = [(w, p) for w, p in defs if p]
+        if not defs:
+            todo.append(f"BLOCKING: no bean of type {bean} is declared anywhere (project or libraries) - an upgraded library "
+                        f"now requires it as a collaborator; declare a @Bean of that type")
+        elif gated and not any(not p or set(p) & set(active) for _, p in defs):
+            where = "; ".join(f"{w} under @Profile({', '.join(p)})" for w, p in gated[:4])
+            need = sorted({x for _, p in gated for x in p if not x.startswith("!")})
+            todo.append(f"BLOCKING: bean {bean} is only declared under a profile that is not active (active: "
+                        f"{', '.join(active) or 'none'}): {where}. @Profile also applies to @Import-ed classes - activate it, e.g. "
+                        f"spring.profiles.include={need[0] if need else '<profile>'} (or spring.profiles.group), or declare the bean "
+                        f"for the active profiles")
+        else:
+            todo.append(f"BLOCKING: bean {bean} could not be found although it is declared ({'; '.join(w for w, _ in defs[:3])}) - "
+                        f"check @Conditional*/component scanning for it")
+    env = bool(_ENV_PROBLEM_RX.search(text)) and not changes and not todo
+    return changes, todo, env
+
+
+def run_context_smoke(root: Path, builder, key: str, profiles: list[str], no_git: bool) -> tuple[bool | None, list, list]:
+    """Load each application's context once (a temporary @SpringBootTest), diagnose what fails and fix what has a
+    single right value (missing placeholders). Returns (ok or None when it could not run, changes, todo)."""
+    changes_all, todo_all, ok_all = [], [], True
+    if builder.tool != "maven":
+        return None, [], []
+    apps = boot_apps(root)
+    if not apps:
+        return None, [], []
+    for mod, pkg, app in apps:
+        builds = reactor_text(root, module_build_file(mod)) if module_build_file(mod) else ""
+        if not re.search(r"spring-boot-starter-test|spring-boot-test\b", builds):
+            todo_all.append(f"{rel(app, root)}: no spring-boot-starter-test in this module - add it so placeholder and missing-bean "
+                            f"problems show up in a build (the context smoke test could not run)")
+            continue
+        test_dir = mod / "src/test/java" / Path(*pkg.split(".")) if pkg else mod / "src/test/java"
+        test = test_dir / f"{SMOKE_CLASS}.java"
+        prof = ", ".join(f'"{p_}"' for p_ in profiles)
+        src = ((f"package {pkg};\n\n" if pkg else "") +
+               "import org.junit.jupiter.api.Test;\nimport org.springframework.boot.test.context.SpringBootTest;\n" +
+               ("import org.springframework.test.context.ActiveProfiles;\n" if profiles else "") +
+               "\n/** Temporary context-load check written by spring-migrate; removed after the run. */\n@SpringBootTest\n" +
+               (f"@ActiveProfiles({{{prof}}})\n" if profiles else "") +
+               f"class {SMOKE_CLASS} {{\n  @Test\n  void contextLoads() {{\n  }}\n}}\n")
+        mod_rel = rel(mod, root)
+        cmd = [builder.exe, "-B", "-ntp", "test", f"-Dtest={SMOKE_CLASS}", "-Dsurefire.failIfNoSpecifiedTests=false",
+               "-DfailIfNoTests=false"] + ([] if mod_rel in (".", "") else ["-pl", mod_rel, "-am"]) + QUALITY_SKIP + builder.extra
+        for rnd in range(3):
+            log = builder.log_dir / f"{key}-smoke-{mod.name}{rnd or ''}.log"
+            log.unlink(missing_ok=True)
+            for old in (mod / "target/surefire-reports").glob(f"*{SMOKE_CLASS}*") if (mod / "target/surefire-reports").is_dir() else []:
+                old.unlink()
+            test_dir.mkdir(parents=True, exist_ok=True)
+            write_file(test, src)
+            try:
+                code = run(cmd, root, log, builder.env)
+            finally:
+                test.unlink(missing_ok=True)
+            reports = " ".join(read(f) or "" for f in (mod / "target/surefire-reports").glob(f"*{SMOKE_CLASS}*")) \
+                if (mod / "target/surefire-reports").is_dir() else ""
+            if code == 0:
+                say(f"  smoke: {rel(app, root)} - application context loads")
+                break
+            text = (read(log) or "") + "\n" + reports
+            changes, todo, env = diagnose_context_failure(root, text, builder.test_classpath(), profiles)
+            todo_all += [t for t in todo if t not in todo_all]
+            if env:
+                todo_all.append(f"{rel(app, root)}: the context smoke test could not reach an external system (database, broker...) "
+                                f"- not a migration error; re-run with a reachable environment or --smoke-profiles <test profile> "
+                                f"(log: {log})")
+                break
+            if not changes:
+                ok_all = False
+                if not todo:
+                    todo_all.append(f"BLOCKING: {rel(app, root)}: the application context does not start - see {log}")
+                break
+            changes_all += changes
+            for c in changes:
+                say(f"  smoke fix: {c}")
+            if not no_git:
+                git(root, "add", "-A")
+                git(root, "commit", "-q", "-m", f"chore(migration): properties the context requires ({key})")
+        else:
+            ok_all = False
+    return ok_all, changes_all, todo_all
+
+
 # ---- wiring guard: a stage must never silently drop class-level wiring (entity scan, component scan, imports, ...) ----
 # Annotations whose loss changes the application context without a compile error. Deliberately not the ones the
 # migration removes on purpose (@EnableBatchProcessing, @EnableHystrix, @EnableResourceServer, @EnableSwagger2, ...).
@@ -6476,6 +6776,24 @@ def cmd_migrate(a) -> int:
             failed_stage = st.key
             break
 
+    # ---- runtime checks: context refresh (placeholders, beans, profiles) ---
+    smoke_ok = None
+    if not failed_stage and not a.skip_tests and a.smoke_test != "off" and builder.tool == "maven":
+        final_line = next((st.boot_line for st in reversed(stages) if st.boot_line), None)
+        if dep_plan and final_line:
+            pc, pt = new_required_placeholders(root, dep_plan, final_line, local_repository(builder.extra, env), builder.test_classpath())
+            for c in pc:
+                say(f"  placeholders: {c}")
+            todo_all += pt
+            if pc and not a.no_git:
+                git(root, "add", "-A")
+                git(root, "commit", "-q", "-m", "chore(migration): properties newly required by upgraded company libraries")
+        say("\n[check] context smoke test: does every application context start?")
+        profiles = [x for x in re.split(r"[,\s]+", a.smoke_profiles or "") if x]
+        smoke_ok, sc, st_ = run_context_smoke(root, builder, "final", profiles, a.no_git)
+        todo_all += st_
+        if smoke_ok is False:
+            say("[check] the application context does not start - see the BLOCKING items in the report")
     # ---- jars still compiled against javax.* -------------------------------
     if not failed_stage and not a.skip_tests:
         direct = {a for bf in build_files(root) for _, _, _, a in pom_dependency_blocks(read(bf) or "") if a}
@@ -6496,6 +6814,9 @@ def cmd_migrate(a) -> int:
     elif failed_stage:
         say(f"[done] stopped at stage {failed_stage}. Automated changes are committed; fix the build on top of them, "
             f"then re-run `spring-migrate migrate` for the remaining stages (it detects the current version).")
+        return 1
+    if smoke_ok is False:
+        say("[done] all stages build and test green, but the application context does not start (see BLOCKING in the report)")
         return 1
     return 0
 
@@ -6700,6 +7021,15 @@ def cmd_update(a) -> int:
     if not ok:
         show_errors(strict_log if strict_log and strict_log.exists() else log_dir / "update-build.log")
         return 1
+    if a.smoke_test != "off" and info["tool"] == "maven":
+        say("[update] context smoke test: does every application context start?")
+        profiles = [x for x in re.split(r"[,\s]+", a.smoke_profiles or "") if x]
+        smoke_ok, _, stodo = run_context_smoke(root, builder, "update", profiles, False)
+        for t in stodo:
+            say(f"  TODO {t}")
+        if smoke_ok is False:
+            say("[update] the application context does not start")
+            return 1
     return 0
 
 
@@ -6755,6 +7085,8 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--build-args", help='extra args for mvn/gradle, e.g. "-s /path/settings.xml"')
     up.add_argument("--db2-platform", choices=("luw", "zos", "ibmi"), help="DB2 platform for the Hibernate 6 dialect (DB2Dialect = LUW, DB2zDialect, DB2iDialect); default: from .spring-migrate/state.json, else each DB2 dialect keeps its platform (DB2390* = z/OS, DB2400* = IBM i)")
     up.add_argument("--skip-tests", action="store_true", help="only apply and commit the fixes, no build")
+    up.add_argument("--smoke-test", choices=("auto", "off"), default="auto", help="after the build: start every application context once (a temporary @SpringBootTest) to catch missing properties/beans/profiles that only fail at startup")
+    up.add_argument("--smoke-profiles", help="profiles for the context smoke test, comma-separated (e.g. a test profile with an embedded database)")
     up.add_argument("--ci-profile", action="append", help="Maven profile the project's CI verifies with (repeatable; default: read from .gitlab-ci.yml/Jenkinsfile/GitHub workflows, else a ci/strict/quality profile in the POMs)")
     up.add_argument("--no-strict-gate", action="store_true", help="do not run the project's strict verification (enforcer, quality plugins, CI profiles) after the build+tests")
     up.add_argument("--skip-frontend", action="store_true")
@@ -6804,6 +7136,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--no-legacy", action="store_true", help="skip the legacy-library codemods (Netflix, legacy OAuth2, id pinning, ...)")
     m.add_argument("--db2-platform", choices=("luw", "zos", "ibmi"), help="DB2 platform for the Hibernate 6 dialect (DB2Dialect = LUW, DB2zDialect, DB2iDialect); default: each DB2 dialect keeps its platform (DB2390* = z/OS, DB2400* = IBM i)")
     m.add_argument("--no-trailing-slash-compat", action="store_true", help="do not add the trailing-slash compatibility filter")
+    m.add_argument("--smoke-test", choices=("auto", "off"), default="auto", help="after the build: start every application context once (a temporary @SpringBootTest) to catch missing properties/beans/profiles that only fail at startup")
+    m.add_argument("--smoke-profiles", help="profiles for the context smoke test, comma-separated (e.g. a test profile with an embedded database)")
     m.add_argument("--ci-profile", action="append", help="Maven profile the project's CI verifies with (repeatable; default: read from .gitlab-ci.yml/Jenkinsfile/GitHub workflows, else a ci/strict/quality profile in the POMs)")
     m.add_argument("--no-strict-gate", action="store_true", help="do not run the project's strict verification (enforcer, quality plugins, CI profiles) after the build+tests")
     m.add_argument("--no-properties-migrator", action="store_true", help="do not run tests with spring-boot-properties-migrator")

@@ -49,7 +49,7 @@ OPTION_GROUPS = {
     "target": "Target", "java": "Target", "java_home": "Build", "build_args": "Build", "retries": "Build",
     "dry_run": "Run", "skip_tests": "Run", "skip_baseline": "Run", "allow_dirty": "Run", "no_git": "Run", "force": "Run",
     "openjpa": "Migration steps", "no_openjpa": "Migration steps", "no_legacy": "Migration steps",
-    "no_trailing_slash_compat": "Migration steps", "ci_profile": "Build", "no_strict_gate": "Build", "db2_platform": "Migration steps", "no_properties_migrator": "Migration steps",
+    "no_trailing_slash_compat": "Migration steps", "ci_profile": "Build", "smoke_test": "Run", "smoke_profiles": "Run", "no_strict_gate": "Build", "db2_platform": "Migration steps", "no_properties_migrator": "Migration steps",
     "dependency_plan": "Company dependencies", "internal_group": "Company dependencies", "no_dependency_detection": "Company dependencies", "refresh_dependency_versions": "Company dependencies",
     "offline": "Build", "rewrite_spring_version": "Advanced", "rewrite_plugin_version": "Advanced", "extra_recipe": "Advanced",
     "json": "Run", "skip_frontend": "Build", "format_goal": "Build", "no_format": "Build", "rewrite_frontend": "Advanced", "rewrite_args": "Advanced", "rewrite_no_fork": "Advanced",

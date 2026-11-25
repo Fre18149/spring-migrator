@@ -954,6 +954,45 @@ class JpqlTemporalLiteralTest(unittest.TestCase):
         pr.close()
 
 
+class RuntimeDiagnosisTest(unittest.TestCase):
+    def test_placeholder_value_derived_and_bean_profile_reported(self):
+        pr = Project({
+            "app/src/main/java/a/App.java": "package a;\n@SpringBootApplication\npublic class App {}\n",
+            "app/src/main/resources/application.properties": "spring.batch.table-prefix=URV.BATCH_\nspring.profiles.active=prod\n",
+            "app/pom.xml": "<project><artifactId>app</artifactId></project>",
+            "app/src/main/java/a/Cfg.java": """
+                package a;
+                @Configuration
+                @Profile("tomcat")
+                class Cfg {
+                  @Bean
+                  TokenService tokenService() { return null; }
+                }
+                """})
+        log = ("Caused by: java.lang.IllegalArgumentException: Could not resolve placeholder 'spring.batch.jdbc.table-prefix' "
+               "in value \"${spring.batch.jdbc.table-prefix}\"\n"
+               "Parameter 0 of method securityFilter in com.corp.lib.CorpAutoConfiguration required a bean of type "
+               "'com.corp.lib.TokenService' that could not be found.\n")
+        changes, todo, env = sm.diagnose_context_failure(pr.root, log, [], [])
+        self.assertFalse(env)
+        self.assertIn("spring.batch.jdbc.table-prefix=URV.BATCH_", pr["app/src/main/resources/application.properties"])
+        self.assertIn("derived from the existing spring.batch.table-prefix", changes[0])
+        self.assertEqual(len(todo), 1)
+        self.assertIn("only declared under a profile that is not active (active: prod)", todo[0])
+        self.assertIn("app/src/main/java/a/Cfg.java under @Profile(tomcat)", todo[0])
+        self.assertIn("spring.profiles.include=tomcat", todo[0])
+        pr.close()
+
+    def test_known_default_and_environment_problem(self):
+        self.assertEqual(sm._derive_value("spring.batch.jdbc.table-prefix", {}, {})[0], "BATCH_")
+        self.assertEqual(sm._derive_value("x.y", {}, {"x.y": "5"})[0], "5")
+        pr = Project({"src/main/java/a/App.java": "package a;\n@SpringBootApplication\nclass App {}\n"})
+        _, todo, env = sm.diagnose_context_failure(pr.root, "Failed to obtain JDBC Connection; Connection refused", [], [])
+        self.assertTrue(env)
+        self.assertEqual(todo, [])
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>
