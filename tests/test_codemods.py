@@ -597,7 +597,11 @@ class CustomDialectTest(unittest.TestCase):
         # length-specific rule first, the comment moves along
         self.assertLess(j.index("Types.CHAR && precision <= 1"), j.index("Types.BIGINT)"))
         self.assertLess(j.index("// enum domains"), j.index("Types.CHAR && precision <= 1"))
-        self.assertIn("return jdbcTypeRegistry.getDescriptor(Types.VARCHAR);", j)
+        self.assertIn("if (jdbcTypeCode == Types.CHAR && precision <= 1) {\n            return CHAR_AS_STRING;", j)
+        self.assertIn("(jdbcTypeCode == Types.VARCHAR || jdbcTypeCode == Types.NVARCHAR) && precision <= 1", j)
+        self.assertIn("private static final JdbcType CHAR_AS_STRING = new CharJdbcType() {", j)
+        self.assertIn("public JavaType<?> getRecommendedJavaType(", j)            # Hibernate 7
+        self.assertIn("public <T> JavaType<T> getJdbcRecommendedJavaTypeMapping(", j)   # Hibernate 6
         self.assertIn("import org.hibernate.type.descriptor.jdbc.spi.JdbcTypeRegistry;", j)
         self.assertEqual(sm.fix_custom_dialects(pr.root, "luw"), ([], []))
         sm.fix_hibernate_props(pr.root, "luw")
@@ -624,6 +628,38 @@ class CustomDialectTest(unittest.TestCase):
         # the platform changed later (z/OS -> LUW): update moves the already migrated class
         sm.fix_custom_dialects(pr.root, "luw")
         self.assertIn("extends DB2Dialect {", pr[self.F])
+        pr.close()
+
+    def test_repairs_dialect_converted_by_2_2(self):
+        old = """
+            package at.x;
+
+            import java.sql.Types;
+            import org.hibernate.dialect.DB2Dialect;
+            import org.hibernate.type.descriptor.jdbc.JdbcType;
+            import org.hibernate.type.descriptor.jdbc.spi.JdbcTypeRegistry;
+
+            public class CustomDb2390Dialect extends DB2Dialect {
+
+                @Override
+                public JdbcType resolveSqlTypeDescriptor(String columnTypeName, int jdbcTypeCode, int precision, int scale,
+                        JdbcTypeRegistry jdbcTypeRegistry) {
+                    if (jdbcTypeCode == Types.CHAR && precision <= 1) {
+                        return jdbcTypeRegistry.getDescriptor(Types.VARCHAR);
+                    }
+                    return super.resolveSqlTypeDescriptor(columnTypeName, jdbcTypeCode, precision, scale, jdbcTypeRegistry);
+                }
+            }
+            """
+        pr = Project({self.F: old})
+        changes, _ = sm.fix_custom_dialects(pr.root, "luw")
+        j = pr[self.F]
+        self.assertTrue(changes)
+        self.assertNotIn("getDescriptor(Types.VARCHAR)", j)
+        self.assertIn("return CHAR_AS_STRING;", j)
+        self.assertIn("return VARCHAR_AS_STRING;", j)
+        self.assertIn("import org.hibernate.type.descriptor.jdbc.CharJdbcType;", j)
+        self.assertEqual(sm.fix_custom_dialects(pr.root, "luw"), ([], []))
         pr.close()
 
     def test_unported_api_is_reported(self):

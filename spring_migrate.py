@@ -35,11 +35,13 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "2.3.0"
+__version__ = "2.3.1"
 
 # What each version changes for an already migrated branch (`spring_migrate.py update` prints the entries newer than the
 # version recorded in .spring-migrate/state.json). Every post-fixer is idempotent, so `update` simply runs them again.
 CHANGELOG = [
+    ("2.3.1", "converted dialects: CHAR(1)/VARCHAR(1) native query results are Strings again (Hibernate 6 made them Character, "
+              "so '' became ' ' or null); dialects converted by 2.2.0/2.3.0 are repaired"),
     ("2.3.0", "context smoke test after the build: missing placeholders filled from existing config/metadata/framework defaults; "
               "missing beans traced to @Profile-gated declarations (sources and jars) and reported"),
     ("2.3.0", "placeholders that upgraded company libraries newly read without a default are set (or reported) up front"),
@@ -5189,6 +5191,57 @@ def fix_jpql_temporal_literals(root: Path) -> list[str]:
     return changes
 
 
+_STRING_JDBC = {"CHAR_AS_STRING": "CharJdbcType", "VARCHAR_AS_STRING": "VarcharJdbcType"}
+_GENERATED_RESOLVE = "resolveSqlTypeDescriptor(String columnTypeName, int jdbcTypeCode, int precision, int scale,"
+
+
+def _string_jdbc_constant(name: str, base: str, i1: str) -> str:
+    i2 = i1 + ("\t" if i1.startswith("\t") else "    ")
+    i3 = i2 + ("\t" if i1.startswith("\t") else "    ")
+    return (f"{i1}/** Read as String also for length 1 - Hibernate 6 reads CHAR(1)/VARCHAR(1) as Character ('' becomes ' ' or null). */\n"
+            f"{i1}private static final JdbcType {name} = new {base}() {{\n"
+            f"{i2}// Hibernate 6.x\n{i2}@SuppressWarnings(\"unchecked\")\n"
+            f"{i2}public <T> JavaType<T> getJdbcRecommendedJavaTypeMapping(Integer length, Integer scale, TypeConfiguration typeConfiguration) {{\n"
+            f"{i3}return (JavaType<T>) typeConfiguration.getJavaTypeRegistry().getDescriptor(String.class);\n{i2}}}\n\n"
+            f"{i2}// Hibernate 7.x\n"
+            f"{i2}public JavaType<?> getRecommendedJavaType(Integer length, Integer scale, TypeConfiguration typeConfiguration) {{\n"
+            f"{i3}return typeConfiguration.getJavaTypeRegistry().getDescriptor(String.class);\n{i2}}}\n"
+            f"{i1}}};\n\n")
+
+
+def _ensure_string_jdbc_types(text: str) -> str:
+    """In a converted dialect's resolveSqlTypeDescriptor: Hibernate 5 type mappings to STRING must really yield a String.
+    Hibernate 6 derives the Java type from the JDBC type and the length - CHAR(1) and VARCHAR(1) become Character, and
+    an empty string turns into ' ' or null. Also restores Hibernate 5's VARCHAR(1) -> String for native query results."""
+    if _GENERATED_RESOLVE not in text:
+        return text
+    def per_code(m):
+        const = "CHAR_AS_STRING" if m.group(2) in ("CHAR", "NCHAR") else "VARCHAR_AS_STRING"
+        return m.group(1) + f"return {const};"
+    new = re.sub(r"(if \(jdbcTypeCode == Types\.(\w+)[^\n]*\{\s*\n\s*)return jdbcTypeRegistry\.getDescriptor\(Types\.VARCHAR\);", per_code, text)
+    mm = re.search(r"JdbcTypeRegistry jdbcTypeRegistry\) \{[ \t]*\n", new)
+    if mm and not re.search(r"jdbcTypeCode == Types\.VARCHAR \|\| jdbcTypeCode == Types\.NVARCHAR", new):
+        ind = re.match(r"[ \t]*", new[mm.end():]).group(0) or "        "
+        i3 = ind + ("\t" if ind.startswith("\t") else "    ")
+        rule = (f"{ind}// Hibernate 5 read VARCHAR(1) as String; Hibernate 6 reads it as Character\n"
+                f"{ind}if ((jdbcTypeCode == Types.VARCHAR || jdbcTypeCode == Types.NVARCHAR) && precision <= 1) {{\n"
+                f"{i3}return VARCHAR_AS_STRING;\n{ind}}}\n")
+        new = new[:mm.end()] + rule + new[mm.end():]
+    cm = re.search(r"\bclass\s+\w+[^{]*\{[ \t]*\n", new)
+    if cm:
+        nxt = re.search(r"\n([ \t]+)\S", new[cm.end() - 1:])
+        i1 = nxt.group(1) if nxt else "    "
+        add = "".join(_string_jdbc_constant(n, b, i1) for n, b in _STRING_JDBC.items()
+                      if re.search(rf"return {n};", new) and not re.search(rf"JdbcType {n}\s*=", new))
+        if add:
+            new = new[:cm.end()] + "\n" + add + new[cm.end():].lstrip("\n")
+            for imp in ("org.hibernate.type.descriptor.java.JavaType", "org.hibernate.type.descriptor.jdbc.CharJdbcType",
+                        "org.hibernate.type.descriptor.jdbc.VarcharJdbcType", "org.hibernate.type.spi.TypeConfiguration"):
+                if imp.rsplit(".", 1)[1] in new.replace(f"import {imp};", ""):
+                    new = add_import(new, imp)
+    return new
+
+
 def fix_custom_dialects(root: Path, db2_platform: str | None = None) -> tuple[list[str], list[str]]:
     """Own Dialect subclasses (e.g. `CustomDb2390Dialect extends DB2390Dialect`) on Hibernate 6/7: the removed
     version-specific base dialect -> its Hibernate 6 class, registerHibernateType(...) -> a resolveSqlTypeDescriptor
@@ -5255,6 +5308,11 @@ def fix_custom_dialects(root: Path, db2_platform: str | None = None) -> tuple[li
                     new = add_import(new, imp)
                 new = drop_unused_imports(new, ["org.hibernate.type.StandardBasicTypes"])
                 notes.append(f"registerHibernateType -> resolveSqlTypeDescriptor ({len(rules)} rule(s))")
+            # 2b. STRING mappings must stay String for length 1 (also repairs dialects converted by spring-migrate < 2.3.1)
+            fixed = _ensure_string_jdbc_types(new)
+            if fixed != new:
+                new = fixed
+                notes.append("CHAR(1)/VARCHAR(1) read as String like in Hibernate 5")
             # 3. supportsSequences() (removed) -> getSequenceSupport()
             sm = _SUPPORTS_SEQ_RX.search(new)
             if sm and sm.group(2) == "true" and _SEQUENCE_BASES.search(base):
