@@ -773,6 +773,135 @@ class Boot3ApiFixTest(unittest.TestCase):
         pr.close()
 
 
+class WiringGuardTest(unittest.TestCase):
+    OUTER = """
+        package a;
+
+        import org.springframework.boot.autoconfigure.domain.EntityScan;
+        import org.springframework.context.annotation.Bean;
+        import org.springframework.context.annotation.Configuration;
+        import org.springframework.context.annotation.Profile;
+
+        @Configuration
+        public class PersistenceConfig {
+
+          @Bean
+          Object a() { return 1; }
+
+          @Configuration
+          @Profile("hibernate")
+          @EntityScan(basePackages = {"a.domain", "a.other"})
+          static class HibernateConfig {
+            @Bean
+            Object obsolete(LegacyConfigurer c) { return c; }
+          }
+        }
+        """
+
+    def test_restores_nested_and_top_level_classes_member_free(self):
+        pr = Project({"src/main/java/a/PersistenceConfig.java": self.OUTER,
+                      "src/main/java/a/ScanConfig.java": """
+                        package a;
+                        import org.springframework.context.annotation.ComponentScan;
+                        import org.springframework.context.annotation.Configuration;
+                        @Configuration
+                        @ComponentScan("a.web")
+                        public class ScanConfig {
+                          Object x(LegacyConfigurer c) { return c; }
+                        }
+                        """,
+                      "src/main/java/a/Moved.java": """
+                        package a;
+                        @org.springframework.context.annotation.Configuration
+                        @org.springframework.data.jpa.repository.config.EnableJpaRepositories("a.repo")
+                        public class Moved {}
+                        """})
+        before = sm.wiring_snapshot(pr.root)
+        self.assertEqual(len(before), 3)
+        # a recipe deletes the nested class (one obsolete @Bean), the whole ScanConfig file, and moves @EnableJpaRepositories
+        outer = pr["src/main/java/a/PersistenceConfig.java"]
+        s = outer.index("  @Configuration\n  @Profile")
+        e = outer.rindex("\n  }\n") + 5                          # the nested class's closing brace
+        (pr.root / "src/main/java/a/PersistenceConfig.java").write_text(outer[:s] + outer[e:], encoding="utf-8")
+        (pr.root / "src/main/java/a/ScanConfig.java").unlink()
+        (pr.root / "src/main/java/a/Moved.java").write_text(
+            "package a;\n@org.springframework.context.annotation.Configuration\npublic class Moved {}\n", encoding="utf-8")
+        (pr.root / "src/main/java/a/App.java").write_text(
+            "package a;\n@org.springframework.data.jpa.repository.config.EnableJpaRepositories(\"a.repo\")\n"
+            "@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n", encoding="utf-8")
+        changes, todo = sm.guard_wiring(pr.root, before)
+        self.assertEqual(todo, [])
+        self.assertEqual(len(changes), 2, changes)             # the moved annotation is not restored
+        o = pr["src/main/java/a/PersistenceConfig.java"]
+        self.assertIn('  @Configuration\n  @Profile("hibernate")\n  @EntityScan(basePackages = {"a.domain", "a.other"})\n'
+                      '  static class HibernateConfig {\n  }\n}', o)
+        self.assertNotIn("obsolete", o)
+        self.assertIn("Object a()", o)
+        sc = pr["src/main/java/a/ScanConfig.java"]
+        self.assertIn('@Configuration\n@ComponentScan("a.web")\npublic class ScanConfig {\n}', sc)
+        self.assertIn("import org.springframework.context.annotation.ComponentScan;", sc)
+        self.assertNotIn("LegacyConfigurer", sc)
+        self.assertEqual(sm.guard_wiring(pr.root, before), ([], []))
+        pr.close()
+
+    def test_annotation_removed_from_surviving_class(self):
+        pr = Project({"src/main/java/a/PersistenceConfig.java": self.OUTER})
+        before = sm.wiring_snapshot(pr.root)
+        f = pr.root / "src/main/java/a/PersistenceConfig.java"
+        f.write_text(pr["src/main/java/a/PersistenceConfig.java"].replace('  @EntityScan(basePackages = {"a.domain", "a.other"})\n', ""),
+                     encoding="utf-8")
+        changes, _ = sm.guard_wiring(pr.root, before)
+        self.assertEqual(len(changes), 1)
+        self.assertIn('@Profile("hibernate")\n  @EntityScan(basePackages = {"a.domain", "a.other"})\n  static class HibernateConfig {\n'
+                      '    @Bean', pr["src/main/java/a/PersistenceConfig.java"])
+        pr.close()
+
+
+class LibraryApiAutofixTest(unittest.TestCase):
+    def test_catch_removal_and_unwrap(self):
+        src = ("class A {\n  void r(java.io.InputStream in) throws java.io.IOException {\n    try {\n      in.read();\n"
+               "    } catch (OldEx ex) {\n      throw new IllegalStateException(ex);\n    }\n    try {\n      in.read();\n"
+               "    } catch (java.io.IOException ex) {\n      throw ex;\n    } catch (IllegalStateException | OldEx ex) {\n"
+               "      throw ex;\n    } finally {\n      in.close();\n    }\n  }\n}\n")
+        i = src.index("catch (OldEx")
+        out, _ = sm._remove_catch(src, i, "OldEx")
+        self.assertIn("  void r(java.io.InputStream in) throws java.io.IOException {\n    in.read();\n    try {", out)
+        j = out.index("| OldEx") + 2
+        out2, _ = sm._remove_catch(out, j, "OldEx")
+        self.assertIn("catch (IllegalStateException ex)", out2)
+        k = out2.index("catch (IllegalStateException")
+        out3, _ = sm._remove_catch(out2, k, "IllegalStateException")
+        self.assertIn("    } catch (java.io.IOException ex) {\n      throw ex;\n    } finally {", out3)
+
+    def test_class_index_moved(self):
+        idx = sm.ClassIndex([])
+        idx.names = {"LocalServerPort": {"org.springframework.boot.test.web.server.LocalServerPort"},
+                     "Foo": {"x.a.Foo", "x.b.Foo"}}
+        self.assertEqual(idx.moved("org.springframework.boot.web.server.LocalServerPort"),
+                         "org.springframework.boot.test.web.server.LocalServerPort")
+        self.assertIsNone(idx.moved("x.c.Foo"))                # ambiguous: no guess
+
+    def test_pdfbox_liquibase_timestamp(self):
+        text = ("import java.sql.Timestamp;\nclass D {\n  Object p(java.io.InputStream in) throws Exception {\n"
+                "    e.setCreated(Timestamp.valueOf(now));\n    l.setLabelFilter(props.getLabels());\n"
+                "    return PDDocument.load(in);\n  }\n}\n")
+        imps = set()
+        i = text.index("PDDocument.load") + len("PDDocument")
+        out, _ = sm._fix_at(text, i, "Symbol nicht gefunden\nSymbol: Methode load(java.io.InputStream)\nOrt: Klasse org.apache.pdfbox.pdmodel.PDDocument", imps, [])
+        self.assertIn("return Loader.loadPDF(new RandomAccessReadBuffer(in));", out)
+        i = out.index(".getLabels")
+        out, _ = sm._fix_at(out, i, "Symbol nicht gefunden\nSymbol: Methode getLabels()\nOrt: Variable props von Typ "
+                                    "org.springframework.boot.autoconfigure.liquibase.LiquibaseProperties", imps, [])
+        i = out.index("(props.getLabelFilter") + len("(props.getLabelFilter")
+        out, _ = sm._fix_at(out, i, "Inkompatible Typen: java.util.List<java.lang.String> kann nicht in java.lang.String konvertiert werden", imps, [])
+        self.assertIn("l.setLabelFilter(StringUtils.collectionToCommaDelimitedString(props.getLabelFilter()));", out)
+        i = out.index("(now)")
+        out, _ = sm._fix_at(out, i, "Inkompatible Typen: java.sql.Timestamp kann nicht in java.time.LocalDateTime konvertiert werden", imps, [])
+        self.assertIn("e.setCreated(now);", out)
+        # List -> String only for the Liquibase getters
+        self.assertIsNone(sm._fix_at("x = names();", 9, "Inkompatible Typen: java.util.List<java.lang.String> kann nicht in java.lang.String konvertiert werden", set(), []))
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>
@@ -919,7 +1048,8 @@ class BuilderTest(unittest.TestCase):
         self.assertIn("-Dcheckstyle.skip=true", rewrite)
         self.assertNotIn("-Dspotless.check.skip=true", verify)  # ... but the build gate keeps them
         self.assertIn("corp.xml", rewrite)
-        self.assertTrue(rewrite[4].endswith(":run"))
+        self.assertEqual(rewrite[4], "clean")      # stale generated sources must not survive
+        self.assertTrue(rewrite[5].endswith(":run"))
 
     def test_skip_frontend_everywhere_and_no_fork(self):
         rewrite, verify = self.capture(skip_frontend=True, no_fork=True, rewrite_extra=["-Ddocker.skip"])

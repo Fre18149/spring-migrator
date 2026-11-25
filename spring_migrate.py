@@ -527,6 +527,7 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
         changes += hc
         todo_extra += ht
         changes += fix_xss_block(root)
+        changes += fix_batch5_launcher(root)
         changes += fix_response_error_handler(root)
     changes += fix_hibernate_props(root, db2_platform)
     changes += fix_build_wrappers(root, boot_line)
@@ -3035,6 +3036,21 @@ def fix_httpclient5_ssl(root: Path) -> tuple[list[str], list[str]]:
 _XSS = "XXssProtectionHeaderWriter.HeaderValue."
 
 
+def fix_batch5_launcher(root: Path) -> list[str]:
+    """Spring Batch 5 renamed SimpleJobLauncher to TaskExecutorJobLauncher (SimpleJobLauncher is gone in Batch 6)."""
+    changes = []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "SimpleJobLauncher" not in t or "org.springframework.batch" not in t:
+            continue
+        new = re.sub(r"\borg\.springframework\.batch\.core\.launch\.support\.SimpleJobLauncher\b",
+                     "org.springframework.batch.core.launch.support.TaskExecutorJobLauncher", t)
+        new = re.sub(r"(?<![\w.])SimpleJobLauncher\b", "TaskExecutorJobLauncher", new)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: Spring Batch 5 SimpleJobLauncher -> TaskExecutorJobLauncher")
+    return changes
+
+
 def fix_xss_block(root: Path) -> list[str]:
     """Spring Security 6 removed XXssConfig.block(boolean)/xssProtectionEnabled(boolean): headerValue(HeaderValue.X)."""
     changes = []
@@ -3585,6 +3601,111 @@ def fix_java_level(root: Path, java: int, exe: str, extra: list[str], env: dict)
     return changes
 
 
+# ---- wiring guard: a stage must never silently drop class-level wiring (entity scan, component scan, imports, ...) ----
+# Annotations whose loss changes the application context without a compile error. Deliberately not the ones the
+# migration removes on purpose (@EnableBatchProcessing, @EnableHystrix, @EnableResourceServer, @EnableSwagger2, ...).
+WIRING_ANNOTATIONS = re.compile(r"^(?:EntityScan|ComponentScans?|Import|ImportResource|ImportAutoConfiguration|PropertySources?|"
+                                r"Enable\w*Repositories|EnableTransactionManagement|EnableConfigurationProperties|"
+                                r"ConfigurationPropertiesScan|EnableScheduling|EnableAsync|EnableCaching|EnableAspectJAutoProxy|"
+                                r"EnableJpaAuditing|EnableRetry|EnableKafka|EnableRabbit|EnableJms|ServletComponentScan)$")
+# kept alongside them when a class has to be restored: they scope the wiring
+COMPANION_ANNOTATIONS = re.compile(r"^(?:Configuration|AutoConfiguration|Profile|Conditional\w*|Order|AutoConfigure(?:Before|After|Order))$")
+_ANNO = r"@[\w.]+(?:\s*\((?:[^()]|\((?:[^()]|\([^()]*\))*\))*\))?"
+_CLASS_DECL_RX = re.compile(r"((?:" + _ANNO + r"\s*)+)((?:(?:public|protected|private|static|final|abstract)\s+)*)(class|interface)\s+(\w+)")
+
+
+def _annotations(block: str) -> list[tuple[str, str]]:
+    return [(m.group(0).split("(")[0].strip()[1:].rsplit(".", 1)[-1], m.group(0).strip()) for m in re.finditer(_ANNO, block)]
+
+
+def wiring_snapshot(root: Path) -> dict:
+    """{(package, class, outer class or None): {"file", "annos": [(name, text)], "imports": {simple: fqcn}, "static"}}
+    for every Java class that carries wiring annotations."""
+    snap = {}
+    for p in java_sources(root):
+        t = read(p) or ""
+        if "@" not in t:
+            continue
+        pkg = (re.search(r"^\s*package\s+([\w.]+)\s*;", t, re.M) or [None, ""])[1]
+        imports = {i.rsplit(".", 1)[-1]: i for i in java_imports(t) if not i.endswith("*")}
+        body = re.sub(r'"(?:\\.|[^"\\])*"', '""', t)
+        top = None
+        for m in _CLASS_DECL_RX.finditer(t):
+            annos = _annotations(m.group(1))
+            depth = body[:m.start()].count("{") - body[:m.start()].count("}")
+            outer = top if depth > 0 else None
+            if depth == 0:
+                top = m.group(4)
+            if any(WIRING_ANNOTATIONS.match(n) for n, _ in annos):
+                snap[(pkg, m.group(4), outer)] = {"file": rel(p, root), "annos": annos, "imports": imports,
+                                                  "static": "static" in m.group(2)}
+    return snap
+
+
+def guard_wiring(root: Path, before: dict) -> tuple[list[str], list[str]]:
+    """Compare class-level wiring with the stage start. A class that lost a wiring annotation (or was deleted with it) is
+    restored member-free: same name, its wiring and scoping annotations, nothing else - so entity scans, component scans
+    and imports survive a recipe that removed the class for one obsolete member."""
+    after = wiring_snapshot(root)
+    present = {(n, txt.replace(" ", "")) for v in after.values() for n, txt in v["annos"]}
+    changes, todo = [], []
+    for key, old in before.items():
+        pkg, cls, outer = key
+        new = after.get(key)
+        lost = [(n, txt) for n, txt in old["annos"] if WIRING_ANNOTATIONS.match(n)
+                and not (new and any(n2 == n for n2, _ in new["annos"]))
+                and (n, txt.replace(" ", "")) not in present]         # moved elsewhere on purpose: fine
+        if not lost:
+            continue
+        keep = [txt for n, txt in old["annos"] if WIRING_ANNOTATIONS.match(n) or COMPANION_ANNOTATIONS.match(n)]
+        names = {n for n, _ in old["annos"]}
+        f = root / old["file"]
+        cur = read(f) if f.exists() else None
+        marker = f"// restored by spring-migrate: this stage removed {cls} and with it {', '.join('@' + n for n, _ in lost)}"
+        needed = [fq for s, fq in old["imports"].items()
+                  if any(re.search(rf"\b{re.escape(s)}\b", k) for k in keep)]
+        if cur is not None and re.search(rf"\b(?:class|interface)\s+{cls}\b", cur):
+            # the class is still there: put the lost annotations back on it
+            m = re.search(rf"((?:{_ANNO}\s*)*)((?:(?:public|protected|private|static|final|abstract)\s+)*)(?:class|interface)\s+{cls}\b", cur)
+            ind = re.match(r"[ \t]*", cur[cur.rfind("\n", 0, m.start()) + 1:]).group(0)
+            add = "".join(f"{txt}\n{ind}" for _, txt in lost)
+            new_text = cur[:m.start(2)] + add + cur[m.start(2):]
+            for fq in needed:
+                new_text = add_import(new_text, fq)
+            write_file(f, new_text)
+            changes.append(f"{old['file']}: {', '.join('@' + n for n, _ in lost)} restored on {cls} (removed by this stage)")
+        elif outer and cur is not None and re.search(rf"\bclass\s+{outer}\b", cur):
+            om = re.search(rf"\bclass\s+{outer}\b[^{{]*\{{", cur)
+            ob = om.end() - 1
+            cb = balanced(cur, ob, "{", "}")
+            if cb == -1:
+                todo.append(f"{old['file']}: {cls} was removed with {', '.join('@' + n for n, _ in lost)} - restore that wiring")
+                continue
+            ind = "    "
+            mm = re.search(r"\n([ \t]+)\S", cur[ob:cb])
+            ind = mm.group(1) if mm else ind
+            annos = "".join(f"{ind}{txt}\n" for txt in keep)
+            block = f"\n{ind}{marker}\n{annos}{ind}{'static ' if old['static'] or 'Configuration' in names else ''}class {cls} {{\n{ind}}}\n"
+            new_text = cur[:cb].rstrip() + "\n" + block + cur[cb:]
+            for fq in needed:
+                new_text = add_import(new_text, fq)
+            write_file(f, new_text)
+            changes.append(f"{old['file']}: nested {cls} restored without members, keeping {', '.join('@' + n for n, _ in lost)} "
+                           f"(the stage removed the whole class)")
+        else:
+            imps = "".join(f"import {fq};\n" for fq in sorted(set(needed)))
+            annos = "".join(f"{txt}\n" for txt in keep)
+            text = (f"package {pkg};\n\n" if pkg else "") + imps + ("\n" if imps else "") + marker + "\n" + annos + f"public class {cls} {{\n}}\n"
+            target = f if not outer else f.parent / f"{cls}.java"
+            if target.exists():
+                todo.append(f"{old['file']}: {cls} was removed with {', '.join('@' + n for n, _ in lost)} - restore that wiring")
+                continue
+            write_file(target, text)
+            changes.append(f"{rel(target, root)}: {cls} restored without members, keeping {', '.join('@' + n for n, _ in lost)} "
+                           f"(the stage deleted the class)")
+    return changes, todo
+
+
 # ---- compile errors with a safe mechanical fix -----------------------------------------------------------------------
 _DOMINATED_RX = re.compile(r"\[ERROR\] (/\S+?\.java):\[(\d+),\d+\] (?:this case label is dominated by a preceding case label|"
                            r"diese case-Marke wird von einer vorherigen case-Marke dominiert|"
@@ -3615,6 +3736,16 @@ def _remove_switch_arm(text: str, line_no: int) -> str | None:
 
 
 _ERR_HEAD_RX = re.compile(r"^\[ERROR\] ((?:[A-Za-z]:)?[/\\].+?\.java):\[(\d+),(\d+)\] (.*)$")
+
+
+def is_generated(p: Path, root: Path | None = None) -> bool:
+    """Output of a build step (target/, build/, generated-sources): regenerated by a clean build, never edited."""
+    try:
+        rp = p.resolve().relative_to(root.resolve()) if root else p
+    except ValueError:
+        rp = p
+    dirs = [x.lower() for x in rp.parts[:-1]]
+    return any(d in ("target", "build") or d.startswith("generated") or d.endswith("generated") for d in dirs)
 
 
 def compile_errors(log_text: str) -> list[tuple[str, int, int, str]]:
@@ -3731,8 +3862,13 @@ _CONVERSIONS = {
     ("Date", "LocalDateTime"): ("{LocalDateTime}.ofInstant({e}.toInstant(), {ZoneId}.systemDefault())",
                                 ("java.time.LocalDateTime", "java.time.ZoneId")),
     ("HttpStatusCode", "HttpStatus"): ("{HttpStatus}.valueOf({e}.value())", ("org.springframework.http.HttpStatus",)),
+    ("Timestamp", "LocalDateTime"): ("{e}.toLocalDateTime()", ()),
+    # Boot 3 LiquibaseProperties.getContexts()/getLabelFilter() are lists; SpringLiquibase still takes the joined string
+    ("List<String>", "String"): ("{StringUtils}.collectionToCommaDelimitedString({e})", ("org.springframework.util.StringUtils",)),
 }
-_INCOMPATIBLE_RX = re.compile(r"(?:incompatible types|Inkompatible Typen): ([\w.$]+) (?:cannot be converted to|kann nicht in) ([\w.$]+)")
+_LIST_TO_STRING_OK = re.compile(r"\.\s*(?:getContexts|getLabelFilter|getLabels)\s*\(\s*\)$")
+_INCOMPATIBLE_RX = re.compile(r"(?:incompatible types|Inkompatible Typen): ([\w.$]+(?:<[\w.$<>, ?]+>)?) "
+                              r"(?:cannot be converted to|kann nicht in) ([\w.$]+(?:<[\w.$<>, ?]+>)?)")
 _SYMBOL_RX = re.compile(r"(?:symbol|Symbol):\s+(?:method|Methode) (\w+)\(([^)]*)\)")
 _LOCATION_RX = re.compile(r"(?:location|Ort):\s+(.*)")
 _CTOR_RX = re.compile(r"(?:constructor|Konstruktor) (\w+) in (?:class|Klasse) ([\w.$]+)")
@@ -3740,22 +3876,192 @@ _REQUIRED_RX = re.compile(r"(?:required|Erforderlich):\s+([\w.$]+)\s*$", re.M)
 _NO_ARGS_RX = re.compile(r"(?:found|Ermittelt):\s+(?:no arguments|keine Argumente)")
 
 
-def _fix_at(text: str, i: int, msg: str, imports: set, fields: list) -> tuple[str, str] | None:
+_NEVER_THROWN_RX = re.compile(r"(?:exception|Ausnahme) ([\w.$]+) (?:is never thrown in body of corresponding try statement|"
+                              r"wird nie im (?:Body|Hauptteil) der entsprechenden try-Anweisung ausgel)")
+_ALREADY_CAUGHT_RX = re.compile(r"(?:exception|Ausnahme) ([\w.$]+) (?:has already been caught|wurde bereits abgefangen)")
+_NO_PACKAGE_RX = re.compile(r"(?:package|Package|Paket) ([\w.]+) (?:does not exist|ist nicht vorhanden|existiert nicht)")
+
+
+def _remove_catch(text: str, i: int, exc: str) -> tuple[str, str] | None:
+    """Remove a catch alternative or clause that can never run (javac: never thrown / already caught).
+    i points at `catch` (single type) or at the type inside a multi-catch."""
+    if text.startswith("catch", i):
+        po = text.index("(", i)
+        pc = balanced(text, po)
+        types = [x.strip() for x in text[po + 1:pc].rsplit(None, 1)[0].split("|")] if pc != -1 else []
+        bo = text.find("{", pc)
+        bc = balanced(text, bo, "{", "}") if bo != -1 else -1
+        if bc == -1 or len(types) != 1:
+            return None
+        prev_close = text.rfind("}", 0, i)                    # end of the try block or of the previous catch
+        after = text[bc + 1:]
+        more = re.match(r"\s*(?:catch|finally)\b", after) is not None
+        # find the try this clause belongs to
+        k, try_at = prev_close, None
+        for tm in reversed(list(re.finditer(r"\btry\b", text[:prev_close]))):
+            ob = text.find("{", tm.end())
+            res = re.match(r"\s*\(", text[tm.end():])
+            if res:                                           # try-with-resources
+                rc = balanced(text, tm.end() + res.end() - 1)
+                ob = text.find("{", rc)
+            cb = balanced(text, ob, "{", "}")
+            if cb == -1:
+                continue
+            # walk the try block and its catch clauses up to this one
+            pos = cb
+            while pos < prev_close:
+                cm = re.match(r"\s*catch\s*\(", text[pos + 1:])
+                if not cm:
+                    break
+                cpc = balanced(text, pos + 1 + cm.end() - 1)
+                cbo = text.find("{", cpc)
+                pos = balanced(text, cbo, "{", "}")
+            if pos == prev_close:
+                try_at = (tm.start(), ob, cb, bool(res))
+                break
+        if try_at is None:
+            return None
+        only = try_at[2] == prev_close and not more
+        if only and not try_at[3]:
+            # the only clause of a plain try: the try is pointless, keep its body
+            body = text[try_at[1] + 1:try_at[2]]
+            lines = body.split("\n")
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            while lines and not lines[-1].strip():
+                lines.pop()
+            ind_try = re.match(r"[ \t]*", text[text.rfind("\n", 0, try_at[0]) + 1:]).group(0)
+            ind_body = min((len(l) - len(l.lstrip()) for l in lines if l.strip()), default=0)
+            body = "\n".join(ind_try + l[ind_body:] if l.strip() else "" for l in lines).lstrip()
+            return text[:try_at[0]] + body + text[bc + 1:], f"try/catch of {exc} unwrapped (it can never be thrown there)"
+        start = prev_close + 1
+        return text[:start] + text[bc + 1:], f"catch ({exc}) removed (it can never run)"
+    # multi-catch alternative
+    m = re.match(r"[\w.$]+", text[i:])
+    if not m:
+        return None
+    e = i + m.end()
+    after = re.match(r"\s*\|\s*", text[e:])
+    if after:
+        return text[:i] + text[e + after.end():], f"{exc} removed from a multi-catch (it can never be thrown there)"
+    before = re.search(r"\s*\|\s*$", text[:i])
+    if before:
+        return text[:before.start()] + text[e:], f"{exc} removed from a multi-catch (it can never be thrown there)"
+    return None
+
+
+class ClassIndex:
+    """Simple class name -> fully qualified names, from the jars of the build's classpath (for classes that moved)."""
+    def __init__(self, entries: list[str]):
+        import zipfile
+        self.names: dict[str, set] = {}
+        for e in entries:
+            if not e.endswith(".jar") or not os.path.exists(e):
+                continue
+            try:
+                with zipfile.ZipFile(e) as z:
+                    for n in z.namelist():
+                        if n.endswith(".class") and "$" not in n and not n.startswith(("META-INF/", "module-info")):
+                            fq = n[:-6].replace("/", ".")
+                            self.names.setdefault(fq.rsplit(".", 1)[-1], set()).add(fq)
+            except (OSError, zipfile.BadZipFile):
+                continue
+
+    def moved(self, old_fqcn: str) -> str | None:
+        """The unique new home of a class whose package is gone (closest package wins a tie on prefix length)."""
+        simple, old_pkg = old_fqcn.rsplit(".", 1)[-1], old_fqcn.rsplit(".", 1)[0]
+        cands = [c for c in self.names.get(simple, ()) if c.rsplit(".", 1)[0] != old_pkg and not c.startswith("javax.")
+                 and ".internal." not in c and ".shaded." not in c and ".shade." not in c]
+        if not cands:
+            return None
+        def common(c):
+            a, b = c.split("."), old_pkg.split(".")
+            n = 0
+            while n < min(len(a), len(b)) and a[n] == b[n]:
+                n += 1
+            return n
+        best = max(common(c) for c in cands)
+        top = [c for c in cands if common(c) == best]
+        return top[0] if len(top) == 1 and best >= 2 else None
+
+
+def _simple_type(t: str) -> str:
+    """java.util.List<java.lang.String> -> List<String>"""
+    return re.sub(r"[\w$]+\.", "", t.replace(" ", ""))
+
+
+def _fix_at(text: str, i: int, msg: str, imports: set, fields: list, ctx: dict | None = None) -> tuple[str, str] | None:
     """One compile error with a mechanical fix: (new text, description) or None."""
+    ctx = ctx if ctx is not None else {}
     m = _INCOMPATIBLE_RX.search(msg)
     if m:
-        frm, to = m.group(1), m.group(2)
-        conv = _CONVERSIONS.get((frm.rsplit(".", 1)[-1], to.rsplit(".", 1)[-1]))
-        if not conv or frm == "java.sql.Date":
+        frm, to = _simple_type(m.group(1)), _simple_type(m.group(2))
+        conv = _CONVERSIONS.get((frm, to))
+        if not conv or m.group(1) == "java.sql.Date":
             return None
         span = _expr_span(text, i)
         if not span:
             return None
         tmpl, types = conv
-        refs = {f.rsplit(".", 1)[1]: _type_ref(text, f, imports) for f in types}
         e = text[span[0]:span[1]]
-        return text[:span[0]] + tmpl.format(e=e, **refs) + text[span[1]:], f"{frm.rsplit('.', 1)[-1]} -> {to.rsplit('.', 1)[-1]} converted"
+        if (frm, to) == ("List<String>", "String") and not _LIST_TO_STRING_OK.search(e):
+            return None
+        if (frm, to) == ("Timestamp", "LocalDateTime"):
+            vm = re.fullmatch(r"(?:java\.sql\.)?Timestamp\s*\.\s*valueOf\s*\((.*)\)", e, re.S)
+            if vm and len(split_top_level(vm.group(1))) == 1 and not re.match(r"\s*\"", vm.group(1)):
+                return text[:span[0]] + vm.group(1).strip() + text[span[1]:], "Timestamp.valueOf(LocalDateTime) unwrapped (the field is a LocalDateTime now)"
+        refs = {f.rsplit(".", 1)[1]: _type_ref(text, f, imports) for f in types}
+        return text[:span[0]] + tmpl.format(e=e, **refs) + text[span[1]:], f"{frm} -> {to} converted"
+    for rx in (_NEVER_THROWN_RX, _ALREADY_CAUGHT_RX):
+        em = rx.search(msg)
+        if em:
+            return _remove_catch(text, i, em.group(1).rsplit(".", 1)[-1])
+    pm = _NO_PACKAGE_RX.search(msg)
+    if not pm:
+        # the package still exists, the class moved out of it: "cannot find symbol / symbol: class X / location: package P"
+        cm_ = re.search(r"(?:symbol|Symbol):\s+(?:class|Klasse) (\w+)", msg)
+        lm_ = re.search(r"(?:location|Ort):\s+(?:package|Package|Paket) ([\w.]+)", msg)
+        if cm_ and lm_:
+            pm = lm_
+    if pm:
+        ls = text.rfind("\n", 0, i) + 1
+        le = text.find("\n", i)
+        line = text[ls:le if le != -1 else len(text)]
+        im = re.match(r"(\s*import\s+(?:static\s+)?)([\w.]+)(\s*;.*)$", line)
+        if not im or not im.group(2).startswith(pm.group(1) + "."):
+            return None
+        rest = im.group(2)[len(pm.group(1)) + 1:]
+        cls = pm.group(1) + "." + rest.split(".")[0]
+        if "classindex" not in ctx:
+            cp = ctx.get("classpath")
+            ctx["classindex"] = ClassIndex(cp() if callable(cp) else (cp or []))
+        new_cls = ctx["classindex"].moved(cls)
+        if not new_cls:
+            return None
+        member = rest.split(".", 1)[1] if "." in rest else None
+        new_line = im.group(1) + new_cls + ("." + member if member else "") + im.group(3)
+        return text[:ls] + new_line + text[ls + len(line):], f"moved class {cls} -> {new_cls}"
     sm, loc = _SYMBOL_RX.search(msg), _LOCATION_RX.search(msg)
+    if sm and sm.group(1) == "load" and loc and "PDDocument" in loc.group(1):
+        mm = re.match(r"\.\s*load\s*\(", text[i:])
+        rm = re.search(r"\bPDDocument\s*$", text[:i])
+        if mm and rm:
+            po = i + mm.end() - 1
+            pc = balanced(text, po)
+            args = split_top_level(text[po + 1:pc]) if pc != -1 else []
+            first = sm.group(2).split(",")[0].strip().rsplit(".", 1)[-1]
+            if not args or first not in ("InputStream", "File", "byte[]"):
+                return None
+            loader = _type_ref(text, "org.apache.pdfbox.Loader", imports)
+            if first == "InputStream":
+                buf = _type_ref(text, "org.apache.pdfbox.io.RandomAccessReadBuffer", imports)
+                args[0] = f"new {buf}({args[0]})"
+            return text[:rm.start()] + f"{loader}.loadPDF(" + ", ".join(args) + ")" + text[pc + 1:], "PDFBox 3: PDDocument.load -> Loader.loadPDF"
+    if sm and sm.group(1) in ("getLabels", "setLabels") and loc and "LiquibaseProperties" in loc.group(1):
+        mm = re.match(r"\.\s*(?:get|set)Labels\s*\(", text[i:])
+        if mm:
+            new_name = "getLabelFilter(" if sm.group(1) == "getLabels" else "setLabelFilter("
+            return text[:i] + "." + new_name + text[i + mm.end():], "Boot 3 LiquibaseProperties labels -> labelFilter"
     if sm and sm.group(1) == "getTime" and loc and "LocalDateTime" in loc.group(1):
         mm = re.match(r"\.\s*getTime\s*\(\s*\)", text[i:])
         if mm:
@@ -3814,7 +4120,7 @@ def _add_field(text: str, fqcn: str) -> str:
     return add_import(add_import(text, f"{pkg}.PersistenceContext"), fqcn)
 
 
-def autofix_compile_errors(root: Path, log: Path) -> list[str]:
+def autofix_compile_errors(root: Path, log: Path, classpath=None) -> list[str]:
     """Fix compile errors that have exactly one safe fix:
     - a pattern-switch arm 'dominated by a preceding case label' can never match (OpenRewrite's if/else-instanceof ->
       switch conversion produces these when a later type is a subtype of an earlier one): remove it;
@@ -3827,7 +4133,7 @@ def autofix_compile_errors(root: Path, log: Path) -> list[str]:
         hits.setdefault(m.group(1), set()).add(int(m.group(2)))
     for f, line_nos in hits.items():
         p = Path(f)
-        if not p.exists():
+        if not p.exists() or is_generated(p, root):
             continue
         t = read(p) or ""
         new = t
@@ -3838,18 +4144,19 @@ def autofix_compile_errors(root: Path, log: Path) -> list[str]:
         if write_if_changed(p, t, new):
             changes.append(f"{rel(p, root) if str(p).startswith(str(root)) else p}: removed {len(line_nos)} unreachable switch arm(s) "
                            f"(dominated by a preceding case)")
+    ctx = {"classpath": classpath}
     by_file: dict[str, list] = {}
     for f, ln, col, msg in compile_errors(text_log):
         by_file.setdefault(f, []).append((ln, col, msg))
     for f, errs in by_file.items():
         p = Path(f)
-        if not p.exists() or f in hits:
+        if not p.exists() or f in hits or is_generated(p, root):
             continue
         t = read(p) or ""
         new, imports, fields, what = t, set(), [], []
         for ln, col, msg in sorted(errs, key=lambda x: (x[0], x[1]), reverse=True):   # bottom-up, right-to-left
             i = _offset(new, ln, col)
-            r = _fix_at(new, i, msg, imports, fields) if i is not None else None
+            r = _fix_at(new, i, msg, imports, fields, ctx) if i is not None else None
             if r:
                 new = r[0]
                 what.append(r[1])
@@ -3857,6 +4164,9 @@ def autofix_compile_errors(root: Path, log: Path) -> list[str]:
             new = _add_field(new, fq)
         for imp in sorted(imports):
             new = add_import(new, imp)
+        # imports only the replaced code used (Timestamp after unwrapping Timestamp.valueOf, ...)
+        new = drop_unused_imports(new, [i for i in java_imports(t) if not i.endswith("*") and uses_simple_name(t, i.rsplit(".", 1)[-1])
+                                        and i in java_imports(new)])
         if write_if_changed(p, t, new):
             changes.append(f"{rel(p, root) if str(p).startswith(str(root)) else p}: {'; '.join(sorted(set(what)))}")
     return changes
@@ -5330,7 +5640,8 @@ class Builder:
             plugin = "org.openrewrite.maven:rewrite-maven-plugin" + (f":{self.plugin_version}" if self.plugin_version else "")
             # runNoFork/dryRunNoFork: no build before rewriting (generated sources are then missing for type attribution)
             goal = f"{plugin}:{'dryRun' if dry else 'run'}{'NoFork' if self.no_fork else ''}"
-            cmd = [self.exe, "-B", "-ntp", "-U", goal,
+            # clean first: code generators (wsimport, xjc, openapi) skip unchanged inputs and would leave javax-era output in target/
+            cmd = [self.exe, "-B", "-ntp", "-U"] + ([] if self.no_fork else ["clean"]) + [goal,
                    f"-Drewrite.recipeArtifactCoordinates={','.join(artifacts)}",
                    f"-Drewrite.activeRecipes={','.join(recipes)}",
                    "-Drewrite.exportDatatables=false", "-Drewrite.failOnInvalidActiveRecipes=true"] + self.extra + self.rewrite_extra
@@ -5372,6 +5683,22 @@ rootProject {{
             f.unlink()
         return cp
 
+    def test_classpath(self) -> list[str]:
+        """Compile+test classpath of every module, also when the code does not compile (maven.main.skip: the compile
+        phase runs without javac, so sibling modules still resolve through the reactor). Cached."""
+        if getattr(self, "_test_cp", None) is not None:
+            return self._test_cp
+        self._test_cp = []
+        if self.tool != "maven":
+            return self._test_cp
+        run([self.exe, "-B", "-ntp", "-q", "-fae", "compile", f"{DEP_PLUGIN}:build-classpath", "-Dmaven.main.skip=true",
+             "-Dmdep.outputFile=target/spring-migrate-testcp.txt", "-Dmdep.includeScope=test"] + QUALITY_SKIP + FRONTEND_SKIP + self.extra,
+            self.root, self.log_dir / "classpath.log", self.env)
+        for f in self.root.rglob("spring-migrate-testcp.txt"):
+            self._test_cp += [x for x in (read(f) or "").strip().split(os.pathsep) if x and x not in self._test_cp]
+            f.unlink()
+        return self._test_cp
+
     def format(self, stage: str, files: list[str]) -> list[str] | None:
         """Run the project's formatter (default: Spotless, as configured in the build) on the files a stage changed.
         Returns a note, or None when the project has no such formatter (then it is not tried again)."""
@@ -5395,7 +5722,8 @@ rootProject {{
 
     def verify(self, stage: str) -> int:
         log = self.log_dir / f"{stage}-build.log"
-        cmd = [self.exe, "-B", "-ntp", "verify"] if self.tool == "maven" else [self.exe, "build"]
+        # clean: stale generated sources (javax output of skipped code generators) must not look like code breakage
+        cmd = [self.exe, "-B", "-ntp", "clean", "verify"] if self.tool == "maven" else [self.exe, "clean", "build"]
         return run(cmd + self.extra, self.root, log, self.env)
 
 
@@ -5590,6 +5918,7 @@ def cmd_migrate(a) -> int:
         say(f"\n[stage {st.key}] {st.title}")
         t0 = time.time()
         changes = []
+        wiring_before = wiring_snapshot(root)
         if st.key == OPENJPA_STAGE:
             stage_rev = git(root, "rev-parse", "HEAD").strip() if not a.no_git else None
             changes, todo = migrate_openjpa(root)
@@ -5687,6 +6016,14 @@ def cmd_migrate(a) -> int:
             changes = pre_changes + changes
         if not st.java_fix:
             changes = changes + pre_changes if st.key != OPENJPA_STAGE else changes
+        if not (code != 0 or dl):
+            wc, wt = guard_wiring(root, wiring_before)
+            for c in wc:
+                say(f"  wiring: {c}")
+            for t in wt:
+                say(f"  TODO {t}")
+            changes += wc
+            todo_all += wt
         note = f"{len(changes)} tool change(s)"
         if not a.no_git and builder.format_goal and not (code != 0 or dl):
             base = stage_rev if st.key != OPENJPA_STAGE else git(root, "rev-parse", "HEAD").strip()
@@ -5717,7 +6054,8 @@ def cmd_migrate(a) -> int:
                 for rnd in range(1, AUTOFIX_ROUNDS + 1):      # javac reports the next errors once these are gone
                     if ok:
                         break
-                    fixed = autofix_compile_errors(root, log_dir / f"{st.key}-build.log")
+                    builder._test_cp = None
+                    fixed = autofix_compile_errors(root, log_dir / f"{st.key}-build.log", builder.test_classpath)
                     if not fixed:
                         break
                     for c in fixed:
@@ -5954,7 +6292,8 @@ def cmd_update(a) -> int:
     for rnd in range(1, AUTOFIX_ROUNDS + 1):
         if ok:
             break
-        fixed = autofix_compile_errors(root, log_dir / "update-build.log")
+        builder._test_cp = None
+        fixed = autofix_compile_errors(root, log_dir / "update-build.log", builder.test_classpath)
         if not fixed:
             break
         for c in fixed:
