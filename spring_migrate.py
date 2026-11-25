@@ -40,6 +40,11 @@ __version__ = "2.3.0"
 # What each version changes for an already migrated branch (`spring_migrate.py update` prints the entries newer than the
 # version recorded in .spring-migrate/state.json). Every post-fixer is idempotent, so `update` simply runs them again.
 CHANGELOG = [
+    ("2.3.0", "context smoke test after the build: missing placeholders filled from existing config/metadata/framework defaults; "
+              "missing beans traced to @Profile-gated declarations (sources and jars) and reported"),
+    ("2.3.0", "placeholders that upgraded company libraries newly read without a default are set (or reported) up front"),
+    ("2.3.0", "OpenJPA stage: openjpa.* keys in every profile's application*.properties/yml translated; JPA provider per profile "
+              "reported, any profile still on OpenJPA afterwards is BLOCKING"),
     ("2.3.0", "JPQL: date/time string literals compared with LocalDate/LocalDateTime/Date attributes -> {d '...'}/{ts '...'} "
               "(Hibernate 6: 'Cannot compare left expression of type java.time.LocalDate with ... java.lang.String')"),
     ("2.3.0", "builds start with clean (stale generated javax sources); compile autofix never edits generated files"),
@@ -715,6 +720,34 @@ def openjpa_persistence_xml(root: Path) -> tuple[list[str], list[str]]:
     return changes, todo
 
 
+def openjpa_config_properties(root: Path) -> tuple[list[str], list[str]]:
+    """openjpa.* / spring.jpa.properties.openjpa.* in application*.properties|yml - every profile file, so no profile is
+    left configuring a provider that is gone."""
+    changes, todo = [], []
+    for f in config_files(root):
+        cf = ConfigFile(f)
+        hits = [e for e in cf.entries() if re.match(r"(?:spring\.jpa\.properties\.)?openjpa\.", e["key"])]
+        if not hits:
+            continue
+        n = 0
+        for e in hits:
+            name = re.sub(r"^spring\.jpa\.properties\.", "", e["key"])
+            keep, note = map_openjpa_property(name, str(e.get("value") or ""))
+            if note and not keep:
+                cf.comment_out(e["key"], f"OpenJPA {name}: {note}")
+                todo.append(f"{rel(f, root)}: {name}={e.get('value')}: {note}")
+            else:
+                cf.remove(e["key"])
+                for k, v in keep:
+                    cf.put(k if k.startswith("spring.") else "spring.jpa.properties." + k, v, doc=e.get("doc", 0))
+                if note:
+                    todo.append(f"{rel(f, root)}: {name}={e.get('value')}: {note}")
+            n += 1
+        if cf.save():
+            changes.append(f"{rel(f, root)}: {n} openjpa.* propert(ies) translated to Hibernate/JPA or commented out")
+    return changes, todo
+
+
 def openjpa_build_files(root: Path) -> tuple[list[str], list[str]]:
     changes, todo = [], []
     for f in walk(root):
@@ -812,7 +845,8 @@ def migrate_openjpa(root: Path) -> tuple[list[str], list[str]]:
     c2, t2 = openjpa_build_files(root)
     c3 = openjpa_spring_adapters(root)
     c4 = openjpa_naming_defaults(root)
-    changes, todo = c1 + c2 + c3 + c4, t1 + t2
+    c5, t5 = openjpa_config_properties(root)
+    changes, todo = c1 + c2 + c3 + c4 + c5, t1 + t2 + t5
     for fn in (cm_openjpa_api, cm_openjpa_annotations, cm_openjpa_code_props, cm_openjpa_agent, cm_jpql_positional,
                lambda r: cm_pin_generated_ids(r, "openjpa")):
         c, t = fn(root)
@@ -821,6 +855,77 @@ def migrate_openjpa(root: Path) -> tuple[list[str], list[str]]:
     if any("OPENJPA_SEQUENCE_TABLE" in c for c in changes):
         changes += openjpa_pooled_lo(root)
     return changes, todo
+
+
+_OPENJPA_MARK = re.compile(r"OpenJpaVendorAdapter|OpenJpaDialect|org\.apache\.openjpa|openjpa\.")
+_HIBERNATE_MARK = re.compile(r"HibernateJpaVendorAdapter|HibernateJpaDialect|HibernatePersistenceProvider|\bhibernate\.(?!validator)|"
+                             r"spring\.jpa\.hibernate\.")
+
+
+def jpa_provider_profiles(root: Path) -> dict:
+    """Which JPA provider each profile configures: {profile: {provider: [where]}}. 'default' = not profile-gated;
+    a negated profile ('!hibernate') is kept as written - it is active whenever that profile is not."""
+    out: dict[str, dict] = {}
+    def add(profile, provider, where):
+        out.setdefault(profile, {}).setdefault(provider, [])
+        if where not in out[profile][provider]:
+            out[profile][provider].append(where)
+    for p in java_sources(root, main_only=True):
+        t = read(p) or ""
+        if not (_OPENJPA_MARK.search(t) or re.search(r"HibernateJpaVendorAdapter|HibernatePersistenceProvider", t)):
+            continue
+        cls_prof = re.search(r"@Profile\s*\(\s*(?:value\s*=\s*)?\{?([^)}]*)\}?\s*\)(?=(?:\s*@[\w.]+(?:\([^)]*\))?)*\s*(?:public\s+|final\s+|abstract\s+)*class\b)", t)
+        profs = [x.strip().strip('"') for x in cls_prof.group(1).split(",")] if cls_prof else ["default"]
+        for prof in profs:
+            if re.search(r"OpenJpaVendorAdapter|OpenJpaDialect|org\.apache\.openjpa", t):
+                add(prof, "OpenJPA", rel(p, root))
+            if re.search(r"HibernateJpaVendorAdapter|HibernatePersistenceProvider|HibernateJpaDialect", t):
+                add(prof, "Hibernate", rel(p, root))
+    for f in config_files(root, include_test=False):
+        m = re.match(r"(?:application|bootstrap)(?:-([\w-]+))?\.", f.name)
+        prof = m.group(1) if m and m.group(1) else "default"
+        for e in ConfigFile(f).entries():
+            k, v = e["key"], str(e.get("value") or "")
+            if re.match(r"(?:spring\.jpa\.properties\.)?openjpa\.", k) or "openjpa" in v.lower():
+                add(prof, "OpenJPA", rel(f, root))
+            elif re.match(r"spring\.jpa\.(?:hibernate\.|properties\.hibernate\.)", k) or "org.hibernate" in v:
+                add(prof, "Hibernate", rel(f, root))
+    for x in walk(root):
+        if x.name == "persistence.xml" and "/src/test/" not in x.as_posix():
+            t = read(x) or ""
+            if "openjpa" in t.lower():
+                add("default", "OpenJPA", rel(x, root))
+            elif "org.hibernate" in t:
+                add("default", "Hibernate", rel(x, root))
+    return out
+
+
+def render_provider_profiles(prof: dict) -> list[str]:
+    if not prof or (set(prof) == {"default"} and len(prof["default"]) == 1):
+        return []
+    L = ["## JPA provider per profile", "", "| Profile | Provider | Configured in |", "|---|---|---|"]
+    for p in sorted(prof, key=lambda x: (x != "default", x)):
+        for prov, where in prof[p].items():
+            L.append(f"| `{p}` | {prov} | {', '.join(f'`{w}`' for w in where[:4])} |")
+    L += ["", "A gradual OpenJPA -> Hibernate migration often gates Hibernate behind an opt-in profile while the default still "
+          "runs OpenJPA. The OpenJPA stage converts every profile; review the profile switch afterwards.", ""]
+    return L
+
+
+def check_provider_profiles(root: Path, before: dict) -> list[str]:
+    """After the OpenJPA stage: no profile may still select OpenJPA; profile-split provider configs are now redundant."""
+    todo = []
+    after = jpa_provider_profiles(root)
+    for prof, provs in after.items():
+        if "OpenJPA" in provs:
+            todo.append(f"BLOCKING: profile `{prof}` still configures OpenJPA ({', '.join(provs['OpenJPA'][:3])}) - at runtime that "
+                        f"profile would run without a JPA provider (entities 'not managed'); convert or remove that configuration")
+    split = {p for p, provs in before.items() if p != "default" and provs}
+    if split and any("OpenJPA" in v for v in before.values()) and any("Hibernate" in v for v in before.values()):
+        where = "; ".join(f"`{p}`: {', '.join(sorted(before[p]))}" for p in sorted(split))
+        todo.append(f"the project switched JPA providers by profile ({where}). After the OpenJPA stage every profile runs Hibernate: "
+                    f"merge the profile-gated JPA configurations (entity scan, datasource, properties may differ) and drop the switch")
+    return todo
 
 
 def openjpa_present(result: dict) -> bool:
@@ -866,6 +971,7 @@ def idgen_inventory(root: Path) -> list[tuple]:
 
 def openjpa_section(root: Path) -> list[str]:
     out = ["## OpenJPA -> Hibernate", ""]
+    out += ["#" + l if l.startswith("## ") else l for l in render_provider_profiles(jpa_provider_profiles(root))]
     inv = openjpa_inventory(root)
     if inv:
         out += ["### OpenJPA API still referenced in code (manual)", "", "| Symbol | Uses | Closest replacement |", "|---|---|---|"]
@@ -6586,7 +6692,9 @@ def cmd_migrate(a) -> int:
         wiring_before = wiring_snapshot(root)
         if st.key == OPENJPA_STAGE:
             stage_rev = git(root, "rev-parse", "HEAD").strip() if not a.no_git else None
+            providers_before = jpa_provider_profiles(root)
             changes, todo = migrate_openjpa(root)
+            todo += check_provider_profiles(root, providers_before)
             if dep_plan:
                 c_, t_ = apply_plan_safely(root, dep_plan, HIBERNATE_LINE, builder.exe, builder.extra, env)
                 changes += c_

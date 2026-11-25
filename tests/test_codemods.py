@@ -993,6 +993,49 @@ class RuntimeDiagnosisTest(unittest.TestCase):
         pr.close()
 
 
+class ProviderProfileTest(unittest.TestCase):
+    def test_profile_split_detected_and_checked_after_conversion(self):
+        pr = Project({
+            "src/main/java/a/OpenJpaConfig.java": """
+                package a;
+                import org.springframework.orm.jpa.vendor.OpenJpaVendorAdapter;
+                @Configuration
+                @Profile("!hibernate")
+                public class OpenJpaConfig {
+                  @Bean OpenJpaVendorAdapter adapter() { return new OpenJpaVendorAdapter(); }
+                }
+                """,
+            "src/main/java/a/HibernateConfig.java": """
+                package a;
+                import org.springframework.orm.jpa.vendor.HibernateJpaVendorAdapter;
+                @Configuration
+                @Profile("hibernate")
+                @EntityScan("a.domain")
+                public class HibernateConfig {
+                  @Bean HibernateJpaVendorAdapter adapter() { return new HibernateJpaVendorAdapter(); }
+                }
+                """,
+            "src/main/resources/application-prod.properties": "spring.jpa.properties.openjpa.Log=SQL=TRACE\n"})
+        before = sm.jpa_provider_profiles(pr.root)
+        self.assertIn("OpenJPA", before["!hibernate"])
+        self.assertIn("Hibernate", before["hibernate"])
+        self.assertIn("OpenJPA", before["prod"])
+        table = "\n".join(sm.render_provider_profiles(before))
+        self.assertIn("| `!hibernate` | OpenJPA |", table)
+        sm.openjpa_spring_adapters(pr.root)                     # what the stage does to the adapters ...
+        todo = sm.check_provider_profiles(pr.root, before)
+        self.assertTrue(any(t.startswith("BLOCKING: profile `prod` still configures OpenJPA") for t in todo), todo)
+        sm.openjpa_config_properties(pr.root)                   # ... and to openjpa.* keys in every profile's config
+        prod = pr["src/main/resources/application-prod.properties"]
+        self.assertFalse([l for l in prod.splitlines() if "openjpa" in l and not l.startswith("#")], prod)
+        self.assertIn("logging.level.org.hibernate.SQL", prod)           # the TODO says what replaces it
+        todo = sm.check_provider_profiles(pr.root, before)
+        self.assertFalse([t for t in todo if t.startswith("BLOCKING")], todo)
+        self.assertTrue(any("merge the profile-gated JPA configurations" in t for t in todo))
+        self.assertNotIn("!hibernate", " ".join(t for t in todo if t.startswith("BLOCKING")))
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>

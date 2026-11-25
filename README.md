@@ -227,10 +227,53 @@ one commit each):
 | `getUnicodeCmap(..)` not found (FontBox 3) | `getUnicodeCmapLookup(..)`, `CmapSubtable` variable -> `CmapLookup` |
 | a constructor now needs the `EntityManager` (e.g. a company Querydsl provider bean) | `@PersistenceContext EntityManager` field, passed in |
 | `case label is dominated` | the unreachable arm is removed |
+| `PDDocument.load(..)` not found (PDFBox 3) | `Loader.loadPDF(..)` (`InputStream` via `RandomAccessReadBuffer`) |
+| `getLabels()` on `LiquibaseProperties`, `List<String> -> String` | `getLabelFilter()`, `StringUtils.collectionToCommaDelimitedString(..)` |
+| `Timestamp cannot be converted to LocalDateTime` | `Timestamp.valueOf(x)` -> `x`, else `.toLocalDateTime()` |
+| `exception X is never thrown` / `has already been caught` | the dead catch clause / multi-catch alternative is removed |
+| class not found in its old package | import moved to its unique new package on the classpath |
 
-Fixed before the build, from the source: `DefaultResponseErrorHandler.handleError(response, HttpStatus)` overrides
+Fixed before the build, from the source: JPQL date/time string literals compared with `LocalDate`/`LocalDateTime`/`Date`
+attributes (`zr.datumVonFachlich = '0002-01-01'` -> `{d '0002-01-01'}`; Hibernate 6 refuses to compare them with strings -
+the query's aliases are resolved against the entity sources, so string attributes and native queries keep their literals), `DefaultResponseErrorHandler.handleError(response, HttpStatus)` overrides
 (-> `HttpStatusCode, URI, HttpMethod`), HttpClient 5 `setSSLContext`/`setSSLHostnameVerifier` (-> connection manager), and
 Spring Security's X-XSS-Protection `block(true)` (-> `headerValue(ENABLED_MODE_BLOCK)`).
+
+## What "done" means: build, strict gate, context start
+
+A green compile is not a green migration. After every stage:
+
+1. **Ground truth** - `clean verify` with enforcer/quality plugins skipped: does the code compile and do the tests
+   pass? `clean`, because code generators (wsimport, xjc, OpenAPI) skip unchanged inputs and would leave javax-era
+   output in `target/` that looks like missed conversions. Compile errors are fixed from the log where one fix is
+   right (see below); generated files are never edited.
+2. **Strict gate** - the project's own verification with nothing skipped: the Maven profiles its CI uses (read from
+   `.gitlab-ci.yml`, `Jenkinsfile`, GitHub workflows, ...; or `--ci-profile`), enforcer rules, Checkstyle, Spotless check.
+   - `RequireUpperBoundDeps`: aligned on the highest version **through the mechanism the parent uses** - its version
+     property when an inherited POM manages the artifact with `${prop}` (a BOM import does not override a parent's
+     literal pin), else an explicit `<dependencyManagement>` entry. Build and tests run again afterwards.
+   - `BanDuplicateClasses` (an embedded container next to a separately declared API jar): an `ignoreClasses` entry
+     in the rule, not a version bump.
+   `--no-strict-gate` turns it off.
+3. **Wiring guard** - a recipe that removes a class for one obsolete member must not take `@EntityScan`,
+   `@ComponentScan`, `@Import`, `@Enable…Repositories`, ... with it: such classes are restored member-free with their
+   wiring and `@Configuration`/`@Profile` annotations.
+
+After the last stage (and after `update`), **every application context is started once** (a temporary
+`@SpringBootTest`, removed afterwards; `--smoke-test off` to skip, `--smoke-profiles test` for a profile with an
+embedded database). Placeholder, bean and profile problems only appear at context refresh:
+
+- `Could not resolve placeholder 'x'`: set from your own config under another key first (e.g. the old
+  `spring.batch.table-prefix` for `spring.batch.jdbc.table-prefix` - a custom prefix must win), then the configuration
+  metadata default, then the framework's built-in default; otherwise a BLOCKING item. Placeholders an upgraded company
+  library newly reads (old vs. new jar) are handled before the context even starts.
+- `required a bean of type 'X' that could not be found`: the declarations are searched in your sources and the library
+  jars. A declaration behind an inactive `@Profile` (e.g. `tomcat` - `@Profile` also applies to `@Import`-ed classes) is
+  reported with the profile to activate; profiles are never activated automatically.
+- Database/broker connection failures are reported as an environment problem, not a migration error.
+
+The OpenJPA stage reports which JPA provider each profile configures (also in `scan`), translates `openjpa.*` keys in
+every profile's config file, and reports any profile still on OpenJPA as BLOCKING.
 
 ## Hibernate dialects (own Dialect classes, DB2 platforms)
 
