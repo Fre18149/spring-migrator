@@ -35,11 +35,19 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 # What each version changes for an already migrated branch (`spring_migrate.py update` prints the entries newer than the
 # version recorded in .spring-migrate/state.json). Every post-fixer is idempotent, so `update` simply runs them again.
 CHANGELOG = [
+    ("2.3.0", "JPQL: date/time string literals compared with LocalDate/LocalDateTime/Date attributes -> {d '...'}/{ts '...'} "
+              "(Hibernate 6: 'Cannot compare left expression of type java.time.LocalDate with ... java.lang.String')"),
+    ("2.3.0", "builds start with clean (stale generated javax sources); compile autofix never edits generated files"),
+    ("2.3.0", "wiring guard: classes a stage removed together with @EntityScan/@ComponentScan/@Import/... are restored member-free"),
+    ("2.3.0", "strict gate: the project's CI profile/enforcer/quality checks run after the ground-truth build; "
+              "RequireUpperBoundDeps aligned via the parent's version property, duplicate classes routed to banDuplicateClasses ignores"),
+    ("2.3.0", "autofix: PDDocument.load, LiquibaseProperties labels/contexts, Timestamp->LocalDateTime, dead catch clauses, "
+              "classes moved to another package; Spring Batch SimpleJobLauncher -> TaskExecutorJobLauncher"),
     ("2.2.0", "Spring Batch 5 LocalDateTime (getStartTime/getEndTime -> Date, .getTime()), HttpStatusCode -> HttpStatus: "
               "converted where the build reports them"),
     ("2.2.0", "DefaultResponseErrorHandler.handleError(response, HttpStatus) -> (response, HttpStatusCode, URI, HttpMethod)"),
@@ -508,6 +516,7 @@ def run_fixers(root: Path, java: int, boot_line: str = "3.5", base_rev: str | No
     changes += jc
     todo_extra = jt
     if not boot_line.startswith("2"):
+        changes += fix_jpql_temporal_literals(root)
         dc_, dt_ = fix_custom_dialects(root, db2_platform)
         changes += dc_
         todo_extra += dt_
@@ -3601,6 +3610,206 @@ def fix_java_level(root: Path, java: int, exe: str, extra: list[str], env: dict)
     return changes
 
 
+# ---- strict gate: the project's real CI verification, separate from the ground-truth build -----------------------------
+_CI_FILES = (".gitlab-ci.yml", "Jenkinsfile", "azure-pipelines.yml", "bitbucket-pipelines.yml", ".travis.yml", "Makefile")
+_CI_PROFILE_SKIP = re.compile(r"deploy|release|docker|sonar|publish|native|jib|helm|sign|gpg|site|it$|integration|e2e", re.I)
+_CI_POM_PROFILE = re.compile(r"^(?:ci|strict|checks?|verify|quality|qa|enforce|enforcer|static-analysis)$", re.I)
+
+
+def ci_profiles(root: Path) -> list[str]:
+    """Maven profiles the project's CI builds with (from CI definitions; else a 'ci'/'strict'/'quality'-style profile in
+    the POMs). Deployment/release profiles are left out - they need credentials, not verification."""
+    files = [root / f for f in _CI_FILES if (root / f).exists()] + [p for p in root.glob("Jenkinsfile*")]
+    for d in (".github/workflows", ".circleci"):
+        if (root / d).is_dir():
+            files += [p for p in (root / d).iterdir() if p.suffix in (".yml", ".yaml")]
+    found = []
+    for f in files:
+        for line in (read(f) or "").splitlines():
+            if not re.search(r"\bmvnw?\b|\bmaven\b", line):
+                continue
+            for m in re.finditer(r"(?:\s-P\s*|--activate-profiles[= ])([\w.,!\-]+)", line):
+                for prof in m.group(1).split(","):
+                    if prof and not prof.startswith("!") and not _CI_PROFILE_SKIP.search(prof) and prof not in found:
+                        found.append(prof)
+    if found:
+        return found
+    for bf in build_files(root):
+        if bf.name == "pom.xml":
+            for pid in re.findall(r"<profile>\s*<id>([\w.\-]+)</id>", read(bf) or ""):
+                if _CI_POM_PROFILE.match(pid) and pid not in found:
+                    found.append(pid)
+    return found
+
+
+_UPPER_BOUND_RX = re.compile(r"Require upper bound dependencies error for ([\w.\-]+):([\w.\-]+):([\w.\-]+)")
+
+
+def parse_enforcer_failures(log_text: str) -> tuple[dict, list]:
+    """RequireUpperBoundDeps -> {(g, a): highest version seen}; BanDuplicateClasses -> [(artifacts, classes)]."""
+    text = re.sub(r"(?m)^\[(?:ERROR|WARNING|WARN|INFO)\] ?", "", log_text)
+    upper = {}
+    for m in _UPPER_BOUND_RX.finditer(text):
+        g, a = m.group(1), m.group(2)
+        nxt = _UPPER_BOUND_RX.search(text, m.end())
+        block = text[m.start():nxt.start() if nxt else min(len(text), m.end() + 4000)]
+        vers = re.findall(rf"\b{re.escape(g)}:{re.escape(a)}:(?:jar:)?(\d[\w.\-]*)", block)
+        if vers:
+            best = max(vers, key=vtuple)
+            if (g, a) not in upper or vtuple(best) > vtuple(upper[(g, a)]):
+                upper[(g, a)] = best
+    dups = []
+    for m in re.finditer(r"Found in:\s*\n((?:[ \t]+[\w.\-]+:[\w.\-]+:[^\n]*\n)+)\s*Duplicate classes:\s*\n((?:[ \t]+\S+\.class[ \t]*\n?)+)", text):
+        arts = [tuple(l.strip().split(":")[:2]) for l in m.group(1).strip().splitlines()]
+        classes = [l.strip() for l in m.group(2).strip().splitlines()]
+        dups.append((arts, classes))
+    return upper, dups
+
+
+def _parent_chain(root: Path, local_repo: Path) -> list[str]:
+    """Texts of the inherited POMs (parent, its parent, ...) from the local repository."""
+    out, t = [], read(root / "pom.xml") or ""
+    for _ in range(12):
+        pm = re.search(r"<parent>(.*?)</parent>", t, re.S)
+        if not pm:
+            break
+        g, a, v = (_first_tag(pm.group(1), x) for x in ("groupId", "artifactId", "version"))
+        if not (g and a and v):
+            break
+        p = local_repo / Path(*g.split(".")) / a / v / f"{a}-{v}.pom"
+        t = read(p) if p.exists() else None
+        if not t:
+            break
+        out.append(t)
+    return out
+
+
+def _section(text: str, tag: str) -> tuple[int, int] | None:
+    """Span of the top-level <tag>...</tag> section."""
+    m = _top_level(text, tag)
+    if not m:
+        return None
+    e = text.find(f"</{tag}>", m.start())
+    return (m.start(), e + len(tag) + 3) if e != -1 else None
+
+
+def pom_manage_version(text: str, g: str, a: str, v: str) -> str:
+    """Explicit <dependencyManagement> entry (wins over inherited and imported management)."""
+    for m in re.finditer(r"<dependency>((?:(?!<dependency>).)*?)</dependency>", text, re.S):
+        b = m.group(1)
+        dm = _section(text, "dependencyManagement")
+        if dm and dm[0] < m.start() < dm[1] and _first_tag(b, "groupId") == g and _first_tag(b, "artifactId") == a \
+                and _first_tag(b, "scope") != "import":
+            old = _first_tag(b, "version")
+            nb = b.replace(f"<version>{old}</version>", f"<version>{v}</version>", 1) if old else \
+                b.replace(f"<artifactId>{a}</artifactId>", f"<artifactId>{a}</artifactId>\n        <version>{v}</version>", 1)
+            return text[:m.start(1)] + nb + text[m.end(1):]
+    dep = (f"      <dependency>\n        <groupId>{g}</groupId>\n        <artifactId>{a}</artifactId>\n"
+           f"        <version>{v}</version>\n      </dependency>\n")
+    m = re.search(r"<dependencyManagement>\s*<dependencies>[ \t]*\n?", text)
+    if m:
+        return text[:m.end()] + ("" if text[m.end() - 1] == "\n" else "\n") + dep + text[m.end():]
+    block = f"  <dependencyManagement>\n    <dependencies>\n{dep}    </dependencies>\n  </dependencyManagement>\n"
+    anchor = _top_level(text, "dependencies") or _top_level(text, "build")
+    pos = anchor.start() if anchor else text.rindex("</project>")
+    return text[:pos] + block + text[pos:]
+
+
+def fix_enforcer_failures(root: Path, log: Path, local_repo: Path) -> tuple[list[str], list[str]]:
+    """Fix what the strict gate's enforcer rules report:
+    - RequireUpperBoundDeps: align on the highest version, through the mechanism the parent uses (its version property,
+      when an inherited POM manages the artifact with ${prop}), else an explicit <dependencyManagement> entry;
+    - BanDuplicateClasses: an exclusion in the rule (ignoreClasses for the API artifact), not a version bump."""
+    changes, todo = [], []
+    upper, dups = parse_enforcer_failures(read(log) or "")
+    top = root / "pom.xml"
+    if not top.exists() or not (upper or dups):
+        return changes, todo
+    t = read(top) or ""
+    new = t
+    chain = _parent_chain(root, local_repo)
+    for (g, a), v in sorted(upper.items()):
+        prop = None
+        for ptxt in [t] + chain:
+            dm = _section(ptxt, "dependencyManagement")
+            for m in re.finditer(r"<dependency>((?:(?!<dependency>).)*?)</dependency>", ptxt[dm[0]:dm[1]] if dm else "", re.S):
+                b = m.group(1)
+                if _first_tag(b, "groupId") == g and _first_tag(b, "artifactId") == a:
+                    pv = re.fullmatch(r"\$\{([\w.\-]+)\}", _first_tag(b, "version") or "")
+                    prop = pv.group(1) if pv else None
+                    break
+            if prop:
+                break
+        if prop:
+            new = pom_set_property(new, prop, v)
+            changes.append(f"pom.xml: {g}:{a} aligned on {v} via <{prop}> (the property the parent manages it with)")
+        else:
+            new = pom_manage_version(new, g, a, v)
+            changes.append(f"pom.xml: {g}:{a} aligned on {v} (<dependencyManagement>; RequireUpperBoundDeps)")
+    for arts, classes in dups:
+        api = next((x for x in arts if x[1].endswith("-api") or x[0].startswith(("jakarta.", "javax."))), None)
+        if not api:
+            todo.append(f"duplicate classes in {' and '.join(':'.join(x) for x in arts)} ({classes[0]} ...) - exclude one of them "
+                        f"or add it to the banDuplicateClasses ignores")
+            continue
+        pkgs = sorted({c.rsplit("/", 1)[0].replace("/", ".") for c in classes})
+        prefix = os.path.commonprefix(pkgs).rstrip(".")
+        prefix = prefix if prefix.count(".") >= 1 else pkgs[0]
+        ignore = f"{prefix}.*"
+        entry = (f"<dependency><groupId>{api[0]}</groupId><artifactId>{api[1]}</artifactId>"
+                 f"<ignoreClasses><ignoreClass>{ignore}</ignoreClass></ignoreClasses></dependency>")
+        rule_pom = next((bf for bf in build_files(root) if bf.name == "pom.xml" and "<banDuplicateClasses" in (read(bf) or "")), None)
+        if rule_pom is None:
+            todo.append(f"duplicate classes {ignore} in {' and '.join(':'.join(x) for x in arts)} (an embedded container and a "
+                        f"separately declared API): add to the banDuplicateClasses rule (configured in a parent): {entry}")
+            continue
+        rt = read(rule_pom) if rule_pom != top else new
+        if f"<artifactId>{api[1]}</artifactId><ignoreClasses>" in rt or ignore in rt:
+            continue
+        bm = re.search(r"<banDuplicateClasses>(.*?)</banDuplicateClasses>", rt, re.S)
+        if not bm:
+            continue
+        body = bm.group(1)
+        if re.search(r"<dependencies>", body):
+            nb = re.sub(r"<dependencies>", "<dependencies>\n" + entry, body, count=1)
+        else:
+            nb = body.rstrip() + f"\n<dependencies>{entry}</dependencies>\n"
+        rt2 = rt[:bm.start(1)] + nb + rt[bm.end(1):]
+        if rule_pom == top:
+            new = rt2
+        else:
+            write_file(rule_pom, rt2)
+        changes.append(f"{rel(rule_pom, root)}: banDuplicateClasses ignores {ignore} from {api[0]}:{api[1]} "
+                       f"(also embedded in {', '.join(':'.join(x) for x in arts if x != api)})")
+    write_if_changed(top, t, new)
+    return changes, todo
+
+
+def run_strict_gate(root: Path, builder, key: str, profiles: list[str], no_git: bool, local_repo: Path) -> tuple[bool, Path, list, list]:
+    """The project's own verification (its CI profiles, enforcer rules, quality plugins - nothing skipped), after the
+    ground-truth build passed. Tests already ran there. Enforcer findings with a mechanical fix are fixed and re-checked."""
+    changes_all, todo_all = [], []
+    if builder.tool != "maven":
+        return True, Path(), [], []
+    cmd = [builder.exe, "-B", "-ntp", "verify", "-DskipTests"] + ([f"-P{','.join(profiles)}"] if profiles else [])
+    cmd = cmd + [x for x in builder.extra if x not in QUALITY_SKIP]
+    for rnd in range(3):
+        log = builder.log_dir / f"{key}-strict{rnd or ''}-build.log"
+        if run(cmd, root, log, builder.env) == 0:
+            return True, log, changes_all, todo_all
+        changes, todo = fix_enforcer_failures(root, log, local_repo)
+        todo_all += [t for t in todo if t not in todo_all]
+        if not changes:
+            return False, log, changes_all, todo_all
+        changes_all += changes
+        for c in changes:
+            say(f"  strict-gate fix: {c}")
+        if not no_git:
+            git(root, "add", "-A")
+            git(root, "commit", "-q", "-m", f"chore(migration): dependency convergence for the strict build ({key})")
+    return False, log, changes_all, todo_all
+
+
 # ---- wiring guard: a stage must never silently drop class-level wiring (entity scan, component scan, imports, ...) ----
 # Annotations whose loss changes the application context without a compile error. Deliberately not the ones the
 # migration removes on purpose (@EnableBatchProcessing, @EnableHystrix, @EnableResourceServer, @EnableSwagger2, ...).
@@ -4418,6 +4627,160 @@ _REMOVED_DIALECT_API = ("registerColumnType", "registerFunction", "supportsPoole
 
 def _class_end(text: str) -> int:
     return text.rstrip().rfind("}")
+
+
+# ---- JPQL: string literals compared with date/time attributes (Hibernate 6: "Cannot compare left expression of type
+# 'java.time.LocalDate' with right expression of type 'java.lang.String'") -> JDBC escape literals {d '...'} / {ts '...'}
+_TEMPORAL_KIND = {"LocalDate": "d", "LocalDateTime": "ts", "Instant": "ts", "OffsetDateTime": "ts", "ZonedDateTime": "ts",
+                  "Timestamp": "ts", "LocalTime": "t", "Time": "t", "Date": "?", "Calendar": "ts"}
+_COLLECTION_RX = re.compile(r"^(?:java\.util\.)?(?:List|Set|Collection|SortedSet|Iterable)<\s*([\w.]+)\s*>$")
+
+
+class EntityModel:
+    """Fields of the project's classes (entities, embeddables, mapped superclasses) from the sources."""
+    def __init__(self, root: Path):
+        self.fields: dict[str, dict] = {}      # class simple name -> {field: (type, temporal annotation or None)}
+        self.parent: dict[str, str] = {}
+        self.entity: dict[str, str] = {}       # entity name -> class simple name
+        for p in java_sources(root, main_only=True):
+            t = read(p) or ""
+            if not re.search(r"@(?:[\w.]+\.)?(?:Entity|Embeddable|MappedSuperclass)\b", t):
+                continue
+            body = re.sub(r"//[^\n]*|/\*.*?\*/", "", t, flags=re.S)
+            for cm in re.finditer(r"((?:@[\w.]+(?:\s*\([^)]*\))?\s*)*)(?:public\s+|abstract\s+|final\s+)*class\s+(\w+)(?:<[^>]*>)?"
+                                  r"(?:\s+extends\s+([\w.]+))?", body):
+                name = cm.group(2)
+                en = re.search(r"@(?:[\w.]+\.)?Entity\s*\(\s*(?:name\s*=\s*)?\"(\w+)\"", cm.group(1))
+                if re.search(r"@(?:[\w.]+\.)?Entity\b", cm.group(1)):
+                    self.entity[en.group(1) if en else name] = name
+                if cm.group(3):
+                    self.parent[name] = cm.group(3).rsplit(".", 1)[-1]
+                f = self.fields.setdefault(name, {})
+                for fm in re.finditer(r"((?:@[\w.]+(?:\s*\((?:[^()]|\([^()]*\))*\))?\s*)*)(?:private|protected|public)\s+(?!static\b)"
+                                      r"(?:final\s+|transient\s+)*([\w.]+(?:\s*<[\w.<>, ?]+>)?(?:\[\])?)\s+(\w+)\s*[;=]", body):
+                    temporal = re.search(r"@Temporal\s*\(\s*(?:TemporalType\.)?(\w+)", fm.group(1))
+                    f[fm.group(3)] = (fm.group(2).replace(" ", ""), temporal.group(1) if temporal else None)
+
+    def field(self, cls: str, name: str):
+        seen = set()
+        while cls and cls not in seen:
+            seen.add(cls)
+            if name in self.fields.get(cls, {}):
+                return self.fields[cls][name]
+            cls = self.parent.get(cls)
+        return None
+
+    def path_type(self, aliases: dict, path: str):
+        """(type, temporal) of alias.a.b, following embeddables, to-one and collection associations."""
+        parts = path.split(".")
+        cls = aliases.get(parts[0])
+        if not cls or len(parts) < 2:
+            return None
+        ft = None
+        for i, part in enumerate(parts[1:]):
+            ft = self.field(cls, part)
+            if not ft:
+                return None
+            t = ft[0]
+            cm = _COLLECTION_RX.match(t)
+            cls = (cm.group(1) if cm else t).rsplit(".", 1)[-1]
+        return ft
+
+
+def _jpql_aliases(query: str, model: EntityModel) -> dict:
+    aliases = {}
+    for m in re.finditer(r"\bfrom\s+([\w.]+)\s+(?:as\s+)?(\w+)", query, re.I):
+        ent = m.group(1).rsplit(".", 1)[-1]
+        cls = model.entity.get(ent) or (ent if ent in model.fields else None)
+        if cls and m.group(2).lower() not in ("where", "join", "left", "inner", "order", "group"):
+            aliases[m.group(2)] = cls
+    # joins may refer to aliases declared before them: resolve in order, twice for forward references
+    for _ in range(2):
+        for m in re.finditer(r"\bjoin\s+(?:fetch\s+)?(\w+(?:\.\w+)+)\s+(?:as\s+)?(\w+)", query, re.I):
+            ft = model.path_type(aliases, m.group(1))
+            if ft:
+                cm = _COLLECTION_RX.match(ft[0])
+                aliases[m.group(2)] = (cm.group(1) if cm else ft[0]).rsplit(".", 1)[-1]
+    return aliases
+
+
+_DATE_LIT = r"'(\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?)?|\d{2}:\d{2}(?::\d{2})?)'"
+_QUERY_START_RX = re.compile(r"@(?:Query|NamedQuery|NamedNativeQuery)\s*\(|\.create(?:Native)?Query\s*\(")
+
+
+def _typed_literal(kind: str, lit: str) -> str | None:
+    if kind == "d":
+        return f"{{d '{lit[:10]}'}}" if re.match(r"\d{4}-\d{2}-\d{2}$", lit) else None
+    if kind == "ts":
+        if re.match(r"\d{4}-\d{2}-\d{2}$", lit):
+            lit += " 00:00:00"
+        lit = lit.replace("T", " ")
+        if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", lit):
+            lit += ":00"
+        return f"{{ts '{lit}'}}" if re.match(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", lit) else None
+    if kind == "t":
+        return f"{{t '{lit if lit.count(':') == 2 else lit + ':00'}'}}" if re.match(r"\d{2}:\d{2}", lit) else None
+    return None
+
+
+def fix_jpql_temporal_literals(root: Path) -> list[str]:
+    model = None
+    changes = []
+    for p in java_sources(root):
+        t = read(p) or ""
+        if not re.search(_DATE_LIT, t) or not _QUERY_START_RX.search(t):
+            continue
+        model = model or EntityModel(root)
+        new, pos, n = t, 0, 0
+        while True:
+            qm = _QUERY_START_RX.search(new, pos)
+            if not qm:
+                break
+            e = balanced(new, qm.end() - 1)
+            if e == -1:
+                break
+            span = new[qm.end():e]
+            pos = e
+            if "Native" in qm.group(0) or re.search(r"nativeQuery\s*=\s*true", span) or not re.search(_DATE_LIT, span):
+                continue
+            # the query as JPQL text: the string literals and text blocks of the annotation/call joined
+            query = " ".join(re.findall(r'"""(.*?)"""|"((?:\\.|[^"\\])*)"', span, re.S) and
+                             [a or b for a, b in re.findall(r'"""(.*?)"""|"((?:\\.|[^"\\])*)"', span, re.S)])
+            aliases = _jpql_aliases(query, model)
+            if not aliases:
+                continue
+            def kind_of(path):
+                ft = model.path_type(aliases, path)
+                if not ft:
+                    return None
+                simple = ft[0].rsplit(".", 1)[-1]
+                k = _TEMPORAL_KIND.get(simple)
+                if k == "?":                       # java.util.Date: @Temporal decides (default TIMESTAMP)
+                    k = {"DATE": "d", "TIME": "t"}.get(ft[1] or "", "ts")
+                return k
+            def sub_cmp(m):
+                k = kind_of(m.group(1))
+                lit = _typed_literal(k, m.group(3)) if k else None
+                return f"{m.group(1)} {m.group(2)} {lit}" if lit else m.group(0)
+            def sub_cmp_rev(m):
+                k = kind_of(m.group(3))
+                lit = _typed_literal(k, m.group(1)) if k else None
+                return f"{lit} {m.group(2)} {m.group(3)}" if lit else m.group(0)
+            def sub_between(m):
+                k = kind_of(m.group(1))
+                a_, b_ = (_typed_literal(k, m.group(3)), _typed_literal(k, m.group(4))) if k else (None, None)
+                return f"{m.group(1)} {m.group(2)} {a_} and {b_}" if a_ and b_ else m.group(0)
+            ns = re.sub(rf"\b([A-Za-z_]\w*(?:\.\w+)+)\s*(=|<>|!=|<=|>=|<|>)\s*{_DATE_LIT}", sub_cmp, span)
+            ns = re.sub(rf"{_DATE_LIT}\s*(=|<>|!=|<=|>=|<|>)\s*([A-Za-z_]\w*(?:\.\w+)+)\b", sub_cmp_rev, ns)
+            ns = re.sub(rf"\b([A-Za-z_]\w*(?:\.\w+)+)\s+((?:not\s+)?between)\s+{_DATE_LIT}\s+and\s+{_DATE_LIT}", sub_between, ns, flags=re.I)
+            if ns != span:
+                n += 1
+                new = new[:qm.end()] + ns + new[e:]
+                pos = qm.end() + len(ns)
+        if write_if_changed(p, t, new):
+            changes.append(f"{rel(p, root)}: date/time string literals in {n} JPQL quer{'y' if n == 1 else 'ies'} -> typed literals "
+                           f"({{d '...'}}/{{ts '...'}}; Hibernate 6 does not compare them with strings)")
+    return changes
 
 
 def fix_custom_dialects(root: Path, db2_platform: str | None = None) -> tuple[list[str], list[str]]:
@@ -5722,8 +6085,10 @@ rootProject {{
 
     def verify(self, stage: str) -> int:
         log = self.log_dir / f"{stage}-build.log"
-        # clean: stale generated sources (javax output of skipped code generators) must not look like code breakage
-        cmd = [self.exe, "-B", "-ntp", "clean", "verify"] if self.tool == "maven" else [self.exe, "clean", "build"]
+        # Ground truth: does the code compile and do the tests pass? clean: stale generated sources (javax output of
+        # skipped code generators) must not look like code breakage. Enforcer/quality gates often run before compile and
+        # would mask compile errors - they run in the strict gate afterwards (run_strict_gate).
+        cmd = [self.exe, "-B", "-ntp", "clean", "verify"] + QUALITY_SKIP if self.tool == "maven" else [self.exe, "clean", "build"]
         return run(cmd + self.extra, self.root, log, self.env)
 
 
@@ -6086,9 +6451,26 @@ def cmd_migrate(a) -> int:
                     ok = builder.verify(st.key + "-props") == 0
                 elif renames == {} and not ok:
                     pass
+            strict_log = None
+            if ok and not a.no_strict_gate and builder.tool == "maven":
+                profiles = a.ci_profile or ci_profiles(root)
+                say(f"[stage {st.key}] strict gate: the project's own verification"
+                    + (f" (profile(s) {', '.join(profiles)})" if profiles else " (enforcer and quality plugins, nothing skipped)"))
+                sok, strict_log, sc, stodo = run_strict_gate(root, builder, st.key, profiles, a.no_git,
+                                                             local_repository(builder.extra, env))
+                todo_all += stodo
+                if sc:
+                    say(f"[stage {st.key}] build + tests again with the aligned versions")
+                    ok = builder.verify(st.key + "-aligned") == 0
+                    if not ok:
+                        (log_dir / f"{st.key}-build.log").write_bytes((log_dir / f"{st.key}-aligned-build.log").read_bytes())
+                if ok and not sok:
+                    ok = False
+                    say(f"[stage {st.key}] the code builds and the tests pass, but the project's strict verification fails")
             say(f"[stage {st.key}] {'build OK' if ok else 'BUILD/TESTS FAILED'}")
             if not ok:
-                show_errors(log_dir / f"{st.key}-build.log")
+                show_errors(strict_log if strict_log and strict_log.exists() and (log_dir / f"{st.key}-build.log").exists()
+                            and "BUILD SUCCESS" in (read(log_dir / f"{st.key}-build.log") or "") else log_dir / f"{st.key}-build.log")
         results.append((st.key, st.title, ok, time.time() - t0, note))
         if not ok:
             failed_stage = st.key
@@ -6304,9 +6686,19 @@ def cmd_update(a) -> int:
         ok = builder.verify(f"update-autofix{rnd}") == 0
         if not ok:
             (log_dir / "update-build.log").write_bytes((log_dir / f"update-autofix{rnd}-build.log").read_bytes())
+    strict_log = None
+    if ok and not a.no_strict_gate and info["tool"] == "maven":
+        profiles = a.ci_profile or ci_profiles(root)
+        say("[update] strict gate" + (f" (profile(s) {', '.join(profiles)})" if profiles else ""))
+        sok, strict_log, sc, stodo = run_strict_gate(root, builder, "update", profiles, False, local_repository(extra, env))
+        for t in stodo:
+            say(f"  TODO {t}")
+        if sc:
+            ok = builder.verify("update-aligned") == 0
+        ok = ok and sok
     say(f"[update] {'build OK' if ok else 'BUILD/TESTS FAILED'}")
     if not ok:
-        show_errors(log_dir / "update-build.log")
+        show_errors(strict_log if strict_log and strict_log.exists() else log_dir / "update-build.log")
         return 1
     return 0
 
@@ -6363,6 +6755,8 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--build-args", help='extra args for mvn/gradle, e.g. "-s /path/settings.xml"')
     up.add_argument("--db2-platform", choices=("luw", "zos", "ibmi"), help="DB2 platform for the Hibernate 6 dialect (DB2Dialect = LUW, DB2zDialect, DB2iDialect); default: from .spring-migrate/state.json, else each DB2 dialect keeps its platform (DB2390* = z/OS, DB2400* = IBM i)")
     up.add_argument("--skip-tests", action="store_true", help="only apply and commit the fixes, no build")
+    up.add_argument("--ci-profile", action="append", help="Maven profile the project's CI verifies with (repeatable; default: read from .gitlab-ci.yml/Jenkinsfile/GitHub workflows, else a ci/strict/quality profile in the POMs)")
+    up.add_argument("--no-strict-gate", action="store_true", help="do not run the project's strict verification (enforcer, quality plugins, CI profiles) after the build+tests")
     up.add_argument("--skip-frontend", action="store_true")
     up.add_argument("--format-goal")
     up.add_argument("--no-format", action="store_true")
@@ -6410,6 +6804,8 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--no-legacy", action="store_true", help="skip the legacy-library codemods (Netflix, legacy OAuth2, id pinning, ...)")
     m.add_argument("--db2-platform", choices=("luw", "zos", "ibmi"), help="DB2 platform for the Hibernate 6 dialect (DB2Dialect = LUW, DB2zDialect, DB2iDialect); default: each DB2 dialect keeps its platform (DB2390* = z/OS, DB2400* = IBM i)")
     m.add_argument("--no-trailing-slash-compat", action="store_true", help="do not add the trailing-slash compatibility filter")
+    m.add_argument("--ci-profile", action="append", help="Maven profile the project's CI verifies with (repeatable; default: read from .gitlab-ci.yml/Jenkinsfile/GitHub workflows, else a ci/strict/quality profile in the POMs)")
+    m.add_argument("--no-strict-gate", action="store_true", help="do not run the project's strict verification (enforcer, quality plugins, CI profiles) after the build+tests")
     m.add_argument("--no-properties-migrator", action="store_true", help="do not run tests with spring-boot-properties-migrator")
     m.add_argument("--dependency-plan", help=f"use this {DEP_PLAN_FILE} (from `deps` or a previous run) instead of detecting")
     m.add_argument("--internal-group", action="append", help="groupId prefix of your company artifacts (repeatable; also guessed)")

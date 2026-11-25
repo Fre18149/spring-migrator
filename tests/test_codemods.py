@@ -902,6 +902,58 @@ class LibraryApiAutofixTest(unittest.TestCase):
         self.assertIsNone(sm._fix_at("x = names();", 9, "Inkompatible Typen: java.util.List<java.lang.String> kann nicht in java.lang.String konvertiert werden", set(), []))
 
 
+class JpqlTemporalLiteralTest(unittest.TestCase):
+    def test_typed_literals_only_for_temporal_attributes(self):
+        pr = Project({
+            "src/main/java/a/Unternehmen.java": """
+                package a;
+                import jakarta.persistence.*;
+                import java.util.List;
+                @Entity
+                public class Unternehmen {
+                  @Id private Long id;
+                  private String gruendungText;
+                  @OneToMany(mappedBy = "u") private List<Zeitraum> zeitraeume;
+                }
+                """,
+            "src/main/java/a/Zeitraum.java": """
+                package a;
+                import jakarta.persistence.*;
+                import java.time.LocalDate;
+                @Entity
+                public class Zeitraum extends Basis {
+                  @Id private Long id;
+                  private LocalDate datumVonFachlich;
+                  @Temporal(TemporalType.DATE) private java.util.Date alt;
+                }
+                """,
+            "src/main/java/a/Basis.java": """
+                package a;
+                @jakarta.persistence.MappedSuperclass
+                public abstract class Basis { private java.time.LocalDateTime geaendertAm; }
+                """,
+            "src/main/java/a/Repo.java": """
+                package a;
+                interface Repo {
+                  @Query(" SELECT unt FROM Unternehmen unt join unt.zeitraeume zr"
+                      + " where zr.datumVonFachlich = '0002-01-01' and unt.gruendungText = '2020-05-05'"
+                      + " and '2001-01-01' < zr.alt and zr.geaendertAm >= '2024-01-01 10:15'")
+                  java.util.List<Unternehmen> q();
+                  @Query(value = "select * from x where d = '2020-01-01'", nativeQuery = true)
+                  java.util.List<Unternehmen> n();
+                }
+                """})
+        sm.fix_jpql_temporal_literals(pr.root)
+        r = pr["src/main/java/a/Repo.java"]
+        self.assertIn("zr.datumVonFachlich = {d '0002-01-01'}", r)
+        self.assertIn("unt.gruendungText = '2020-05-05'", r)          # a String attribute keeps its string
+        self.assertIn("{d '2001-01-01'} < zr.alt", r)                 # java.util.Date with @Temporal(DATE)
+        self.assertIn("zr.geaendertAm >= {ts '2024-01-01 10:15:00'}", r)   # inherited from the mapped superclass
+        self.assertIn("d = '2020-01-01'", r)                          # native SQL untouched
+        self.assertEqual(sm.fix_jpql_temporal_literals(pr.root), [])
+        pr.close()
+
+
 class ManagementGapTest(unittest.TestCase):
     POM = """<project>
   <dependencies>
@@ -1046,10 +1098,25 @@ class BuilderTest(unittest.TestCase):
         self.assertNotIn("-Dskip.npm", verify)          # your build gates still build the frontend
         self.assertIn("-Dspotless.check.skip=true", rewrite)   # no format/style gate while rewriting
         self.assertIn("-Dcheckstyle.skip=true", rewrite)
-        self.assertNotIn("-Dspotless.check.skip=true", verify)  # ... but the build gate keeps them
+        self.assertIn("-Denforcer.skip=true", verify)            # ground truth: no gate may mask compile errors ...
+        self.assertIn("clean", verify)
         self.assertIn("corp.xml", rewrite)
         self.assertEqual(rewrite[4], "clean")      # stale generated sources must not survive
         self.assertTrue(rewrite[5].endswith(":run"))
+
+    def test_strict_gate_keeps_every_check(self):
+        seen = []
+        old = sm.run
+        sm.run = lambda cmd, cwd, log, env: seen.append(cmd) or 0
+        try:
+            b = sm.Builder(Path("."), "maven", {}, Path(tempfile.mkdtemp()), ["-s", "corp.xml"], None)
+            ok, _, _, _ = sm.run_strict_gate(Path("."), b, "s", ["ci", "strict"], True, Path("."))
+        finally:
+            sm.run = old
+        self.assertTrue(ok)
+        self.assertIn("-Pci,strict", seen[0])                    # ... the strict gate runs them all, with the CI profiles
+        self.assertFalse([x for x in seen[0] if x in sm.QUALITY_SKIP])
+        self.assertIn("corp.xml", seen[0])
 
     def test_skip_frontend_everywhere_and_no_fork(self):
         rewrite, verify = self.capture(skip_frontend=True, no_fork=True, rewrite_extra=["-Ddocker.skip"])
