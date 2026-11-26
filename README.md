@@ -291,6 +291,19 @@ Hibernate 6 removed the version-specific dialects (`DB2390Dialect`, `PostgreSQL9
 already migrated branch: `python3 spring_migrate.py update . --db2-platform luw` (recorded in `.spring-migrate/state.json`).
 
 ## OpenJPA -> Hibernate
+
+**Only the OpenJPA -> Hibernate migration, no Spring Boot upgrade:**
+
+```bash
+python3 spring_migrate.py migrate /path/to/project --openjpa-only
+```
+
+Converts OpenJPA to Hibernate 5.6 (javax) on the project's current Spring Boot 2.x, on the branch
+`migrate/openjpa-to-hibernate`, with everything `migrate` does around it: baseline build, company dependencies switched to
+their Hibernate builds (dependency plan line `2.7-hibernate`), wiring guard, build + tests, strict gate, context smoke
+test, JPA provider per profile, report. `update` on that branch applies the OpenJPA fixes of newer tool versions. Run
+`migrate` (without the flag) on the branch later for the Boot 3/4 upgrade - the OpenJPA stage is then skipped.
+(`spring_migrate.py openjpa <path>` only rewrites files: no git, no build, no checks.)
 OpenRewrite has no recipe for this, so the tool does it itself, as its own stage on Boot 2.7 (Hibernate 5.6, still
 `javax`) *before* the Spring 6 jump, so a persistence regression is caught on its own commit. Run it alone with
 `spring_migrate.py openjpa PATH` (no build, no git).

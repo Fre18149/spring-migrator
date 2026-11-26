@@ -40,6 +40,9 @@ __version__ = "2.3.1"
 # What each version changes for an already migrated branch (`spring_migrate.py update` prints the entries newer than the
 # version recorded in .spring-migrate/state.json). Every post-fixer is idempotent, so `update` simply runs them again.
 CHANGELOG = [
+    ("2.3.1", "migrate --openjpa-only: only OpenJPA -> Hibernate on the current Boot 2.x (own branch, same gates/checks); "
+              "update supports such branches"),
+    ("2.3.1", "OpenJPA properties set in code: already commented-out lines are no longer commented again"),
     ("2.3.1", "converted dialects: CHAR(1)/VARCHAR(1) native query results are Strings again (Hibernate 6 made them Character, "
               "so '' became ' ' or null); dialects converted by 2.2.0/2.3.0 are repaired"),
     ("2.3.0", "context smoke test after the build: missing placeholders filled from existing config/metadata/framework defaults; "
@@ -873,7 +876,7 @@ def jpa_provider_profiles(root: Path) -> dict:
         if where not in out[profile][provider]:
             out[profile][provider].append(where)
     for p in java_sources(root, main_only=True):
-        t = read(p) or ""
+        t = re.sub(r"//[^\n]*|/\*.*?\*/", "", read(p) or "", flags=re.S)       # TODO comments the conversion leaves are not config
         if not (_OPENJPA_MARK.search(t) or re.search(r"HibernateJpaVendorAdapter|HibernatePersistenceProvider", t)):
             continue
         cls_prof = re.search(r"@Profile\s*\(\s*(?:value\s*=\s*)?\{?([^)}]*)\}?\s*\)(?=(?:\s*@[\w.]+(?:\([^)]*\))?)*\s*(?:public\s+|final\s+|abstract\s+)*class\b)", t)
@@ -894,8 +897,8 @@ def jpa_provider_profiles(root: Path) -> dict:
                 add(prof, "Hibernate", rel(f, root))
     for x in walk(root):
         if x.name == "persistence.xml" and "/src/test/" not in x.as_posix():
-            t = read(x) or ""
-            if "openjpa" in t.lower():
+            t = re.sub(r"<!--.*?-->", "", read(x) or "", flags=re.S)
+            if re.search(r"<provider>\s*org\.apache\.openjpa|name\s*=\s*\"openjpa\.", t):
                 add("default", "OpenJPA", rel(x, root))
             elif "org.hibernate" in t:
                 add("default", "Hibernate", rel(x, root))
@@ -2973,6 +2976,8 @@ def cm_openjpa_code_props(root: Path) -> tuple[list[str], list[str]]:
         lines, out, n = t.splitlines(keepends=True), [], 0
         for line in lines:
             m = re.search(r"\"(openjpa\.[\w.]+)\"\s*,\s*(\"(?:[^\"\\]|\\.)*\")?", line)
+            if line.lstrip().startswith(("//", "*", "/*")):
+                m = None                                   # already commented out (by an earlier run): idempotent
             if m and line.rstrip().endswith(";"):
                 keep, note = map_openjpa_property(m.group(1), unquote_java(m.group(2)) or "")
                 if keep:
@@ -4159,6 +4164,7 @@ def run_context_smoke(root: Path, builder, key: str, profiles: list[str], no_git
         return None, [], []
     apps = boot_apps(root)
     if not apps:
+        say("  smoke: no @SpringBootApplication in the main sources - nothing to start (context smoke test skipped)")
         return None, [], []
     for mod, pkg, app in apps:
         builds = reactor_text(root, module_build_file(mod)) if module_build_file(mod) else ""
@@ -6632,7 +6638,16 @@ def cmd_migrate(a) -> int:
     except (ValueError, IndexError):
         major, minor = 2, 7
     target_t = tuple(int(x) for x in a.target.split("."))
-    if (major, minor) >= target_t:
+    if a.openjpa_only:
+        if a.no_openjpa:
+            raise MigrationError("--openjpa-only and --no-openjpa contradict each other")
+        if a.dry_run:
+            raise MigrationError("--openjpa-only has no dry run; use `spring_migrate.py openjpa <copy of the project>` to preview the edits")
+        if major >= 3:
+            raise MigrationError(f"--openjpa-only converts on Spring Boot 2.x (Hibernate 5.6, javax); this project is on Boot {bv}")
+        say("[preflight] --openjpa-only: OpenJPA -> Hibernate on the current Spring Boot "
+            f"{bv} (Hibernate 5.6, javax) - no Spring Boot upgrade")
+    elif (major, minor) >= target_t:
         say(f"[preflight] project is already on Spring Boot {bv}; target {a.target} reached.")
         return 0
     resuming = major >= 3
@@ -6650,6 +6665,9 @@ def cmd_migrate(a) -> int:
     if use_openjpa:
         say("[preflight] OpenJPA detected -> adding an OpenJPA -> Hibernate stage")
     stages = plan_stages(a.target, a.java, junit4, a.rewrite_spring_version, a.extra_recipe or [], use_openjpa)
+    if a.openjpa_only:
+        # only the OpenJPA stage; whether OpenJPA also comes in through a company dependency is known after detection
+        stages = [Stage(OPENJPA_STAGE, "OpenJPA -> Hibernate (on the current Boot 2.x / Hibernate 5.6, javax)", [], [])]
     builder = Builder(root, info["tool"], env, log_dir, shlex.split(a.build_args or ""), a.rewrite_plugin_version,
                       rewrite_extra=shlex.split(a.rewrite_args or ""), skip_frontend=a.skip_frontend,
                       rewrite_frontend=a.rewrite_frontend, no_fork=a.rewrite_no_fork,
@@ -6680,7 +6698,7 @@ def cmd_migrate(a) -> int:
         return code
 
     # ---- branch ----------------------------------------------------------
-    branch = f"migrate/spring-boot-{a.target}"
+    branch = "migrate/openjpa-to-hibernate" if a.openjpa_only else f"migrate/spring-boot-{a.target}"
     created_branch = False
     if not a.no_git:
         current = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
@@ -6721,7 +6739,7 @@ def cmd_migrate(a) -> int:
     elif info["tool"] == "maven" and not a.no_dependency_detection:
         dep_repo = MavenRepo(root, builder.exe, builder.extra, env, log_dir)
         dep_repo.refresh = a.refresh_dependency_versions
-        dep_plan = detect_dependency_plan(root, dep_repo, a.target, a.internal_group or [], openjpa_stage=use_openjpa)
+        dep_plan = detect_dependency_plan(root, dep_repo, a.target, a.internal_group or [], openjpa_stage=use_openjpa or a.openjpa_only)
         if a.interactive:
             dep_plan = interactive_plan(dep_plan)
     if dep_plan:
@@ -6739,6 +6757,13 @@ def cmd_migrate(a) -> int:
             at = next(i for i, st in enumerate(stages) if st.key.startswith("2-"))
             stages.insert(at, Stage(OPENJPA_STAGE, "OpenJPA -> Hibernate (on Boot 2.7 / Hibernate 5.6, before the Spring 6 jump)", [], []))
 
+    if a.openjpa_only and not (use_openjpa or (dep_plan or {}).get("openjpaViaDependencies")):
+        say("[preflight] --openjpa-only: no OpenJPA found in the code, build files or company dependencies - nothing to do "
+            "(add --openjpa to convert anyway)")
+        if created_branch:
+            git(root, "checkout", "-q", "-")
+            git(root, "branch", "-q", "-D", branch)
+        return 0
     # ---- stages ----------------------------------------------------------
     todo_all: list[str] = list(todo_pre)
     failed_stage = None
@@ -6866,9 +6891,10 @@ def cmd_migrate(a) -> int:
             for n_ in notes or []:
                 say(f"  format: {n_}")
         if not a.no_git and not (code != 0 or dl):
-            write_state(root, target=a.target, java=a.java, boot_line=st.boot_line or "2.7", stage=st.key,
+            write_state(root, target=None if a.openjpa_only else a.target, java=None if a.openjpa_only else a.java, boot_line=st.boot_line or "2.7", stage=st.key,
                         no_trailing_slash_compat=a.no_trailing_slash_compat or None, skip_frontend=a.skip_frontend or None,
-                        format_goal=a.format_goal, no_legacy=a.no_legacy or None, db2_platform=a.db2_platform)
+                        format_goal=a.format_goal, no_legacy=a.no_legacy or None, db2_platform=a.db2_platform,
+                        openjpa_only=a.openjpa_only or None)
         if not a.no_git and git(root, "status", "--porcelain").strip():
             git(root, "add", "-A")
             msg = f"chore(migration): {st.title}\n\nAutomated by spring-migrate {__version__} (OpenRewrite: {', '.join(st.recipes)})"
@@ -6945,7 +6971,7 @@ def cmd_migrate(a) -> int:
     # ---- runtime checks: context refresh (placeholders, beans, profiles) ---
     smoke_ok = None
     if not failed_stage and not a.skip_tests and a.smoke_test != "off" and builder.tool == "maven":
-        final_line = next((st.boot_line for st in reversed(stages) if st.boot_line), None)
+        final_line = HIBERNATE_LINE if a.openjpa_only else next((st.boot_line for st in reversed(stages) if st.boot_line), None)
         if dep_plan and final_line:
             pc, pt = new_required_placeholders(root, dep_plan, final_line, local_repository(builder.extra, env), builder.test_classpath())
             for c in pc:
@@ -6960,8 +6986,8 @@ def cmd_migrate(a) -> int:
         todo_all += st_
         if smoke_ok is False:
             say("[check] the application context does not start - see the BLOCKING items in the report")
-    # ---- jars still compiled against javax.* -------------------------------
-    if not failed_stage and not a.skip_tests:
+    # ---- jars still compiled against javax.* (only wrong from Boot 3 on) ---
+    if not failed_stage and not a.skip_tests and not a.openjpa_only:
         direct = {a for bf in build_files(root) for _, _, _, a in pom_dependency_blocks(read(bf) or "") if a}
         bad = javax_jars(builder.classpath(), direct)
         for j in bad:
@@ -7112,7 +7138,9 @@ def cmd_update(a) -> int:
     bv = info["boot_version"]
     if (not bv or bv.startswith("${")) and info["tool"] == "maven":
         bv = effective_boot_version(root, exe, extra, env)
-    if not bv or int(bv.split(".")[0]) < 3:
+    openjpa_branch = bool(bv) and not bv.startswith("${") and int(bv.split(".")[0]) < 3 and \
+        (state.get("openjpa_only") or state.get("stage") == OPENJPA_STAGE)
+    if not openjpa_branch and (not bv or int(bv.split(".")[0]) < 3):
         raise MigrationError(f"this branch is on Spring Boot {bv or '?'} - run `migrate` first; `update` refreshes migrated branches")
     line = ".".join(bv.split(".")[:2])
     line = line if line in ("3.5", "4.0", "4.1") else ("3.5" if bv.startswith("3") else "4.1")
@@ -7131,10 +7159,16 @@ def cmd_update(a) -> int:
         builder.format_goal = None
     stage_rev = git(root, "rev-parse", "HEAD").strip()
     db2 = a.db2_platform or state.get("db2_platform")
-    changes, todo = run_fixers(root, java, line, migration_base(root), trailing_slash=not state.get("no_trailing_slash_compat", False),
-                               stage_rev=stage_rev, boot_version=bv, extra=extra, db2_platform=db2)
-    if info["tool"] == "maven":
-        changes += fix_java_level(root, java, exe, extra, env)
+    if openjpa_branch:
+        # an OpenJPA-only branch (still Boot 2.x): re-run the idempotent OpenJPA -> Hibernate conversion of this version
+        say("[update] OpenJPA -> Hibernate branch on Spring Boot 2.x: applying this version's OpenJPA conversion")
+        changes, todo = migrate_openjpa(root)
+        todo += [t for t in check_provider_profiles(root, jpa_provider_profiles(root)) if t.startswith("BLOCKING")]
+    else:
+        changes, todo = run_fixers(root, java, line, migration_base(root), trailing_slash=not state.get("no_trailing_slash_compat", False),
+                                   stage_rev=stage_rev, boot_version=bv, extra=extra, db2_platform=db2)
+        if info["tool"] == "maven":
+            changes += fix_java_level(root, java, exe, extra, env)
     for c in changes:
         say(f"  fixer: {c}")
     for t in todo:
@@ -7282,6 +7316,9 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--force", action="store_true", help="continue even if scan finds blockers")
     m.add_argument("--openjpa", action="store_true", help="force the OpenJPA -> Hibernate stage even if detection finds nothing")
     m.add_argument("--no-openjpa", action="store_true", help="skip the OpenJPA -> Hibernate stage")
+    m.add_argument("--openjpa-only", action="store_true",
+                   help="ONLY migrate OpenJPA -> Hibernate (5.6, javax) on the current Spring Boot 2.x - no Spring Boot upgrade; "
+                        "branch migrate/openjpa-to-hibernate, same build gates/checks. Run `migrate` later for the Boot upgrade")
     m.add_argument("--retries", type=int, default=2, help="retries per stage on repository/download failures (default 2)")
     m.add_argument("--build-args", help='extra args for mvn/gradle, e.g. "-s /path/settings.xml -Pci"')
     m.add_argument("--report-dir", help="where to write report/logs (default: next to the project)")

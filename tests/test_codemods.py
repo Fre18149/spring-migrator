@@ -1030,6 +1030,27 @@ class RuntimeDiagnosisTest(unittest.TestCase):
 
 
 class ProviderProfileTest(unittest.TestCase):
+    def test_conversion_idempotent_and_comments_are_not_config(self):
+        pr = Project({"src/main/java/a/JpaConfig.java": """
+                package a;
+                class JpaConfig {
+                  void f(java.util.Map<String, Object> m) {
+                    m.put("openjpa.Log", "DefaultLevel=WARN");
+                  }
+                }
+                """,
+                      "src/main/resources/META-INF/persistence.xml":
+                          '<persistence>\n  <persistence-unit name="x">\n'
+                          '    <provider>org.apache.openjpa.persistence.PersistenceProviderImpl</provider>\n    <properties>\n'
+                          '      <property name="openjpa.Log" value="SQL=TRACE"/>\n    </properties>\n  </persistence-unit>\n</persistence>\n'})
+        before = sm.jpa_provider_profiles(pr.root)
+        sm.migrate_openjpa(pr.root)
+        once = pr["src/main/java/a/JpaConfig.java"]
+        self.assertEqual(sm.migrate_openjpa(pr.root)[0], [])        # a second run (update) changes nothing
+        self.assertEqual(pr["src/main/java/a/JpaConfig.java"], once)
+        self.assertFalse([t for t in sm.check_provider_profiles(pr.root, before) if t.startswith("BLOCKING")])
+        pr.close()
+
     def test_profile_split_detected_and_checked_after_conversion(self):
         pr = Project({
             "src/main/java/a/OpenJpaConfig.java": """
